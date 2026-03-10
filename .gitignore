@@ -1,0 +1,10 @@
+node_modules/
+vendor/
+uploads/
+storage/
+cache/
+.env
+*.log
+*.zip
+*.mp4
+*.rar
