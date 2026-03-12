@@ -32,11 +32,12 @@ try {
                     // Set Manila timezone for MySQL
                     $conn->query("SET time_zone = '+08:00'");
                     
-                    // REAL-TIME: Get current Manila datetime
-                    $manila_now = date('Y-m-d H:i:s');
+                    // REAL-TIME: Get current Manila date only (without time)
+                    $manila_today = date('Y-m-d');
                     
-                    // Calculate cutoff datetime - hide programs that start within the next 24 hours
-                    $cutoff_datetime = date('Y-m-d H:i:s', strtotime('+24 hours'));
+                    // OPTION 1: Show programs starting from tomorrow (including tomorrow)
+                    // Hide only programs that start today or earlier
+                    $cutoff_date = date('Y-m-d', strtotime('tomorrow')); // Tomorrow at 00:00:00
                     
                     // Fetch programs that are marked to show on index page
                     // First check if show_on_index column exists
@@ -44,32 +45,32 @@ try {
                     
                     if ($columnCheck && $columnCheck->num_rows > 0) {
                         // Column exists, use it in query
-                        // REAL-TIME: Filter out programs that start in the next 24 hours or earlier
+                        // DATE-ONLY: Show programs starting tomorrow or later (hide today's and past programs)
                         $query = "SELECT id, name, duration, scheduleStart, scheduleEnd, 
                                          trainer, total_slots, slotsAvailable, 
                                          show_on_index 
                                   FROM programs 
                                   WHERE show_on_index = 1 
                                   AND slotsAvailable > 0 
-                                  AND scheduleStart >= ? 
+                                  AND DATE(scheduleStart) >= ? 
                                   ORDER BY scheduleStart ASC 
                                   LIMIT 10";
                     } else {
                         // Column doesn't exist, fetch all active programs
-                        // REAL-TIME: Filter out programs that start in the next 24 hours or earlier
+                        // DATE-ONLY: Show programs starting tomorrow or later (hide today's and past programs)
                         $query = "SELECT id, name, duration, scheduleStart, scheduleEnd, 
                                          trainer, total_slots, slotsAvailable 
                                   FROM programs 
                                   WHERE slotsAvailable > 0 
-                                  AND scheduleStart >= ? 
+                                  AND DATE(scheduleStart) >= ? 
                                   ORDER BY scheduleStart ASC 
                                   LIMIT 10";
                     }
                     
                     $stmt = $conn->prepare($query);
                     if ($stmt) {
-                        // Bind the cutoff datetime parameter (shows programs starting from 24+ hours from now)
-                        $stmt->bind_param("s", $cutoff_datetime);
+                        // Bind the cutoff date parameter (shows programs starting from tomorrow)
+                        $stmt->bind_param("s", $cutoff_date);
                         $stmt->execute();
                         $result = $stmt->get_result();
                         
@@ -86,7 +87,7 @@ try {
                                 if (!empty($row['scheduleStart'])) {
                                     $start_date = new DateTime($row['scheduleStart'], new DateTimeZone('UTC'));
                                     $start_date->setTimezone(new DateTimeZone('Asia/Manila'));
-                                    $row['formatted_start'] = $start_date->format('F j, Y, g:i a');
+                                    $row['formatted_start'] = $start_date->format('F j, Y');
                                 } else {
                                     $row['formatted_start'] = 'Not set';
                                 }
@@ -94,27 +95,33 @@ try {
                                 if (!empty($row['scheduleEnd'])) {
                                     $end_date = new DateTime($row['scheduleEnd'], new DateTimeZone('UTC'));
                                     $end_date->setTimezone(new DateTimeZone('Asia/Manila'));
-                                    $row['formatted_end'] = $end_date->format('F j, Y, g:i a');
+                                    $row['formatted_end'] = $end_date->format('F j, Y');
                                 } else {
                                     $row['formatted_end'] = 'Not set';
                                 }
                                 
-                                // Calculate time until start for display (using Manila time)
+                                // Calculate days until start for display (using Manila time - DATE ONLY)
                                 $now = new DateTime('now', new DateTimeZone('Asia/Manila'));
+                                $today_date = $now->format('Y-m-d');
+                                
                                 $start = new DateTime($row['scheduleStart'], new DateTimeZone('UTC'));
                                 $start->setTimezone(new DateTimeZone('Asia/Manila'));
-                                $interval = $now->diff($start);
+                                $start_date_only = $start->format('Y-m-d');
                                 
-                                if ($interval->invert == 0) { // Future date
-                                    if ($interval->days > 0) {
-                                        $row['time_until'] = $interval->days . ' day' . ($interval->days > 1 ? 's' : '') . ' remaining';
-                                    } elseif ($interval->h > 0) {
-                                        $row['time_until'] = $interval->h . ' hour' . ($interval->h > 1 ? 's' : '') . ' remaining';
-                                    } elseif ($interval->i > 0) {
-                                        $row['time_until'] = $interval->i . ' minute' . ($interval->i > 1 ? 's' : '') . ' remaining';
+                                // Calculate days difference (date only)
+                                $datetime1 = new DateTime($today_date);
+                                $datetime2 = new DateTime($start_date_only);
+                                $interval = $datetime1->diff($datetime2);
+                                $days_until = $interval->days;
+                                
+                                if ($start_date_only > $today_date) {
+                                    if ($days_until == 1) {
+                                        $row['time_until'] = 'Tomorrow';
                                     } else {
-                                        $row['time_until'] = 'Starting soon';
+                                        $row['time_until'] = $days_until . ' days remaining';
                                     }
+                                } elseif ($start_date_only == $today_date) {
+                                    $row['time_until'] = 'Today';
                                 } else {
                                     $row['time_until'] = 'Started';
                                 }
@@ -131,7 +138,7 @@ try {
                                 $programs[] = $row;
                             }
                         } else {
-                            $db_error = "No upcoming programs found";
+                            $db_error = "No upcoming programs found starting from tomorrow";
                         }
                         $stmt->close();
                     } else {
@@ -160,9 +167,18 @@ if (isset($conn) && $conn) {
     $conn->close();
 }
 
-// Get current Manila time for display
-$manila_time = new DateTime('now', new DateTimeZone('Asia/Manila'));
-$current_manila_time = $manila_time->format('F j, Y, g:i a');
+// Get current Manila date for display
+$manila_date = new DateTime('now', new DateTimeZone('Asia/Manila'));
+$current_manila_date = $manila_date->format('F j, Y');
+
+// Debug info (commented out by default)
+/*
+echo "<!-- DEBUG INFO:
+    Today: " . date('Y-m-d') . "
+    Cutoff (tomorrow): " . date('Y-m-d', strtotime('tomorrow')) . "
+    Programs found: " . count($programs) . "
+-->";
+*/
 
 // Check for enrollment success message
 $enrollment_message = '';
@@ -247,8 +263,8 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         background: rgba(28, 42, 58, 0.85); /* Dark blue overlay with transparency */
     }
 
-    /* Manila time display */
-    .manila-time {
+    /* Manila date display */
+    .manila-date {
         background: rgba(32, 201, 151, 0.2);
         padding: 0.5rem 1rem;
         border-radius: 50px;
@@ -260,7 +276,7 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         margin-left: 1rem;
     }
 
-    .manila-time i {
+    .manila-date i {
         color: #20c997;
     }
 
@@ -793,31 +809,24 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
     }
 
-    /* Countdown timer styling */
-    .time-remaining {
+    /* Days remaining styling */
+    .days-remaining {
         color: #20c997;
         font-weight: 500;
     }
 
-    .time-critical {
+    .days-today {
         color: #ffc107;
-        animation: pulse 2s infinite;
+        font-weight: 600;
     }
 
-    @keyframes pulse {
-        0% {
-            opacity: 1;
-        }
-        50% {
-            opacity: 0.7;
-        }
-        100% {
-            opacity: 1;
-        }
+    .days-tomorrow {
+        color: #ffc107;
+        font-weight: 600;
     }
 
-    /* Manila time badge */
-    .time-badge {
+    /* Manila date badge */
+    .date-badge {
         background: rgba(32, 201, 151, 0.15);
         border-radius: 50px;
         padding: 0.25rem 0.75rem;
@@ -829,7 +838,7 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         margin-left: 0.5rem;
     }
 
-    .time-badge i {
+    .date-badge i {
         font-size: 0.7rem;
     }
 
@@ -1117,7 +1126,7 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
             color: white;
         }
 
-        .manila-time {
+        .manila-date {
             margin-left: 0;
             margin-top: 0.5rem;
             width: 100%;
@@ -1336,6 +1345,9 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                     Browse through our available livelihood training programs and apply today. 
                     <strong>All applications require admin approval.</strong>
                 </p>
+                <div style="margin-top: 1rem; font-size: 0.9rem; background: rgba(32,201,151,0.1); padding: 0.5rem 1rem; border-radius: 50px; display: inline-block;">
+                    <i class="fas fa-info-circle"></i> Showing programs starting <strong>tomorrow (<?php echo date('F j, Y', strtotime('tomorrow')); ?>)</strong> and beyond
+                </div>
             </div>
             
             <div class="programs-container">
@@ -1345,14 +1357,13 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                             <div class="program-card" 
                                  data-program-id="<?php echo $program['id']; ?>"
                                  data-total-slots="<?php echo $program['total_slots']; ?>"
-                                 data-start-datetime="<?php echo $program['scheduleStart']; ?>"
+                                 data-start-date="<?php echo date('Y-m-d', strtotime($program['scheduleStart'])); ?>"
                                  <?php if (!empty($program['background_image_url'])): ?>
                                  style="background: linear-gradient(rgba(28, 42, 58, 0.85), rgba(28, 42, 58, 0.9)), url('<?php echo htmlspecialchars($program['background_image_url']); ?>'); background-size: cover; background-position: center;"
                                  <?php endif; ?>>
                                 <div class="program-header">
                                     <h3 class="program-name"><?php echo htmlspecialchars($program['name']); ?></h3>
                                     <div class="program-duration">
-                                        <i class="far fa-clock"></i>
                                         <?php echo htmlspecialchars($program['duration']); ?> Days
                                     </div>
                                 </div>
@@ -1369,9 +1380,12 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                                         </div>
                                         <div class="program-detail">
                                             <i class="fas fa-hourglass-half"></i>
-                                            <span class="time-remaining" data-start="<?php echo $program['scheduleStart']; ?>">
+                                            <span class="days-remaining <?php echo ($program['time_until'] == 'Tomorrow' || $program['time_until'] == 'Today') ? 'days-tomorrow' : ''; ?>">
                                                 <?php echo $program['time_until']; ?>
                                             </span>
+                                            <?php if ($program['time_until'] == 'Tomorrow'): ?>
+                                                <span class="date-badge"><i class="fas fa-clock"></i> Starts tomorrow!</span>
+                                            <?php endif; ?>
                                         </div>
                                     </div>
                                     
@@ -1403,7 +1417,11 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                     <div class="no-programs">
                         <i class="fas fa-calendar-times"></i>
                         <h3>No Programs Available</h3>
-                        <p>There are no programs available at the moment. Programs are hidden 24 hours before they start.</p>
+                        <p>There are no programs starting from tomorrow onwards at the moment.</p>
+                        <p style="margin-top: 1rem; font-size: 0.9rem; color: #20c997;">
+                            <i class="fas fa-info-circle"></i> Today's date: <?php echo $current_manila_date; ?><br>
+                            <i class="fas fa-calendar-day"></i> Showing programs starting from: <?php echo date('F j, Y', strtotime('tomorrow')); ?>
+                        </p>
                     </div>
                 <?php endif; ?>
             </div>
@@ -1412,7 +1430,7 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         <!-- FOOTER -->
         <footer class="footer">
             © <?php echo date('Y'); ?> Livelihood Enrollment and Monitoring System. All Rights Reserved.<br>
-            <small><i class="fas fa-clock"></i> All times are in Manila Time (UTC+8)</small>
+            <small><i class="fas fa-calendar-day"></i> All dates are in Manila Time (UTC+8)</small>
         </footer>
     </div>
 
@@ -1446,29 +1464,25 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <script>
         // ==========================================
-        // MANILA TIME CLOCK (Real-time update)
+        // MANILA DATE DISPLAY
         // ==========================================
-        function updateManilaClock() {
-            const manilaClock = document.getElementById('manilaClock');
-            if (manilaClock) {
-                // Create date in Manila timezone
+        function updateManilaDate() {
+            const manilaDate = document.getElementById('manilaDate');
+            if (manilaDate) {
                 const options = {
                     timeZone: 'Asia/Manila',
                     year: 'numeric',
                     month: 'long',
-                    day: 'numeric',
-                    hour: 'numeric',
-                    minute: '2-digit',
-                    hour12: true
+                    day: 'numeric'
                 };
                 
-                const manilaTime = new Date().toLocaleString('en-US', options);
-                manilaClock.textContent = manilaTime;
+                const manilaDateStr = new Date().toLocaleDateString('en-US', options);
+                manilaDate.textContent = manilaDateStr;
             }
         }
 
-        // Update Manila clock every second
-        setInterval(updateManilaClock, 1000);
+        // Update Manila date display
+        setInterval(updateManilaDate, 60000); // Update every minute
 
         // ==========================================
         // DEBUG: Show debug info on Ctrl+D
@@ -1902,40 +1916,48 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         }
 
         // ==========================================
-        // REAL-TIME PROGRAM VISIBILITY UPDATES (Manila Time)
+        // REAL-TIME PROGRAM VISIBILITY UPDATES (Manila Date Only)
         // ==========================================
         function checkProgramVisibility() {
             const programCards = document.querySelectorAll('.program-card');
-            const now = new Date();
             
-            // Get Manila time for comparison
-            const manilaTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' });
-            const manilaNow = new Date(manilaTime);
+            // Get Manila date only (without time)
+            const manilaDateStr = new Date().toLocaleDateString('en-US', { 
+                timeZone: 'Asia/Manila',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
+            
+            // Convert to YYYY-MM-DD format for comparison
+            const manilaDateParts = manilaDateStr.split('/');
+            const manilaDate = `${manilaDateParts[2]}-${manilaDateParts[0].padStart(2,'0')}-${manilaDateParts[1].padStart(2,'0')}`;
+            
+            // Calculate tomorrow's date
+            const tomorrow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = tomorrow.toISOString().split('T')[0];
             
             let visibleCount = 0;
             
             programCards.forEach(card => {
-                const startDateTime = card.dataset.startDatetime;
-                if (startDateTime) {
+                const startDate = card.dataset.startDate;
+                if (startDate) {
                     try {
-                        // Parse the start date (assuming it's in Manila time)
-                        const startDate = new Date(startDateTime);
-                        const hoursUntilStart = (startDate - manilaNow) / (1000 * 60 * 60);
-                        
-                        // If program starts in less than 24 hours, hide it
-                        if (hoursUntilStart < 24) {
+                        // OPTION 1: Show programs starting tomorrow and beyond (hide today's and past programs)
+                        if (startDate < tomorrowStr) {
                             card.style.display = 'none';
                         } else {
                             card.style.display = 'flex';
                             visibleCount++;
                             
-                            // Add warning class if less than 48 hours
-                            const timeElement = card.querySelector('.time-remaining');
-                            if (timeElement) {
-                                if (hoursUntilStart < 48) {
-                                    timeElement.classList.add('time-critical');
+                            // Add special styling for tomorrow's programs
+                            const daysElement = card.querySelector('.days-remaining');
+                            if (daysElement) {
+                                if (startDate === tomorrowStr) {
+                                    daysElement.classList.add('days-tomorrow');
                                 } else {
-                                    timeElement.classList.remove('time-critical');
+                                    daysElement.classList.remove('days-tomorrow');
                                 }
                             }
                         }
@@ -1962,14 +1984,20 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                 
                 if (!noProgramsDiv) {
                     // Create no programs message if it doesn't exist
-                    const manilaTime = new Date().toLocaleString('en-US', { 
+                    const manilaDate = new Date().toLocaleDateString('en-US', { 
                         timeZone: 'Asia/Manila',
                         year: 'numeric',
                         month: 'long',
-                        day: 'numeric',
-                        hour: 'numeric',
-                        minute: '2-digit',
-                        hour12: true
+                        day: 'numeric'
+                    });
+                    
+                    const tomorrow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+                    tomorrow.setDate(tomorrow.getDate() + 1);
+                    const tomorrowFormatted = tomorrow.toLocaleDateString('en-US', { 
+                        timeZone: 'Asia/Manila',
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric'
                     });
                     
                     const newNoPrograms = document.createElement('div');
@@ -1977,9 +2005,10 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                     newNoPrograms.innerHTML = `
                         <i class="fas fa-calendar-times"></i>
                         <h3>No Programs Available</h3>
-                        <p>All programs either start within the next 24 hours or have no available slots.</p>
+                        <p>There are no programs starting from tomorrow onwards at the moment.</p>
                         <p style="margin-top: 1rem; font-size: 0.9rem; color: #20c997;">
-                            <i class="fas fa-info-circle"></i> Current Manila time: ${manilaTime}
+                            <i class="fas fa-info-circle"></i> Today's date: ${manilaDate}<br>
+                            <i class="fas fa-calendar-day"></i> Showing programs starting from: ${tomorrowFormatted}
                         </p>
                     `;
                     container.appendChild(newNoPrograms);
@@ -1998,45 +2027,39 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         }
 
         // ==========================================
-        // REAL-TIME COUNTDOWN UPDATES (Manila Time)
+        // UPDATE DAYS REMAINING DISPLAY
         // ==========================================
-        function updateCountdowns() {
-            const timeElements = document.querySelectorAll('.time-remaining');
+        function updateDaysRemaining() {
+            const daysElements = document.querySelectorAll('.days-remaining');
             
-            // Get Manila time for comparison
-            const manilaTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' });
-            const manilaNow = new Date(manilaTime);
+            // Get Manila date only
+            const today = new Date().toLocaleDateString('en-US', { 
+                timeZone: 'Asia/Manila',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
             
-            timeElements.forEach(el => {
-                const startDateStr = el.dataset.start;
-                if (startDateStr) {
-                    const startDate = new Date(startDateStr);
-                    const diffMs = startDate - manilaNow;
-                    
-                    if (diffMs > 0) {
-                        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-                        const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-                        const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+            daysElements.forEach(el => {
+                const card = el.closest('.program-card');
+                if (card) {
+                    const startDate = card.dataset.startDate;
+                    if (startDate) {
+                        const startDateObj = new Date(startDate);
+                        const todayObj = new Date(today);
                         
-                        if (diffDays > 0) {
-                            el.textContent = `${diffDays} day${diffDays > 1 ? 's' : ''} remaining`;
-                        } else if (diffHours > 0) {
-                            el.textContent = `${diffHours} hour${diffHours > 1 ? 's' : ''} remaining`;
-                        } else if (diffMinutes > 0) {
-                            el.textContent = `${diffMinutes} minute${diffMinutes > 1 ? 's' : ''} remaining`;
-                        } else {
-                            el.textContent = 'Starting soon';
-                        }
+                        const diffTime = startDateObj - todayObj;
+                        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
                         
-                        // Add warning class if less than 48 hours
-                        const hoursUntilStart = diffMs / (1000 * 60 * 60);
-                        if (hoursUntilStart < 48) {
-                            el.classList.add('time-critical');
+                        if (diffDays > 1) {
+                            el.textContent = `${diffDays} days remaining`;
+                        } else if (diffDays === 1) {
+                            el.textContent = 'Tomorrow';
+                        } else if (diffDays === 0) {
+                            el.textContent = 'Today';
                         } else {
-                            el.classList.remove('time-critical');
+                            el.textContent = 'Started';
                         }
-                    } else {
-                        el.textContent = 'Started';
                     }
                 }
             });
@@ -2045,20 +2068,20 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
         // Run initial checks
         setTimeout(() => {
             checkProgramVisibility();
-            updateCountdowns();
+            updateDaysRemaining();
         }, 100);
 
         // Run updates every minute (60,000 ms)
         setInterval(() => {
             checkProgramVisibility();
-            updateCountdowns();
+            updateDaysRemaining();
         }, 60000);
 
         // Also check when page gains focus
         document.addEventListener('visibilitychange', function() {
             if (!document.hidden) {
                 checkProgramVisibility();
-                updateCountdowns();
+                updateDaysRemaining();
             }
         });
 
@@ -2316,6 +2339,45 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
                 }
             });
         });
+
+        // ==========================================
+        // TEST FUNCTION TO VERIFY DATE-ONLY RULE
+        // ==========================================
+        function testDateRule() {
+            const programCards = document.querySelectorAll('.program-card');
+            const today = new Date().toLocaleDateString('en-US', { 
+                timeZone: 'Asia/Manila',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
+            
+            const tomorrow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = tomorrow.toISOString().split('T')[0];
+            
+            console.log('===== PROGRAM VISIBILITY TEST (OPTION 1) =====');
+            console.log('Current Manila Date:', today);
+            console.log('Showing programs from:', tomorrowStr, '(tomorrow and beyond)');
+            console.log('=================================================');
+            
+            programCards.forEach((card, index) => {
+                const startDate = card.dataset.startDate;
+                if (startDate) {
+                    const isVisible = window.getComputedStyle(card).display !== 'none';
+                    const shouldBeVisible = startDate >= tomorrowStr;
+                    
+                    console.log(`Program ${index + 1}:`);
+                    console.log(`  Start Date: ${startDate}`);
+                    console.log(`  Should be ${shouldBeVisible ? 'VISIBLE' : 'HIDDEN'} (starts ${shouldBeVisible ? 'tomorrow or later' : 'today or earlier'})`);
+                    console.log(`  Currently: ${isVisible ? 'VISIBLE' : 'HIDDEN'}`);
+                }
+            });
+            console.log('=================================================');
+        }
+
+        // Run test after 3 seconds (uncomment to use)
+        // setTimeout(testDateRule, 3000);
     </script>
 </body>
 </html>

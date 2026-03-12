@@ -10,6 +10,7 @@ if (!isset($_SESSION['user_id'])) {
 $user_id = $_SESSION['user_id'];
 
 // Query to get user's completed programs from archived_history table
+// Filtering out programs that ended (archive_trigger = 'program_ended')
 $query = "
     SELECT 
         ah.id as archive_id,
@@ -27,6 +28,7 @@ $query = "
         ah.enrollment_assessment as assessment,
         DATE_FORMAT(ah.enrollment_completed_at, '%M %d, %Y') as completion_date,
         DATE_FORMAT(ah.archived_at, '%M %d, %Y %h:%i %p') as archived_date,
+        ah.archive_trigger,
         -- Check if certificate is available (has feedback)
         CASE 
             WHEN ah.feedback_id IS NOT NULL THEN 1 
@@ -36,6 +38,7 @@ $query = "
     LEFT JOIN program_categories pc ON ah.program_category_id = pc.id
     WHERE ah.user_id = ?
     AND ah.enrollment_status = 'completed'
+    AND ah.archive_trigger != 'program_ended' -- Exclude programs that ended
     ORDER BY ah.enrollment_completed_at DESC, ah.archived_at DESC
 ";
 

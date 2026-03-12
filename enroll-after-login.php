@@ -3,6 +3,7 @@ session_start();
 
 // Enable detailed error logging for debugging
 ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
 ini_set('log_errors', 1);
 error_reporting(E_ALL);
 
@@ -28,7 +29,7 @@ if (!isset($_SESSION['user_id'])) {
     exit();
 }
 
-$user_id = $_SESSION['user_id'];
+$user_id = intval($_SESSION['user_id']);
 $user_role = $_SESSION['role'] ?? '';
 
 // ONLY ALLOW TRAINEES
@@ -75,15 +76,24 @@ error_log("Processing enrollment for program_id: " . $program_id);
 // 3. CONNECT TO DATABASE
 $db_file = __DIR__ . '/db.php';
 if (!file_exists($db_file)) {
-    error_log("ERROR: Database file not found");
+    error_log("ERROR: Database file not found at: " . $db_file);
     header('Location: ' . $DASHBOARD_URL . '?error=system');
     exit();
 }
 
+// Include database connection
 include $db_file;
 
-if (!isset($conn) || !$conn || $conn->connect_error) {
-    error_log("ERROR: Database connection failed");
+// Check if connection was established
+if (!isset($conn) || !$conn) {
+    error_log("ERROR: Database connection variable not set");
+    header('Location: ' . $DASHBOARD_URL . '?error=database');
+    exit();
+}
+
+// Check connection
+if ($conn->connect_error) {
+    error_log("ERROR: Database connection failed: " . $conn->connect_error);
     header('Location: ' . $DASHBOARD_URL . '?error=database');
     exit();
 }
@@ -92,8 +102,80 @@ error_log("Database connected successfully");
 
 try {
     // Start transaction
-    $conn->begin_transaction();
+    if (!$conn->begin_transaction()) {
+        throw new Exception("Failed to start transaction: " . $conn->error);
+    }
     error_log("Transaction started");
+    
+    // ================================================
+    // CRITICAL VALIDATION: CHECK FOR ANY PENDING OR ACTIVE ENROLLMENTS
+    // ================================================
+    error_log("VALIDATION: Checking for existing pending or active enrollments...");
+    
+    // Check if user has ANY pending or active enrollment in ANY program
+    $checkActiveEnrollments = $conn->prepare("
+        SELECT 
+            e.id,
+            e.program_id,
+            e.enrollment_status,
+            e.approval_status,
+            p.name as program_name
+        FROM enrollments e
+        JOIN programs p ON e.program_id = p.id
+        WHERE e.user_id = ? 
+        AND (
+            -- PENDING ENROLLMENTS
+            e.enrollment_status = 'pending' 
+            OR e.approval_status = 'pending'
+            
+            -- ACTIVE/APPROVED ENROLLMENTS
+            OR (e.enrollment_status = 'approved' AND e.approval_status = 'approved')
+            OR e.enrollment_status = 'enrolled'
+            OR e.enrollment_status = 'active'
+            
+            -- ONGOING ENROLLMENTS (not completed or cancelled)
+            OR (e.enrollment_status NOT IN ('completed', 'cancelled', 'rejected', 'waiting'))
+        )
+        ORDER BY e.applied_at DESC
+        LIMIT 1
+    ");
+    
+    if (!$checkActiveEnrollments) {
+        throw new Exception("Database error: " . $conn->error);
+    }
+    
+    if (!$checkActiveEnrollments->bind_param("i", $user_id)) {
+        throw new Exception("Failed to bind parameters: " . $checkActiveEnrollments->error);
+    }
+    
+    if (!$checkActiveEnrollments->execute()) {
+        throw new Exception("Failed to execute query: " . $checkActiveEnrollments->error);
+    }
+    
+    $activeResult = $checkActiveEnrollments->get_result();
+    
+    if ($activeResult->num_rows > 0) {
+        // User has an existing pending or active enrollment
+        $activeEnrollment = $activeResult->fetch_assoc();
+        $existing_program_id = $activeEnrollment['program_id'];
+        $existing_program_name = $activeEnrollment['program_name'];
+        $existing_status = $activeEnrollment['enrollment_status'];
+        $existing_approval = $activeEnrollment['approval_status'];
+        
+        error_log("BLOCKED: User has existing enrollment - Program: " . $existing_program_name . " (ID: " . $existing_program_id . ")");
+        error_log("BLOCKED: Enrollment Status: " . $existing_status . ", Approval: " . $existing_approval);
+        
+        // Determine the exact status for the error message
+        if ($existing_status === 'pending' || $existing_approval === 'pending') {
+            throw new Exception("You have a pending enrollment in '" . $existing_program_name . "'. Please wait for approval or complete that program before applying to a new one.");
+        } elseif ($existing_status === 'approved' || $existing_status === 'enrolled' || $existing_status === 'active') {
+            throw new Exception("You are currently enrolled in '" . $existing_program_name . "'. You must complete this program before applying to another one.");
+        } else {
+            throw new Exception("You have an ongoing enrollment in '" . $existing_program_name . "'. Please complete that program before applying to a new one.");
+        }
+    }
+    
+    error_log("VALIDATION PASSED: No existing pending or active enrollments found");
     
     // STEP 1: CHECK PROGRAM DETAILS
     error_log("Checking program availability...");
@@ -103,9 +185,19 @@ try {
         throw new Exception("Database error: " . $conn->error);
     }
     
-    $checkStmt->bind_param("i", $program_id);
-    $checkStmt->execute();
+    if (!$checkStmt->bind_param("i", $program_id)) {
+        throw new Exception("Failed to bind parameters: " . $checkStmt->error);
+    }
+    
+    if (!$checkStmt->execute()) {
+        throw new Exception("Failed to execute query: " . $checkStmt->error);
+    }
+    
     $result = $checkStmt->get_result();
+    
+    if (!$result) {
+        throw new Exception("Failed to get result: " . $conn->error);
+    }
     
     if ($result->num_rows === 0) {
         throw new Exception("Program not found");
@@ -129,59 +221,97 @@ try {
         throw new Exception("This program is full. No slots available.");
     }
     
-    // STEP 2: CHECK EXISTING ENROLLMENT
-    error_log("Checking for existing enrollment...");
+    // STEP 2: CHECK EXISTING ENROLLMENT FOR THIS SPECIFIC PROGRAM
+    // (Only relevant for re-applying to the same program after completion/rejection)
+    error_log("Checking for existing enrollment for this specific program...");
     $enrollCheck = $conn->prepare("SELECT id, enrollment_status, approval_status FROM enrollments WHERE user_id = ? AND program_id = ?");
     
     if (!$enrollCheck) {
         throw new Exception("Database error: " . $conn->error);
     }
     
-    $enrollCheck->bind_param("ii", $user_id, $program_id);
-    $enrollCheck->execute();
+    if (!$enrollCheck->bind_param("ii", $user_id, $program_id)) {
+        throw new Exception("Failed to bind parameters: " . $enrollCheck->error);
+    }
+    
+    if (!$enrollCheck->execute()) {
+        throw new Exception("Failed to execute query: " . $enrollCheck->error);
+    }
+    
     $enrollResult = $enrollCheck->get_result();
     
     $enrollment_id = null;
     $needs_new_enrollment = true;
     
     if ($enrollResult->num_rows > 0) {
-        // User already has an enrollment record
+        // User has a previous enrollment record for this specific program
         $existing = $enrollResult->fetch_assoc();
         $enrollment_id = $existing['id'];
         $enrollment_status = $existing['enrollment_status'] ?? null;
         $approval_status = $existing['approval_status'] ?? null;
         
-        error_log("Existing enrollment found - ID: " . $enrollment_id);
-        error_log("Status: " . $enrollment_status . ", Approval: " . $approval_status);
+        error_log("Previous enrollment found for this program - ID: " . $enrollment_id);
+        error_log("Previous Status: " . $enrollment_status . ", Approval: " . $approval_status);
         
-        // Check current status
+        // Since we already validated they have no active enrollments,
+        // we only need to check if they can re-apply to this same program
         if (($enrollment_status === 'approved' && $approval_status === 'approved') || 
-            $enrollment_status === 'enrolled') {
-            // Already enrolled
+            $enrollment_status === 'enrolled' || $enrollment_status === 'active') {
+            // This shouldn't happen due to previous validation, but just in case
             throw new Exception("You are already enrolled in this program");
         } elseif ($enrollment_status === 'pending' || $approval_status === 'pending') {
-            // Already pending
-            throw new Exception("Your application is already pending approval");
-        } elseif ($enrollment_status === 'rejected' || $enrollment_status === 'waiting') {
-            // Can re-apply
-            error_log("Re-applying for previously " . $enrollment_status . " enrollment");
-            $updateStmt = $conn->prepare("UPDATE enrollments SET enrollment_status = 'pending', approval_status = 'pending', applied_at = NOW() WHERE id = ?");
-            $updateStmt->bind_param("i", $enrollment_id);
-            $updateStmt->execute();
+            // This shouldn't happen due to previous validation, but just in case
+            throw new Exception("Your application for this program is already pending");
+        } elseif ($enrollment_status === 'rejected' || $enrollment_status === 'waiting' || 
+                  $enrollment_status === 'completed' || $enrollment_status === 'cancelled') {
+            // Can re-apply to the SAME program if previously rejected, completed, or cancelled
+            // Only allowed because they have NO other active enrollments
+            error_log("Re-applying to same program (previously " . $enrollment_status . ")");
+            
+            // Get current date from PHP
+            $current_date = date('Y-m-d H:i:s');
+            
+            // Update the existing enrollment record
+            $updateStmt = $conn->prepare("UPDATE enrollments SET enrollment_status = 'pending', approval_status = 'pending', applied_at = ?, enrollment_date = ? WHERE id = ?");
+            
+            if (!$updateStmt) {
+                throw new Exception("Database error: " . $conn->error);
+            }
+            
+            if (!$updateStmt->bind_param("ssi", $current_date, $current_date, $enrollment_id)) {
+                throw new Exception("Failed to bind parameters: " . $updateStmt->error);
+            }
+            
+            if (!$updateStmt->execute()) {
+                throw new Exception("Failed to update enrollment: " . $updateStmt->error);
+            }
+            
             $needs_new_enrollment = false;
+            error_log("Updated existing enrollment to pending status");
         }
     }
+
+    
     
     // STEP 3: CREATE NEW ENROLLMENT IF NEEDED
     if ($needs_new_enrollment) {
         error_log("Creating new enrollment record...");
-        $enrollStmt = $conn->prepare("INSERT INTO enrollments (user_id, program_id, enrollment_status, approval_status, applied_at) VALUES (?, ?, 'pending', 'pending', NOW())");
+        // Get current date from PHP
+        $current_date = date('Y-m-d H:i:s');
+        
+        // Create new enrollment
+        $enrollStmt = $conn->prepare("INSERT INTO enrollments (user_id, program_id, enrollment_status, approval_status, applied_at, enrollment_date) VALUES (?, ?, 'pending', 'pending', ?, ?)");
+        
+
+
         
         if (!$enrollStmt) {
             throw new Exception("Database error: " . $conn->error);
         }
         
-        $enrollStmt->bind_param("ii", $user_id, $program_id);
+        if (!$enrollStmt->bind_param("iiss", $user_id, $program_id, $current_date, $current_date)) {
+            throw new Exception("Failed to bind parameters: " . $enrollStmt->error);
+        }
         
         if (!$enrollStmt->execute()) {
             throw new Exception("Failed to create enrollment: " . $enrollStmt->error);
@@ -198,8 +328,13 @@ try {
             throw new Exception("Database error: " . $conn->error);
         }
         
-        $slotStmt->bind_param("i", $program_id);
-        $slotStmt->execute();
+        if (!$slotStmt->bind_param("i", $program_id)) {
+            throw new Exception("Failed to bind parameters: " . $slotStmt->error);
+        }
+        
+        if (!$slotStmt->execute()) {
+            throw new Exception("Failed to update slots: " . $slotStmt->error);
+        }
         
         $affected_rows = $slotStmt->affected_rows;
         error_log("Slots updated - affected rows: " . $affected_rows);
@@ -217,10 +352,27 @@ try {
             }
         }
     }
+
+   // Insert notification for trainee
+    $trainee_notification = "INSERT INTO notifications (user_id, type, title, message, related_id, related_type, created_at) 
+                             VALUES (?, 'application', 'Application Submitted', ?, ?, 'enrollment', NOW())";
+    $trainee_stmt = $conn->prepare($trainee_notification);
+    if ($trainee_stmt) {
+        $trainee_message = "Your application for program '" . $program_name . "' has been submitted successfully and is pending approval.";
+        $trainee_stmt->bind_param("isi", $user_id, $trainee_message, $enrollment_id);
+        $trainee_stmt->execute();
+        $trainee_stmt->close();
+        error_log("Trainee notification created");
+    }
+    
     
     // STEP 5: COMMIT TRANSACTION
-    $conn->commit();
+    if (!$conn->commit()) {
+        throw new Exception("Failed to commit transaction: " . $conn->error);
+    }
     error_log("Transaction committed successfully");
+
+    
     
     // Clear session data
     unset($_SESSION['pending_enrollment']);
@@ -243,6 +395,14 @@ try {
     $error_message = $e->getMessage();
     error_log("ENROLLMENT FAILED: " . $error_message);
     
+    // For debugging, show error if debug mode is on
+    if (isset($_GET['debug'])) {
+        echo "<h1>Error Details</h1>";
+        echo "<pre>" . htmlspecialchars($error_message) . "</pre>";
+        echo "<p><a href='" . $DASHBOARD_URL . "'>Go to Dashboard</a></p>";
+        exit();
+    }
+    
     // REDIRECT TO TRAINEE DASHBOARD WITH ERROR
     $error_url = $DASHBOARD_URL . '?error=enrollment_failed&message=' . urlencode($error_message) . '&program_id=' . $program_id;
     header('Location: ' . $error_url);
@@ -258,6 +418,8 @@ try {
     error_log("Script execution completed");
     error_log("================================================\n\n");
 }
+
+
 
 exit();
 ?>

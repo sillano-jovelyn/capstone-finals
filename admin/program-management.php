@@ -1926,8 +1926,8 @@ function addProgram($conn, $data) {
         $trainer_stmt->close();
     }
     
-    // Get show_on_index value (checkbox is checked = 1, not checked = 0)
-    $show_on_index = isset($data['show_on_index']) && $data['show_on_index'] == '1' ? 1 : 0;
+    // Show on index is always true by default (option removed from UI)
+    $show_on_index = 1; // Always visible on index page
     
     // Get current datetime for created_at and updated_at
     $current_time = getCurrentDateTime();
@@ -2215,8 +2215,15 @@ function editProgram($conn, $data) {
         $totalSlots = $current_enrollments;
     }
     
-    // Get show_on_index value
-    $show_on_index = isset($data['show_on_index']) && $data['show_on_index'] == '1' ? 1 : 0;
+    // Get current show_on_index value from database (preserve existing value)
+    $current_sql = "SELECT show_on_index FROM programs WHERE id = ?";
+    $current_stmt = $conn->prepare($current_sql);
+    $current_stmt->bind_param("i", $programId);
+    $current_stmt->execute();
+    $current_result = $current_stmt->get_result();
+    $current_data = $current_result->fetch_assoc();
+    $show_on_index = $current_data['show_on_index'] ?? 1; // Preserve existing value, default to 1
+    $current_stmt->close();
     
     // Get current datetime for updated_at
     $current_time = getCurrentDateTime();
@@ -2516,8 +2523,8 @@ function restoreProgram($conn, $data) {
         $duration = $start->diff($end)->days + 1;
     }
     
-    // Get show_on_index value
-    $show_on_index = isset($data['show_on_index']) && $data['show_on_index'] == '1' ? 1 : 0;
+    // Get show_on_index from archived program or default to 1
+    $show_on_index = isset($archived_program['show_on_index']) ? $archived_program['show_on_index'] : 1;
     
     // FIX: Store the created_at value in a variable first
     $created_at = isset($archived_program['created_at']) ? $archived_program['created_at'] : $current_time;
@@ -3272,19 +3279,7 @@ include '../components/header.php';
                     <small style="color: #718096; font-size: 12px;">Calculated from start date + duration</small>
                 </div>
                 
-                <div class="form-group">
-                    <label class="form-label">Show on Index Page:</label>
-                    <div class="switch-container">
-                        <label class="switch">
-                            <input type="checkbox" name="show_on_index" id="showOnIndex" checked>
-                            <span class="slider"></span>
-                        </label>
-                        <span class="switch-label">
-                            <span id="switchStatus" class="switch-on">Visible on index page</span>
-                        </span>
-                    </div>
-                    <small style="color: #718096; font-size: 12px;">Toggle to show or hide this program on the main index.php page</small>
-                </div> 
+                <!-- Show on index page option removed - all programs now visible by default -->
                 
                 <div class="form-group">
                     <label class="form-label required-field">Primary Trainer:</label>
@@ -3997,20 +3992,6 @@ include '../components/header.php';
             // Reset the category form
             toggleNewCategoryField();
             
-            // Update show on index switch status text
-            const showOnIndexCheckbox = document.getElementById('showOnIndex');
-            const switchStatus = document.getElementById('switchStatus');
-            
-            showOnIndexCheckbox.addEventListener('change', function() {
-                if (this.checked) {
-                    switchStatus.textContent = 'Visible on index page';
-                    switchStatus.className = 'switch-on';
-                } else {
-                    switchStatus.textContent = 'Hidden from index page';
-                    switchStatus.className = 'switch-off';
-                }
-            });
-            
             if (program) {
                 // Special handling for restore action
                 if (action === 'restore') {
@@ -4053,16 +4034,6 @@ include '../components/header.php';
                 document.getElementById('scheduleEnd').value = program.scheduleEnd;
                 document.getElementById('programSlots').value = program.totalSlots || program.slotsAvailable;
                 
-                // Set show_on_index checkbox
-                showOnIndexCheckbox.checked = program.show_on_index == 1;
-                if (showOnIndexCheckbox.checked) {
-                    switchStatus.textContent = 'Visible on index page';
-                    switchStatus.className = 'switch-on';
-                } else {
-                    switchStatus.textContent = 'Hidden from index page';
-                    switchStatus.className = 'switch-off';
-                }
-                
                 // Set trainer value after a delay to ensure options are loaded
                 setTimeout(() => {
                     updateTrainerOptions().then(() => {
@@ -4085,11 +4056,6 @@ include '../components/header.php';
                 startDateInfo.textContent = `Must be at least 7 days from today (Minimum: ${minStartDate})`;
                 document.getElementById('scheduleStart').value = minStartDate;
                 calculateEndDate();
-                
-                // Reset show_on_index to checked (default)
-                showOnIndexCheckbox.checked = true;
-                switchStatus.textContent = 'Visible on index page';
-                switchStatus.className = 'switch-on';
                 
                 // Update trainer options
                 updateTrainerOptions();

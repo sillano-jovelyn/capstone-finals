@@ -415,7 +415,7 @@ function createRevisionRequest($enrollment_id, $admin_id, $reason) {
         // Create notification for the trainee
         if ($enrollment) {
             $notification_title = "Revision Required";
-            $notification_message = "Your enrollment for '{$enrollment['program_name']}' requires revision. Please login to your account and update your profile/documents.";
+            $notification_message = "Your enrollment for '{$enrollment['program_name']}' requires revision. Please check your email and update your profile/documents.";
             
             $notify_stmt = $conn->prepare("
                 INSERT INTO notifications (user_id, type, title, message, related_id, related_type, created_at)
