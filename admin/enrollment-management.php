@@ -2233,10 +2233,6 @@ include '../components/header.php';
                 <button type="button" class="btn btn-outline" onclick="window.location.href='enrollment-management.php'">
                     <i class="fas fa-sync-alt"></i> Refresh
                 </button>
-                <!-- Debug button for testing -->
-                <button type="button" class="btn btn-warning" onclick="testEmailConfig()">
-                    <i class="fas fa-envelope"></i> Test Email
-                </button>
             </div>
         </form>
 

@@ -1725,9 +1725,9 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     </div>
                                     <div class="certificate-buttons">
-                                        <button class="certificate-btn feedback-btn" onclick="location.href='feedback_certificate.php?program_id=<?php echo $program['program_id']; ?>'">
-                                            <i class="fas fa-comment-dots"></i> Submit Feedback
-                                        </button>
+                                      <button class="certificate-btn feedback-btn" onclick="location.href='feedback_certificate.php?program_id=<?php echo $program['program_id']; ?>&program_name=<?php echo urlencode($program['program_name']); ?>'">
+    <i class="fas fa-comment-dots"></i> Submit Feedback
+</button>
                                     </div>
                                 </div>
                             <?php elseif ($program['attendance_met'] && !$program['assessment_done']): ?>
