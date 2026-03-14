@@ -793,7 +793,7 @@ function getTodayAttendanceStatus($conn, $user_id) {
 }
 
 /**
- * Get trainer attendance records for date range
+ * Get trainer attendance records for date range - MODIFIED TO ONLY SHOW DATES WITH ATTENDANCE
  */
 function getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date) {
     if (!$conn) {
@@ -809,7 +809,7 @@ function getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date) {
     try {
         $manilaTz = new DateTimeZone('Asia/Manila');
         
-        // Get all distinct dates with attendance
+        // MODIFIED: Get ONLY dates that have attendance records
         $stmt = $conn->prepare("
             SELECT DATE(attendance_time) as attendance_date,
                    GROUP_CONCAT(
@@ -839,24 +839,14 @@ function getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date) {
         $records = [];
         $total_days = 0;
         
-        // Generate all dates in range
-        $current = new DateTime($start_date);
-        $end = new DateTime($end_date);
-        $interval = new DateInterval('P1D');
-        $date_range = new DatePeriod($current, $interval, $end->modify('+1 day'));
-        
-        $attendance_by_date = [];
+        // MODIFIED: Only process dates that have attendance records
         while ($row = $result->fetch_assoc()) {
-            $attendance_by_date[$row['attendance_date']] = $row['attendance_data'];
-        }
-        
-        foreach ($date_range as $date) {
-            $date_str = $date->format('Y-m-d');
+            $date_str = $row['attendance_date'];
             $total_days++;
             
             $record = [
                 'date' => $date_str,
-                'day_name' => $date->format('l'),
+                'day_name' => date('l', strtotime($date_str)),
                 'time_in' => null,
                 'time_out' => null,
                 'duration' => null,
@@ -865,8 +855,8 @@ function getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date) {
                 'status' => 'incomplete'
             ];
             
-            if (isset($attendance_by_date[$date_str])) {
-                $entries = explode('||', $attendance_by_date[$date_str]);
+            if (isset($row['attendance_data'])) {
+                $entries = explode('||', $row['attendance_data']);
                 $time_in_obj = null;
                 $time_out_obj = null;
                 
@@ -913,7 +903,7 @@ function getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date) {
         }
         
         debug_log("Attendance records retrieved", [
-            'total_days' => $total_days,
+            'total_days_with_attendance' => $total_days,
             'records_count' => count($records)
         ]);
         
@@ -1377,7 +1367,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
 }
 
 // ============================================
-// PAGE DATA PREPARATION
+// PAGE DATA PREPARATION (MODIFIED)
 // ============================================
 debug_log("Preparing page data");
 
@@ -1400,26 +1390,29 @@ try {
     $start_date = date('Y-m-d', strtotime($start_date));
     $end_date = date('Y-m-d', strtotime($end_date));
     
-    // Get attendance records
+    // Get attendance records - NOW ONLY RETURNS DATES WITH ATTENDANCE
     $attendance_data = getTrainerAttendanceRecords($conn, $user_id, $start_date, $end_date);
     $attendance_records = $attendance_data['records'];
     $total_days = $attendance_data['total_days'];
     
-    // Calculate statistics
+    // Calculate statistics - MODIFIED to only count days with attendance
     $completed_days = array_filter($attendance_records, function($record) {
         return $record['status'] === 'completed';
     });
     $completed_count = count($completed_days);
     
     $incomplete_days = array_filter($attendance_records, function($record) {
-        return $record['status'] === 'incomplete' || $record['status'] === 'timed_in_only';
+        return $record['status'] === 'timed_in_only';
     });
     $incomplete_count = count($incomplete_days);
-    $completion_rate = $total_days > 0 ? round(($completed_count / $total_days) * 100, 2) : 0;
+    
+    // Only days with any attendance activity
+    $days_with_attendance = count($attendance_records);
+    $completion_rate = $days_with_attendance > 0 ? round(($completed_count / $days_with_attendance) * 100, 2) : 0;
     
     debug_log("Page data prepared successfully", [
         'attendance_records_count' => count($attendance_records),
-        'total_days' => $total_days,
+        'days_with_attendance' => $days_with_attendance,
         'completed_count' => $completed_count,
         'location' => LOCATION_NAME,
         'radius' => MAX_DISTANCE_METERS . 'm'
@@ -1430,6 +1423,7 @@ try {
     // Set default values to prevent fatal errors
     $attendance_records = [];
     $total_days = 0;
+    $days_with_attendance = 0;
     $completed_count = 0;
     $incomplete_count = 0;
     $completion_rate = 0;
@@ -1544,7 +1538,7 @@ if (!empty($error_output)) {
         .page-header { background: white; padding: 20px 24px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 24px; }
         .page-title { font-size: 28px; font-weight: 700; color: #1a1a1a; margin: 0; }
         
-        /* Summary */
+        /* Summary - MODIFIED to show days with attendance only */
         .attendance-summary { display: flex; gap: 15px; margin-top: 15px; flex-wrap: wrap; }
         .summary-item { padding: 12px 20px; border-radius: 8px; background-color: #f8f9fa; min-width: 150px; text-align: center; }
         .summary-label { font-size: 12px; color: #6b7280; margin-bottom: 5px; font-weight: 600; text-transform: uppercase; }
@@ -1748,15 +1742,7 @@ if (!empty($error_output)) {
                 </div>
             </div>
 
-            <!-- Location Info Card (New) -->
-            <div style="background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 8px; padding: 15px; margin-bottom: 20px; color: white; display: flex; align-items: center; gap: 15px;">
-                <i class="fas fa-map-pin" style="font-size: 24px;"></i>
-                <div>
-                    <strong>Training Location:</strong> <?php echo htmlspecialchars(LOCATION_NAME ?: 'Main Office'); ?><br>
-                    <small>📍 <?php echo CENTER_LAT; ?>, <?php echo CENTER_LNG; ?> • Allowed radius: <?php echo MAX_DISTANCE_METERS; ?> meters</small>
-                </div>
-            </div>
-
+          
             <!-- Attendance Card -->
             <div class="attendance-card">
                 <h2>Trainer's Attendance</h2>
@@ -1789,7 +1775,7 @@ if (!empty($error_output)) {
                 </div>
             </div>
 
-            <!-- Attendance Statistics -->
+            <!-- Attendance Statistics - MODIFIED to show days with attendance only -->
             <div class="page-header">
                 <h2 class="page-title"><i class="fas fa-chart-line"></i> Attendance Statistics</h2>
                 <div class="attendance-summary">
@@ -1799,29 +1785,11 @@ if (!empty($error_output)) {
                             <?php echo date('M d, Y', strtotime($start_date)); ?> - <?php echo date('M d, Y', strtotime($end_date)); ?>
                         </div>
                     </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Total Days</div>
-                        <div class="summary-value"><?php echo $total_days; ?></div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Completed Days</div>
-                        <div class="summary-value"><?php echo $completed_count; ?></div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Completion Rate</div>
-                        <div class="summary-value"><?php echo $completion_rate; ?>%</div>
-                    </div>
+                    
                 </div>
             </div>
 
-            <!-- Attendance Records Table -->
-            <div class="page-header" style="margin-top: 20px;">
-                <h2 class="page-title"><i class="fas fa-history"></i> Attendance History</h2>
-                <div style="margin-top: 10px; font-size: 14px; color: #666;">
-                    Showing attendance records for <strong><?php echo htmlspecialchars($fullname); ?></strong>
-                    (User ID: <?php echo $user_id; ?>) at <strong><?php echo htmlspecialchars(LOCATION_NAME ?: 'Main Office'); ?></strong>
-                </div>
-            </div>
+        
 
             <!-- Date Range Filter -->
             <div class="filter-container">
@@ -1872,7 +1840,7 @@ if (!empty($error_output)) {
                 <div class="table-header">
                     <i class="fas fa-calendar-alt"></i> Attendance Records 
                     <span style="font-size: 14px; margin-left: 10px;">
-                        (Showing <?php echo $total_days; ?> days from <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?>)
+                        (Showing <?php echo count($attendance_records); ?> days with attendance from <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?>)
                     </span>
                 </div>
                 <div class="table-container">

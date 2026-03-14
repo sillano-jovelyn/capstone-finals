@@ -1432,13 +1432,9 @@ function formatDateTime($dateTimeStr) {
                                     <div class="attendance-progress-bar">
                                         <div class="attendance-progress-fill" style="width: <?php echo $program['attendance_percentage']; ?>%"></div>
                                     </div>
-                                    <div class="attendance-progress-text"><?php echo round($program['attendance_percentage'], 1); ?>%</div>
-                                    <small style="color: #666; font-size: 0.8rem;">
-                                        <i class="fas fa-info-circle"></i> Minimum required: 80% attendance
-                                    </small>
-                                </div>
+                                    
                             <?php endif; ?>
-                            
+                            <br>
                             <p><b>Assessment:</b> 
                                 <?php if ($program['assessment']): ?>
                                     <span style="color: <?php echo $program['assessment_passed'] ? '#10b981' : '#dc2626'; ?>; font-weight: bold;">
@@ -1692,7 +1688,7 @@ function formatDateTime($dateTimeStr) {
                                     <div class="certificate-requirements">
                                         <p><strong>Certificate Requirements Met:</strong></p>
                                         <div class="requirement requirement-met">
-                                            <i class="fas fa-check-circle"></i> Attendance: 80% or more
+                                            <i class="fas fa-check-circle"></i> Attendance
                                         </div>
                                         <div class="requirement requirement-met">
                                             <i class="fas fa-check-circle"></i> Assessment: Passed
@@ -1735,11 +1731,7 @@ function formatDateTime($dateTimeStr) {
                                     <h5><i class="fas fa-clock"></i> Awaiting Assessment</h5>
                                     <p>Your attendance requirement is met. Waiting for trainer to assess your performance.</p>
                                 </div>
-                            <?php elseif (!$program['attendance_met'] && $program['program_has_started']): ?>
-                                <div class="assessment-info">
-                                    <h5><i class="fas fa-running"></i> Training in Progress</h5>
-                                    <p>Current attendance: <?php echo $program['attendance_percentage']; ?>% (Need 80% minimum)</p>
-                                </div>
+                           
                             <?php endif; ?>
                         </div>
                     <?php endforeach; ?>
@@ -1771,8 +1763,7 @@ function formatDateTime($dateTimeStr) {
                                 <div class="attendance-progress-bar">
                                     <div class="attendance-progress-fill" style="width: <?php echo $program['attendance_percentage']; ?>%"></div>
                                 </div>
-                                <div class="attendance-progress-text"><?php echo round($program['attendance_percentage'], 1); ?>%</div>
-                            </div>
+                               
                             
                             <p><b>Assessment:</b> 
                                 <?php if ($program['assessment']): ?>

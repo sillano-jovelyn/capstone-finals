@@ -485,18 +485,18 @@ if (isset($_POST['calculate_all_results'])) {
             $conn->query("UPDATE assessment_components SET 
                 overall_total_score = $total,
                 overall_result = '$overall_result',
-                 assessment = '$overall_result', 
                 assessed_by = '$fullname',
                 assessed_at = NOW(),
                 is_finalized = 1
                 WHERE enrollment_id = $enrollment_id");
             
+           
             // Update enrollments table
             $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
             $conn->query("UPDATE enrollments SET 
                 enrollment_status = '$enrollment_status',
                 overall_result = '$overall_result',
-                completion_date = NOW(),
+                completed_at = NOW(),
                 assessment = '$overall_result', 
                 assessed_by = '$fullname',
                 assessed_at = NOW()
@@ -522,6 +522,9 @@ if (isset($_POST['finalize_all_completed'])) {
     
     foreach ($enrollments as $enrollment) {
         $enrollment_id = $enrollment['id'];
+        $user_id = $enrollment['user_id']; // Make sure this exists in your enrollments array
+        $program_id = $enrollment['program_id']; // Make sure this exists
+        
         $assessment = $conn->query("SELECT * FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
         
         if ($assessment) {
@@ -540,25 +543,73 @@ if (isset($_POST['finalize_all_completed'])) {
                 if ($overall_result == 'Passed') $passed_count++;
                 else $failed_count++;
                 
-                // Update assessment_components
-                $conn->query("UPDATE assessment_components SET 
-                    overall_total_score = $total,
-                    overall_result = '$overall_result',
-                    assessed_by = '$fullname',
+                // Update assessment_components (using prepared statement for security)
+                $update_assessment = $conn->prepare("UPDATE assessment_components SET 
+                    overall_total_score = ?,
+                    overall_result = ?,
+                    assessed_by = ?,
                     assessed_at = NOW(),
                     is_finalized = 1
-                    WHERE enrollment_id = $enrollment_id");
+                    WHERE enrollment_id = ?");
+                $update_assessment->bind_param("dssi", $total, $overall_result, $fullname, $enrollment_id);
+                $update_assessment->execute();
+                $update_assessment->close();
                 
                 // Update enrollments table
                 $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
-                $conn->query("UPDATE enrollments SET 
-                    enrollment_status = '$enrollment_status',
-                    overall_result = '$overall_result',
+                $update_enrollment = $conn->prepare("UPDATE enrollments SET 
+                    enrollment_status = ?,
+                    overall_result = ?,
                     completion_date = NOW(),
-                    assessed_by = '$fullname',
+                    assessed_by = ?,
                     assessed_at = NOW()
-                    WHERE id = $enrollment_id");
+                    WHERE id = ?");
+                $update_enrollment->bind_param("sssi", $enrollment_status, $overall_result, $fullname, $enrollment_id);
+                $update_enrollment->execute();
                 
+                // Update or insert into archived_history
+                // First try to update existing record
+                $update_archive = $conn->prepare("UPDATE archived_history SET 
+                    enrollment_completed_at = NOW(),
+                    enrollment_status = ?,
+                    enrollment_assessment = ?,
+                    updated_at = NOW()
+                    WHERE user_id = ? AND enrollment_id = ? AND archive_trigger = 'enrollment_completed'");
+                $update_archive->bind_param("ssii", $enrollment_status, $overall_result, $user_id, $enrollment_id);
+                $update_archive->execute();
+                
+                // If no rows were updated, insert new record
+                if ($update_archive->affected_rows === 0) {
+                    // Get program details from enrollments or programs table
+                    $program_info = $conn->query("
+                        SELECT e.*, p.name as program_name, p.duration, p.duration_unit 
+                        FROM enrollments e 
+                        LEFT JOIN programs p ON e.program_id = p.id 
+                        WHERE e.id = $enrollment_id
+                    ")->fetch_assoc();
+                    
+                    $insert_archive = $conn->prepare("INSERT INTO archived_history 
+                        (user_id, original_program_id, enrollment_id, enrollment_status, 
+                         enrollment_assessment, enrollment_completed_at, archive_trigger, 
+                         archive_source, program_name, program_duration, program_duration_unit)
+                        VALUES (?, ?, ?, ?, ?, NOW(), 'enrollment_completed', 'direct_from_programs',
+                                ?, ?, ?)");
+                    $insert_archive->bind_param("iiissssi", 
+                        $user_id, 
+                        $program_id, 
+                        $enrollment_id, 
+                        $enrollment_status, 
+                        $overall_result,
+                        $program_info['program_name'],
+                        $program_info['duration'],
+                        $program_info['duration_unit']
+                    );
+                    $insert_archive->execute();
+                    $insert_archive->close();
+                }
+                $update_archive->close();
+                
+                $update_enrollment->close();
                 $updated++;
             }
         }
@@ -569,107 +620,6 @@ if (isset($_POST['finalize_all_completed'])) {
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=summary");
     exit;
 }
-
-// ============================================
-// GENERATE CERTIFICATES FOR PASSED TRAINEES
-// ============================================
-if (isset($_POST['generate_certificates'])) {
-    $generated = 0;
-    $errors = 0;
-    
-    foreach ($enrollments as $enrollment) {
-        // Check both assessment and enrollment for passed status
-        $passed = ($enrollment['assessment_result'] == 'Passed' || $enrollment['overall_result'] == 'Passed');
-        
-        if ($passed) {
-            // Check if certificate already exists
-            $check_cert = $conn->query("SELECT id FROM certificates WHERE enrollment_id = {$enrollment['id']}");
-            
-            if ($check_cert->num_rows == 0) {
-                // Generate certificate number
-                $certificate_number = 'CERT-' . date('Y') . '-' . str_pad($enrollment['id'], 6, '0', STR_PAD_LEFT);
-                
-                // Here you would generate the actual PDF certificate
-                // For now, we'll just save the record
-                $stmt = $conn->prepare("INSERT INTO certificates (enrollment_id, certificate_number, issued_date) VALUES (?, ?, NOW())");
-                $stmt->bind_param("is", $enrollment['id'], $certificate_number);
-                
-                if ($stmt->execute()) {
-                    $generated++;
-                } else {
-                    $errors++;
-                }
-            }
-        }
-    }
-    
-    $_SESSION['message'] = "$generated certificate(s) generated successfully!" . ($errors ? " ($errors errors)" : "");
-    $_SESSION['message_type'] = $errors ? 'warning' : 'success';
-    header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=summary");
-    exit;
-}
-
-// ============================================
-// SEND RESULT NOTIFICATIONS
-// ============================================
-if (isset($_POST['send_notifications'])) {
-    $sent = 0;
-    $errors = 0;
-    
-    foreach ($enrollments as $enrollment) {
-        // Get trainee info
-        $trainee = $conn->query("SELECT email, fullname FROM trainees WHERE user_id = {$enrollment['user_id']}")->fetch_assoc();
-        
-        if ($trainee && !empty($trainee['email']) && !empty($enrollment['overall_result'])) {
-            // Get assessment scores
-            $assessment = $conn->query("SELECT * FROM assessment_components WHERE enrollment_id = {$enrollment['id']}")->fetch_assoc();
-            
-            $practical = $assessment['practical_score'] ?? 'N/A';
-            $project = $assessment['project_score'] ?? 'N/A';
-            $oral = $assessment['oral_score'] ?? 'N/A';
-            $oral_max = $assessment['oral_max_score'] ?? '100';
-            
-            // Prepare email content
-            $to = $trainee['email'];
-            $subject = "Assessment Results - " . $program['name'];
-            
-            $message = "<html><body>";
-            $message .= "<h2>Assessment Results</h2>";
-            $message .= "<p>Dear <strong>" . $trainee['fullname'] . "</strong>,</p>";
-            $message .= "<p>Your assessment for the program <strong>" . $program['name'] . "</strong> has been completed.</p>";
-            $message .= "<h3>Your Scores:</h3>";
-            $message .= "<table border='1' cellpadding='8' cellspacing='0'>";
-            $message .= "<tr><th>Component</th><th>Score</th><th>Status</th></tr>";
-            $message .= "<tr><td>Practical Skills</td><td>" . $practical . "/100</td><td>" . ($practical >= 75 ? 'PASSED' : ($practical > 0 ? 'FAILED' : 'Pending')) . "</td></tr>";
-            $message .= "<tr><td>Project Output</td><td>" . $project . "/100</td><td>" . ($project >= 75 ? 'PASSED' : ($project > 0 ? 'FAILED' : 'Pending')) . "</td></tr>";
-            $message .= "<tr><td>Oral Examination</td><td>" . $oral . "/" . $oral_max . "</td><td>" . ($oral >= ($oral_max * 0.75) ? 'PASSED' : ($oral > 0 ? 'FAILED' : 'Pending')) . "</td></tr>";
-            $message .= "</table>";
-            $message .= "<p><strong>Overall Result: " . $enrollment['overall_result'] . "</strong></p>";
-            $message .= "<p>Thank you for participating in our program.</p>";
-            $message .= "</body></html>";
-            
-            $headers = "MIME-Version: 1.0\r\n";
-            $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
-            $headers .= "From: noreply@" . $_SERVER['HTTP_HOST'] . "\r\n";
-            
-            // Uncomment to actually send emails
-            // if (mail($to, $subject, $message, $headers)) {
-            //     $sent++;
-            // } else {
-            //     $errors++;
-            // }
-            
-            // For testing, just count as sent
-            $sent++;
-        }
-    }
-    
-    $_SESSION['message'] = "$sent notification(s) sent successfully!" . ($errors ? " ($errors failed)" : "");
-    $_SESSION['message_type'] = $errors ? 'warning' : 'success';
-    header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=summary");
-    exit;
-}
-
 // ============================================
 // TOGGLE VISIBILITY FOR ALL
 // ============================================
@@ -762,9 +712,9 @@ foreach ($enrollments as $e) {
     elseif ($overall_result == 'Failed') $failed_count++;
     else $pending_count++;
     
-    if (!is_null($e['practical_score'])) $practical_completed++;
-    if (!is_null($e['project_score'])) $project_completed++;
-    if (!is_null($e['oral_score'])) $oral_completed++;
+    if (!is_null($e['practical_score']) && $e['practical_score'] > 0) $practical_completed++;
+    if (!is_null($e['project_score']) && $e['project_score'] > 0) $project_completed++;
+    if (!is_null($e['oral_score']) && $e['oral_score'] > 0) $oral_completed++;
     if (!empty($e['practical_skills_grading'])) $skills_loaded++;
     if (!empty($e['oral_questions_set'])) $questions_loaded++;
     if (!empty($e['project_submitted_by_trainee'])) $project_submitted++;
@@ -930,20 +880,101 @@ foreach ($enrollments as $enrollment) {
             font-size: 11px;
         }
         
+        /* Print Styles */
         @media print {
-            .tabs, .btn-group, .btn, .back-link, .bulk-actions, .program-section, 
-            .toggle-switch, .image-modal, .close-modal {
+            .header, .tabs, .btn-group, .btn, .back-link, .bulk-actions, .program-section, 
+            .toggle-switch, .image-modal, .close-modal, .stats-grid, .summary-stats,
+            .bulk-actions, .program-section, .print\\:hidden {
                 display: none !important;
             }
-            table { border: 1px solid #000; }
-            th { background: #ccc !important; }
+            
+            body { background: white; padding: 0; }
+            .container { max-width: 100%; margin: 0; padding: 20px; }
+            
+            .table-container { 
+                box-shadow: none; 
+                padding: 0; 
+                margin: 0; 
+                background: white;
+            }
+            
+            table { 
+                border-collapse: collapse; 
+                width: 100%;
+                border: 1px solid #000;
+                font-size: 10pt;
+            }
+            
+            th { 
+                background: #333 !important; 
+                color: white !important; 
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            td, th { 
+                border: 1px solid #000; 
+                padding: 6px;
+            }
+            
+            .badge {
+                border: 1px solid #000;
+                padding: 2px 5px;
+                background: none !important;
+                color: #000 !important;
+                font-weight: bold;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            .badge-success { 
+                background: #d4edda !important; 
+                color: #155724 !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            .badge-danger { 
+                background: #f8d7da !important; 
+                color: #721c24 !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            .badge-warning { 
+                background: #fff3cd !important; 
+                color: #856404 !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            
+            tr:nth-child(even) { background: #f9f9f9; }
+            
+            .footer { display: block; }
+        }
+        
+        .print-header {
+            display: none;
+        }
+        
+        @media print {
+            .print-header {
+                display: block;
+                text-align: center;
+                margin-bottom: 30px;
+                padding-bottom: 20px;
+                border-bottom: 2px solid #333;
+            }
+            .print-header h1 { font-size: 24px; margin-bottom: 10px; }
+            .print-header h2 { font-size: 18px; color: #666; margin-bottom: 5px; }
+            .print-header .date { font-size: 14px; color: #888; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <a href="trainer_participants.php" class="back-link">
-            <i class="fas fa-arrow-left"></i> Back to trainer's Participants
+            <i class="fas fa-arrow-left"></i> Back to Participants
         </a>
         
         <div class="header">
@@ -964,7 +995,8 @@ foreach ($enrollments as $enrollment) {
                 <i class="fas fa-info-circle"></i> <?php echo htmlspecialchars($message); ?>
             </div>
         <?php endif; ?>
-  
+        
+     
         
         <!-- Tabs -->
         <div class="tabs">
@@ -1604,27 +1636,65 @@ foreach ($enrollments as $enrollment) {
             <!-- Calculate All Button -->
             <div class="bulk-actions">
                 <h4><i class="fas fa-calculator"></i> Finalize Assessments</h4>
+                <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                    <form method="POST" style="display: inline;" onsubmit="return confirm('Calculate results for ALL trainees? This will update overall results based on current scores.');">
+                        <button type="submit" name="calculate_all_results" class="btn btn-primary">
+                            <i class="fas fa-calculator"></i> Calculate All Results
+                        </button>
+                    </form>
+                </div>
             </div>
 
-           
+            <!-- Print Button and Program Info -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
+                <div style="background: #f8f9fa; padding: 10px 15px; border-radius: 8px;">
+                    <strong>Program:</strong> <?php echo htmlspecialchars($program['name']); ?> | 
+                    <strong>Total Trainees:</strong> <?php echo $total_trainees; ?> |
+                    <strong>Date:</strong> <?php echo date('F d, Y'); ?>
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button onclick="printSummary()" class="btn btn-primary">
+                        <i class="fas fa-print"></i> Print Summary
+                    </button>
+                </div>
+            </div>
+
+            <!-- Summary Statistics -->
+            <div class="summary-stats">
+                <div class="summary-stat-item">
+                    <div class="summary-stat-number"><?php echo $passed_count; ?></div>
+                    <div class="summary-stat-label">Passed</div>
+                </div>
+                <div class="summary-stat-item">
+                    <div class="summary-stat-number"><?php echo $failed_count; ?></div>
+                    <div class="summary-stat-label">Failed</div>
+                </div>
+                <div class="summary-stat-item">
+                    <div class="summary-stat-number"><?php echo $pending_count; ?></div>
+                    <div class="summary-stat-label">Pending</div>
+                </div>
+                <div class="summary-stat-item">
+                    <div class="summary-stat-number"><?php echo $completion_rate; ?>%</div>
+                    <div class="summary-stat-label">Completion Rate</div>
+                </div>
+            </div>
 
             <!-- Summary Table -->
-            <div class="table-container">
-                <table id="summaryTable">
+            <div class="table-container" id="summaryTable">
+                <table>
                     <thead>
                         <tr>
                             <th width="3%">#</th>
-                            <th width="15%">Trainee</th>
+                            <th width="15%">Trainee Name</th>
                             <th width="8%">Practical (100)</th>
-                            <th width="8%">Status</th>
+                            <th width="8%">Practical Status</th>
                             <th width="8%">Project (100)</th>
-                            <th width="8%">Status</th>
+                            <th width="8%">Project Status</th>
                             <th width="10%">Oral</th>
-                            <th width="8%">Status</th>
+                            <th width="8%">Oral Status</th>
                             <th width="8%">Total</th>
                             <th width="8%">Result</th>
-                            <th width="8%">Final Status</th>
-                            <th width="8%">Action</th>
+                            <th width="8%">Status</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1669,12 +1739,9 @@ foreach ($enrollments as $enrollment) {
                                 $result_class = 'badge-warning';
                                 $result_text = 'PENDING';
                             }
-                            
-                            // Determine if all components are completed
-                            $all_completed = ($practical > 0 && $project > 0 && $oral > 0);
                         ?>
                         <tr>
-                            <td><?php echo $index + 1; ?></td>
+                            <td style="text-align: center;"><?php echo $index + 1; ?></td>
                             <td>
                                 <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
                                 <div style="font-size: 11px; color: #666;"><?php echo htmlspecialchars($enrollment['email']); ?></div>
@@ -1682,31 +1749,31 @@ foreach ($enrollments as $enrollment) {
                             <td style="text-align: center; font-weight: bold;"><?php echo $practical ?: '-'; ?></td>
                             <td style="text-align: center;">
                                 <?php if ($practical_status == 'PASS'): ?>
-                                    <span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>
+                                    <span class="badge badge-success">PASS</span>
                                 <?php elseif ($practical_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>
+                                    <span class="badge badge-danger">FAIL</span>
                                 <?php else: ?>
-                                    <span class="badge badge-warning"><i class="fas fa-clock"></i> Pending</span>
+                                    <span class="badge badge-warning">Pending</span>
                                 <?php endif; ?>
                             </td>
                             <td style="text-align: center; font-weight: bold;"><?php echo $project ?: '-'; ?></td>
                             <td style="text-align: center;">
                                 <?php if ($project_status == 'PASS'): ?>
-                                    <span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>
+                                    <span class="badge badge-success">PASS</span>
                                 <?php elseif ($project_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>
+                                    <span class="badge badge-danger">FAIL</span>
                                 <?php else: ?>
-                                    <span class="badge badge-warning"><i class="fas fa-clock"></i> Pending</span>
+                                    <span class="badge badge-warning">Pending</span>
                                 <?php endif; ?>
                             </td>
                             <td style="text-align: center; font-weight: bold;"><?php echo $oral ? $oral . '/' . $oral_max : '-'; ?></td>
                             <td style="text-align: center;">
                                 <?php if ($oral_status == 'PASS'): ?>
-                                    <span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>
+                                    <span class="badge badge-success">PASS</span>
                                 <?php elseif ($oral_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>
+                                    <span class="badge badge-danger">FAIL</span>
                                 <?php else: ?>
-                                    <span class="badge badge-warning"><i class="fas fa-clock"></i> Pending</span>
+                                    <span class="badge badge-warning">Pending</span>
                                 <?php endif; ?>
                             </td>
                             <td style="text-align: center; font-weight: bold;"><?php echo $total ?: '-'; ?></td>
@@ -1714,29 +1781,18 @@ foreach ($enrollments as $enrollment) {
                                 <span class="badge <?php echo $result_class; ?>"><?php echo $result_text; ?></span>
                             </td>
                             <td style="text-align: center;">
-                                <?php if ($all_completed): ?>
-                                    <?php if (!empty($enrollment['is_finalized'])): ?>
-                                        <span class="badge" style="background: #6f42c1; color: white;">
-                                            <i class="fas fa-check-circle"></i> Finalized
-                                        </span>
-                                    <?php else: ?>
-                                        <span class="badge badge-success"><i class="fas fa-check"></i> Complete</span>
-                                    <?php endif; ?>
+                                <?php if ($practical > 0 && $project > 0 && $oral > 0): ?>
+                                    <span class="badge badge-success">Complete</span>
                                 <?php else: ?>
-                                    <span class="badge badge-warning"><i class="fas fa-spinner"></i> Incomplete</span>
+                                    <span class="badge badge-warning">Incomplete</span>
                                 <?php endif; ?>
-                            </td>
-                            <td style="text-align: center;">
-                                <a href="comprehensive_assessment.php?enrollment_id=<?php echo $enrollment['id']; ?>" class="btn btn-info btn-sm" target="_blank" title="View Details">
-                                    <i class="fas fa-external-link-alt"></i>
-                                </a>
                             </td>
                         </tr>
                         <?php endforeach; ?>
                         
                         <?php if (!empty($enrollments)): ?>
                         <tr style="background: #e8f5e9; font-weight: bold;">
-                            <td colspan="2">AVERAGES / TOTALS</td>
+                            <td colspan="2" style="text-align: right;">TOTALS / AVERAGES:</td>
                             <td style="text-align: center;"><?php echo $practical_count ? round($total_practical / $practical_count, 1) : 0; ?></td>
                             <td></td>
                             <td style="text-align: center;"><?php echo $project_count ? round($total_project / $project_count, 1) : 0; ?></td>
@@ -1744,7 +1800,7 @@ foreach ($enrollments as $enrollment) {
                             <td style="text-align: center;"><?php echo $oral_count ? round($total_oral / $oral_count, 1) : 0; ?></td>
                             <td></td>
                             <td style="text-align: center;"><?php echo $total_trainees ? round($total_overall / $total_trainees, 1) : 0; ?></td>
-                            <td colspan="3"></td>
+                            <td colspan="2"></td>
                         </tr>
                         <?php endif; ?>
                     </tbody>
@@ -1762,16 +1818,13 @@ foreach ($enrollments as $enrollment) {
             <div class="bulk-actions" style="margin-top: 20px; border-color: #667eea;">
                 <h4><i class="fas fa-check-double"></i> Batch Finalization</h4>
                 <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                    <form method="POST" style="display: inline;" onsubmit="return confirm('Mark all completed assessments as FINALIZED? This will calculate results and update enrollment status. This action cannot be undone.');">
+                    <form method="POST" style="display: inline;" onsubmit="return confirm('Finalize ALL completed assessments? This will update enrollment status and cannot be undone.');">
                         <input type="hidden" name="finalize_all_completed" value="1">
                         <button type="submit" class="btn btn-primary">
                             <i class="fas fa-check-circle"></i> Finalize All Completed
                         </button>
                     </form>
-                    
-               
                 </div>
-             
             </div>
         <?php endif; ?>
     </div>
@@ -2029,79 +2082,6 @@ foreach ($enrollments as $enrollment) {
             document.getElementById('answerModal').style.display = 'none';
         }
         
-        // Summary tab functions
-        function confirmBulkCalculate() {
-            return Swal.fire({
-                title: 'Calculate & Finalize All Results?',
-                html: `This will:<br><br>
-                       • Calculate overall PASS/FAIL for all trainees<br>
-                       • Save results to <strong>assessment_components</strong> table<br>
-                       • Update <strong>enrollment_status</strong> in enrollments table<br>
-                       • Set <strong>completion_date</strong> for completed assessments<br>
-                       • Mark assessments as <strong>finalized</strong><br><br>
-                       This action cannot be undone.`,
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#28a745',
-                cancelButtonColor: '#6c757d',
-                confirmButtonText: 'Yes, calculate all'
-            }).then((result) => {
-                return result.isConfirmed;
-            });
-        }
-        
-        function exportToExcel() {
-            // Get table data
-            const table = document.getElementById('summaryTable');
-            const rows = [];
-            
-            // Get headers
-            const headers = [];
-            const headerCells = table.querySelectorAll('thead th');
-            headerCells.forEach(cell => {
-                headers.push(cell.innerText.trim());
-            });
-            rows.push(headers);
-            
-            // Get data rows (skip if no data)
-            const dataRows = table.querySelectorAll('tbody tr');
-            dataRows.forEach(row => {
-                const rowData = [];
-                const cells = row.querySelectorAll('td');
-                cells.forEach(cell => {
-                    // Clean the cell text (remove HTML tags, trim)
-                    let text = cell.innerText.trim().replace(/\n/g, ' ').replace(/\s+/g, ' ');
-                    rowData.push(text);
-                });
-                if (rowData.length > 0) {
-                    rows.push(rowData);
-                }
-            });
-            
-            // Create CSV
-            let csv = '';
-            rows.forEach(row => {
-                csv += row.map(cell => `"${cell}"`).join(',') + '\n';
-            });
-            
-            // Download CSV
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'assessment_summary_<?php echo $program_id; ?>_' + new Date().toISOString().slice(0,10) + '.csv';
-            a.click();
-            window.URL.revokeObjectURL(url);
-            
-            Swal.fire({
-                icon: 'success',
-                title: 'Exported!',
-                text: 'Summary has been exported to CSV.',
-                timer: 2000,
-                showConfirmButton: false
-            });
-        }
-        
         // Helper function to add form fields
         function addField(form, name, value) {
             const input = document.createElement('input');
@@ -2109,6 +2089,215 @@ foreach ($enrollments as $enrollment) {
             input.name = name;
             input.value = value;
             form.appendChild(input);
+        }
+        
+        // Print Summary Function
+        function printSummary() {
+            // Create a new window for printing
+            const printWindow = window.open('', '_blank');
+            
+            // Get current date
+            const today = new Date();
+            const options = { year: 'numeric', month: 'long', day: 'numeric' };
+            const formattedDate = today.toLocaleDateString('en-US', options);
+            
+            // Get the program name
+            const programName = '<?php echo htmlspecialchars($program['name']); ?>';
+            
+            // Get the table HTML
+            const table = document.querySelector('#summaryTable table').cloneNode(true);
+            
+            // Create print content
+            const printContent = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Assessment Summary - ${programName}</title>
+                    <style>
+                        body {
+                            font-family: Arial, sans-serif;
+                            margin: 40px;
+                            line-height: 1.4;
+                        }
+                        .print-header {
+                            text-align: center;
+                            margin-bottom: 30px;
+                            padding-bottom: 20px;
+                            border-bottom: 2px solid #333;
+                        }
+                        .print-header h1 {
+                            color: #333;
+                            margin-bottom: 10px;
+                            font-size: 24px;
+                        }
+                        .print-header h2 {
+                            color: #666;
+                            margin-bottom: 5px;
+                            font-size: 18px;
+                        }
+                        .print-header .date {
+                            color: #888;
+                            font-size: 14px;
+                        }
+                        .program-info {
+                            margin-bottom: 20px;
+                            padding: 10px;
+                            background: #f5f5f5;
+                            border-radius: 5px;
+                        }
+                        .stats-summary {
+                            display: flex;
+                            justify-content: space-around;
+                            margin-bottom: 20px;
+                            padding: 15px;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            color: white;
+                            border-radius: 8px;
+                        }
+                        .stat-item {
+                            text-align: center;
+                        }
+                        .stat-number {
+                            font-size: 24px;
+                            font-weight: bold;
+                        }
+                        .stat-label {
+                            font-size: 12px;
+                            opacity: 0.9;
+                        }
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            margin-top: 20px;
+                            font-size: 12px;
+                        }
+                        th {
+                            background: #333;
+                            color: white;
+                            padding: 10px;
+                            text-align: left;
+                            font-size: 12px;
+                        }
+                        td {
+                            padding: 8px;
+                            border: 1px solid #ddd;
+                        }
+                        tr:nth-child(even) {
+                            background: #f9f9f9;
+                        }
+                        .badge {
+                            padding: 3px 8px;
+                            border-radius: 3px;
+                            font-size: 11px;
+                            font-weight: bold;
+                            display: inline-block;
+                        }
+                        .badge-success {
+                            background: #d4edda;
+                            color: #155724;
+                            border: 1px solid #c3e6cb;
+                        }
+                        .badge-danger {
+                            background: #f8d7da;
+                            color: #721c24;
+                            border: 1px solid #f5c6cb;
+                        }
+                        .badge-warning {
+                            background: #fff3cd;
+                            color: #856404;
+                            border: 1px solid #ffeeba;
+                        }
+                        .totals-row {
+                            background: #e8f5e9 !important;
+                            font-weight: bold;
+                        }
+                        .footer {
+                            margin-top: 30px;
+                            padding-top: 20px;
+                            border-top: 1px solid #ddd;
+                            text-align: center;
+                            font-size: 12px;
+                            color: #666;
+                        }
+                        .signature {
+                            margin-top: 50px;
+                            display: flex;
+                            justify-content: space-between;
+                        }
+                        .signature-line {
+                            width: 200px;
+                            border-top: 1px solid #333;
+                            margin-top: 40px;
+                            text-align: center;
+                        }
+                        @media print {
+                            body { margin: 0.5in; }
+                            .no-print { display: none; }
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="print-header">
+                        <h1>COMPREHENSIVE ASSESSMENT SUMMARY</h1>
+                        <h2>${programName}</h2>
+                        <div class="date">Date Printed: ${formattedDate}</div>
+                    </div>
+                    
+                    <div class="stats-summary">
+                        <div class="stat-item">
+                            <div class="stat-number"><?php echo $total_trainees; ?></div>
+                            <div class="stat-label">Total Trainees</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number"><?php echo $passed_count; ?></div>
+                            <div class="stat-label">Passed</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number"><?php echo $failed_count; ?></div>
+                            <div class="stat-label">Failed</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number"><?php echo $pending_count; ?></div>
+                            <div class="stat-label">Pending</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number"><?php echo $completion_rate; ?>%</div>
+                            <div class="stat-label">Completion Rate</div>
+                        </div>
+                    </div>
+                    
+                    ${table.outerHTML}
+                    
+                    <div class="footer">
+                        <p>This is a system-generated summary report. All scores are final and subject to validation.</p>
+                    </div>
+                    
+                    <div class="signature">
+                        <div>
+                            <div class="signature-line"></div>
+                            <p>Assessed By: _________________________</p>
+                        </div>
+                        <div>
+                            <div class="signature-line"></div>
+                            <p>Date: _________________________</p>
+                        </div>
+                    </div>
+                    
+                    <script>
+                        window.onload = function() {
+                            window.print();
+                            window.onafterprint = function() {
+                                window.close();
+                            }
+                        }
+                    <\/script>
+                </body>
+                </html>
+            `;
+            
+            // Write to new window and print
+            printWindow.document.write(printContent);
+            printWindow.document.close();
         }
         
         // Initialize all skill totals on page load

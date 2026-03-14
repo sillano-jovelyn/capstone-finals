@@ -844,15 +844,22 @@ function archiveProgramEnrollmentsAndFeedback($conn, $program_id, $program_data)
         $program_other_trainer = isset($program_data['other_trainer']) ? $program_data['other_trainer'] : '-';
         $program_show_on_index = isset($program_data['show_on_index']) ? $program_data['show_on_index'] : 0;
         
-        // Enrollment data
-        $enrollment_status = $enrollment['enrollment_status'] ?? 'pending';
-        $enrollment_applied_at = $enrollment['applied_at'];
-        $enrollment_completed_at = $enrollment['completed_at'];
+        // FIX 1: Use the actual enrollment status from the enrollments table
+        // Don't default to 'completed' - use what's actually in the database
+        $enrollment_status = $enrollment['enrollment_status'] ?? $enrollment['status'] ?? 'pending';
+        
+        // Also check if there's a 'status' field (some tables use different column names)
+        if (!isset($enrollment['enrollment_status']) && isset($enrollment['status'])) {
+            $enrollment_status = $enrollment['status'];
+        }
+        
+        $enrollment_applied_at = $enrollment['applied_at'] ?? $enrollment['created_at'] ?? null;
+        $enrollment_completed_at = $enrollment['completed_at'] ?? null;
         $enrollment_attendance = $enrollment['attendance'] ?? 0;
         $enrollment_approval_status = $enrollment['approval_status'] ?? 'pending';
-        $enrollment_approved_by = $enrollment['approved_by'];
-        $enrollment_approved_date = $enrollment['approved_date'];
-        $enrollment_assessment = $enrollment['assessment'];
+        $enrollment_approved_by = $enrollment['approved_by'] ?? null;
+        $enrollment_approved_date = $enrollment['approved_date'] ?? null;
+        $enrollment_assessment = $enrollment['assessment'] ?? null;
         
         // Feedback data (if exists)
         $feedback_id = $feedback ? $feedback['id'] : null;
@@ -875,7 +882,36 @@ function archiveProgramEnrollmentsAndFeedback($conn, $program_id, $program_data)
         $system_answers_rating = $feedback ? $feedback['system_answers'] : null;
         $system_performance_rating = $feedback ? $feedback['system_performance'] : null;
         $feedback_comments = $feedback ? $feedback['additional_comments'] : null;
+        
+        // FIX 2: Get the actual submitted_at from feedback table
         $feedback_submitted_at = $feedback ? $feedback['submitted_at'] : null;
+        
+        // If feedback_submitted_at is empty but feedback exists, try alternative field names
+        if ($feedback && empty($feedback_submitted_at)) {
+            $feedback_submitted_at = $feedback['created_at'] ?? $feedback['feedback_date'] ?? null;
+        }
+        
+        // FIX 3: Determine the correct archive_trigger
+        // Check if this enrollment was completed to set the appropriate trigger
+        $archive_trigger = 'program_ended'; // default
+        
+        // If enrollment status is 'completed', use 'enrollment_completed' as trigger
+        if ($enrollment_status === 'completed') {
+            $archive_trigger = 'enrollment_completed';
+        } 
+        // Also check if there's feedback submitted (another indicator of completion)
+        else if ($feedback_submitted_at !== null) {
+            $archive_trigger = 'enrollment_completed';
+        }
+        // Check if we're archiving because program moved to archive
+        else if (isset($program_data['is_being_archived']) && $program_data['is_being_archived'] === true) {
+            $archive_trigger = 'program_moved_to_archive';
+        }
+        
+        $archive_source = 'direct_from_programs';
+        
+        // Log the values for debugging
+        error_log("Archiving enrollment ID $enrollment_id - Status: $enrollment_status, Trigger: $archive_trigger, Feedback Submitted: " . ($feedback_submitted_at ?? 'null'));
         
         // Insert into archived_history
         $insert_sql = "INSERT INTO archived_history (
@@ -906,13 +942,14 @@ function archiveProgramEnrollmentsAndFeedback($conn, $program_id, $program_data)
             continue;
         }
         
-        // Create variables for the last two parameters
-        $archive_trigger = 'program_ended';
-        $archive_source = 'direct_from_programs';
+        // FIX 4: Fix the bind_param type string - need to count parameters correctly
+        // Based on your table structure, here's the corrected type string:
+        // i=integer, s=string, d=double
+        $types = "iiiiisissisiisiiississssiiiiiiiiiiiiiiiiiiiisss";
         
-        // Bind all 47 parameters
+        // Make sure all variables are defined (they should be from above)
         $insert_stmt->bind_param(
-            "iiiiisissisiisiiississsssiiiiiiiiiiiiiiiiiiisss", // 47 's' and 'i' placeholders
+            $types,
             $user_id,
             $program_id,
             $enrollment_id,
@@ -958,13 +995,13 @@ function archiveProgramEnrollmentsAndFeedback($conn, $program_id, $program_data)
             $feedback_comments,
             $feedback_submitted_at,
             $archived_at,
-            $archive_trigger, // Now a variable instead of string literal
-            $archive_source   // Now a variable instead of string literal
+            $archive_trigger,
+            $archive_source
         );
         
         if ($insert_stmt->execute()) {
             $count++;
-            error_log("Successfully archived enrollment ID $enrollment_id with feedback to archived_history");
+            error_log("Successfully archived enrollment ID $enrollment_id with status '$enrollment_status' and trigger '$archive_trigger'");
         } else {
             error_log("Failed to archive enrollment ID $enrollment_id: " . $insert_stmt->error);
         }

@@ -21,7 +21,7 @@ require_once __DIR__ . '/../db.php';
 // DB FUNCTIONS
 // ============================================================
 
-// NEW: Function to check if user has feedback for a program
+// Function to check if user has feedback for a program
 function hasUserFeedback($conn, $user_id, $program_id) {
     $s = $conn->prepare("SELECT COUNT(*) as count FROM feedback WHERE user_id = ? AND program_id = ?");
     $s->bind_param("si", $user_id, $program_id);
@@ -43,7 +43,7 @@ function getTrainerProgram($conn, $trainer_name) {
     return $program;
 }
 
-// MODIFIED: Updated to include pending feedback in ongoing counts
+// FIXED: Certified count now matches the certified filter criteria
 function getTraineeCountsByStatus($conn, $program_id) {
     $out = ['total'=>0, 'ongoing'=>0, 'certified'=>0, 'failed'=>0, 'dropout'=>0, 'pending_feedback'=>0];
     
@@ -52,26 +52,26 @@ function getTraineeCountsByStatus($conn, $program_id) {
     $s->bind_param("i", $program_id); $s->execute();
     $out['total'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Ongoing (includes both regular ongoing AND pending feedback)
+    // FIXED: Certified - Count trainees who are passed/certified AND have submitted feedback
+    // This matches the certified filter criteria
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e 
-                        WHERE e.program_id=? AND e.enrollment_status='approved' 
-                        AND (
-                            (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                            OR 
-                            ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id))
-                        )");
-    $s->bind_param("i", $program_id); $s->execute();
-    $out['ongoing'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
-    
-    // Certified (ONLY if they have feedback)
-    $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e JOIN trainees t ON e.user_id = t.user_id WHERE e.program_id=? AND (e.assessment='Passed' OR e.enrollment_status='certified') AND EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = e.program_id)");
+                        WHERE e.program_id=? 
+                        AND (e.assessment='Passed' OR e.enrollment_status='certified')
+                        AND EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id)");
     $s->bind_param("i", $program_id); $s->execute();
     $out['certified'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Pending Feedback (still track for informational purposes)
+    // Pending Feedback - Trainees who passed but haven't submitted feedback yet
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND (e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id)");
     $s->bind_param("i", $program_id); $s->execute();
     $out['pending_feedback'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
+    
+    // Ongoing - All approved trainees who are not passed/certified/failed
+    $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e 
+                        WHERE e.program_id=? AND e.enrollment_status='approved' 
+                        AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))");
+    $s->bind_param("i", $program_id); $s->execute();
+    $out['ongoing'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
     // Failed
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND e.assessment='Failed' AND e.enrollment_status!='rejected'");
@@ -104,7 +104,7 @@ function getCurrentProgramDay($s) {
     return $sd->diff($t)->days+1;
 }
 
-// MODIFIED: Enhanced to include pending feedback in ongoing
+// FIXED: Get trainees with consistent status display
 function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
     $today = date('Y-m-d');
     $q = "SELECT e.id as enrollment_id, e.applied_at, e.enrollment_status, e.attendance, e.assessment, e.failure_notes,
@@ -120,30 +120,19 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
           JOIN programs p ON e.program_id = p.id
           WHERE e.program_id = ?";
     
+    // FIXED: Filter conditions to match the status definitions
     if ($filter === 'ongoing') {
-        // Include both:
-        // 1. Regular ongoing trainees (not passed/failed)
-        // 2. Trainees who passed but haven't submitted feedback yet (pending feedback)
-        $q .= " AND e.enrollment_status='approved' AND (
-                    (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                    OR 
-                    ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id))
-                )";
+        // Regular ongoing trainees (not passed/certified/failed)
+        $q .= " AND e.enrollment_status='approved' 
+                AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))";
     } elseif ($filter === 'certified') {
-        // Only show as certified if they have feedback AND are passed/certified
+        // FIXED: Only show as certified if they have feedback AND are passed/certified
         $q .= " AND (e.assessment='Passed' OR e.enrollment_status='certified')";
         $q .= " AND EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id)";
     } elseif ($filter === 'failed') {
         $q .= " AND e.assessment='Failed' AND e.enrollment_status!='rejected'";
     } elseif ($filter === 'dropout') {
         $q .= " AND e.enrollment_status='rejected'";
-    } else {
-        // Default to ongoing (same as above)
-        $q .= " AND e.enrollment_status='approved' AND (
-                    (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                    OR 
-                    ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id))
-                )";
     }
     
     $q .= " ORDER BY t.fullname ASC";
@@ -156,17 +145,43 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
     foreach ($rows as &$r) {
         $r['total_days'] = calculateProgramDuration($r['scheduleStart'], $r['scheduleEnd'], $r['duration'], $r['durationUnit']);
         
-        // Override assessment/status if no feedback but marked as passed
-        if (($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') && !$r['has_feedback']) {
+        // FIXED: Determine the correct status display
+        if ($r['enrollment_status'] === 'rejected') {
+            $r['status_display'] = 'dropout';
+            $r['status_text'] = 'Dropout';
+        } elseif ($r['assessment'] === 'Failed') {
+            $r['status_display'] = 'failed';
+            $r['status_text'] = 'Failed';
+        } elseif (($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') && $r['has_feedback']) {
+            $r['status_display'] = 'certified';
+            $r['status_text'] = 'Certified';
+        } elseif (($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') && !$r['has_feedback']) {
+            $r['status_display'] = 'ongoing';
+            $r['status_text'] = 'Ongoing (Pending Feedback)';
             $r['assessment_display'] = 'Pending Feedback';
             $r['assessment_class'] = 'assessment-pending';
-            $r['status_display'] = 'ongoing'; // Changed from 'pending_feedback' to 'ongoing'
             $r['needs_feedback'] = true;
         } else {
+            $r['status_display'] = 'ongoing';
+            $r['status_text'] = 'Ongoing';
+        }
+        
+        // Set assessment display
+        if (!isset($r['assessment_display'])) {
             $r['assessment_display'] = $r['assessment'] ?? 'Not yet graded';
-            $r['status_display'] = $r['enrollment_status'] === 'rejected' ? 'dropout' : 
-                                  (($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') ? 'certified' : 
-                                  ($r['assessment'] === 'Failed' ? 'failed' : 'ongoing'));
+        }
+        
+        // Set assessment class
+        if (!isset($r['assessment_class'])) {
+            if ($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') {
+                $r['assessment_class'] = 'assessment-passed';
+            } elseif ($r['assessment'] === 'Failed') {
+                $r['assessment_class'] = 'assessment-failed';
+            } elseif ($r['assessment'] === 'Pending') {
+                $r['assessment_class'] = 'assessment-pending';
+            } else {
+                $r['assessment_class'] = 'assessment-not-graded';
+            }
         }
     }
     return $rows;
@@ -217,14 +232,10 @@ function markAllTraineesAttendanceToday($conn, $program_id, $status, $marked_by,
     if (!isTodayWithinProgramSchedule($schedStart,$schedEnd)) return ['success_count'=>0,'error_count'=>0,'message'=>'Outside program schedule'];
     if (!hasProgramStarted($schedStart))                      return ['success_count'=>0,'error_count'=>0,'message'=>'Program has not started yet'];
 
-    // Unmarked ongoing only (including pending feedback)
+    // Unmarked ongoing only
     $s=$conn->prepare("SELECT e.id as eid FROM enrollments e LEFT JOIN attendance_records ar ON e.id=ar.enrollment_id AND ar.attendance_date=? 
                        WHERE e.program_id=? AND e.enrollment_status='approved' 
-                       AND (
-                           (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                           OR 
-                           ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id))
-                       ) 
+                       AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
                        AND ar.id IS NULL");
     $s->bind_param("si",$today,$program_id); $s->execute();
     $rows=$s->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -232,11 +243,7 @@ function markAllTraineesAttendanceToday($conn, $program_id, $status, $marked_by,
     // Count already-marked ongoing
     $sk=$conn->prepare("SELECT COUNT(*) c FROM enrollments e JOIN attendance_records ar ON e.id=ar.enrollment_id 
                         WHERE e.program_id=? AND e.enrollment_status='approved' 
-                        AND (
-                            (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                            OR 
-                            ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id))
-                        ) 
+                        AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
                         AND ar.attendance_date=?");
     $sk->bind_param("is",$program_id,$today); $sk->execute();
     $skipped=$sk->get_result()->fetch_assoc()['c']??0;
@@ -246,7 +253,6 @@ function markAllTraineesAttendanceToday($conn, $program_id, $status, $marked_by,
     return ['success_count'=>$ok,'error_count'=>$err,'skipped_count'=>$skipped,'total_unmarked'=>count($rows)];
 }
 
-// MODIFIED: Updated to check for feedback before marking as Passed
 function updateTraineeAssessment($conn, $eid, $assessment, $failure_notes=null) {
     $s=$conn->prepare("SELECT user_id, program_id FROM enrollments WHERE id=?");
     $s->bind_param("i",$eid); $s->execute();
@@ -296,16 +302,11 @@ function updateTraineeAssessment($conn, $eid, $assessment, $failure_notes=null) 
     }
 }
 
-// MODIFIED: Updated to check feedback before bulk marking as passed
 function markAllTraineesPassed($conn, $program_id, $marked_by) {
     $s = $conn->prepare("SELECT e.id as eid, t.user_id FROM enrollments e 
                          JOIN trainees t ON e.user_id = t.user_id 
                          WHERE e.program_id=? AND e.enrollment_status='approved' 
-                         AND (
-                             (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
-                             OR 
-                             ((e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = e.program_id))
-                         )");
+                         AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))");
     $s->bind_param("i", $program_id); $s->execute();
     $rows = $s->get_result()->fetch_all(MYSQLI_ASSOC);
     
@@ -352,7 +353,6 @@ function markTraineeAsDropout($conn, $eid, $reason, $marked_by) {
     } catch (Exception $ex) { $conn->rollback(); error_log($ex->getMessage()); return false; }
 }
 
-// MODIFIED: Updated to include feedback info
 function getTraineeDetails($conn, $uid, $pid) {
     $s=$conn->prepare("SELECT e.id as enrollment_id,e.applied_at,e.enrollment_status,e.attendance,e.assessment,e.failure_notes,
                       t.*,p.name as program_name,p.scheduleStart,p.scheduleEnd,p.duration,p.durationUnit,
@@ -543,6 +543,7 @@ tbody tr:hover{background:#f8f9fa;}
 .att-badge.present{background:#d1fae5;color:#065f46;border:1.5px solid #6ee7b7;}
 .att-badge.absent{background:#fee2e2;color:#7f1d1d;border:1.5px solid #fca5a5;}
 .att-badge.unmarked{background:#f3f4f6;color:#6b7280;border:1.5px solid #d1d5db;}
+.att-badge.certified{background:#d4edda;color:#155724;border:1.5px solid #a3d8a3;}
 
 .progress-bar{width:100%;height:8px;background:#e0e0e0;border-radius:10px;overflow:hidden;}
 .progress-fill{height:100%;background:linear-gradient(90deg,#4A90E2,#357ABD);border-radius:10px;transition:width .3s;}
@@ -729,7 +730,6 @@ tbody tr:hover{background:#f8f9fa;}
       <div class="attendance-summary">
         <div class="summary-item"><div class="summary-label">Program</div><div class="summary-value"><?= htmlspecialchars($trainer_program['name']) ?></div></div>
         <div class="summary-item"><div class="summary-label">Schedule</div><div class="summary-value"><?= (new DateTime($trainer_program['scheduleStart']))->format('M d').' – '.(new DateTime($trainer_program['scheduleEnd']))->format('M d, Y') ?></div></div>
-
       </div>
       <?php endif; ?>
     </div>
@@ -749,7 +749,7 @@ tbody tr:hover{background:#f8f9fa;}
         <button class="btn btn-danger"  onclick="bulkAttendance('absent')"  <?= (!$program_started||$program_ended||!$within_schedule)?'disabled':'' ?>>
           <i class="fas fa-times-circle"></i> Mark All Absent</button>
         
-        <!-- UPDATED BUTTON: Bulk Assessment (no auto-mark) -->
+        <!-- Bulk Assessment -->
         <a href="bulk_comprehensive_assessment.php?program_id=<?= $program_id ?>&tab=practical" class="btn-bulk">
           <i class="fas fa-users-cog"></i> Bulk Comprehensive Assessment
         </a>
@@ -777,56 +777,40 @@ tbody tr:hover{background:#f8f9fa;}
             $total_d    = $tr['total_days']??1;
             $pct        = $tr['attendance']??0;
 
-            // Determine status and assessment display
-            if (isset($tr['needs_feedback']) && $tr['needs_feedback']) {
-                $st = 'ongoing'; // Changed from 'pending-feedback' to 'ongoing'
-                $ass_display = 'Pending Feedback';
-                $ass_cls = 'assessment-pending';
-                $is_cert = false;
-                $is_drop = false;
-                $is_failed = false;
-                $status_display_text = 'Ongoing (Pending Feedback)';
-            } else {
-                $is_drop = ($tr['enrollment_status'] === 'rejected');
-                $is_cert = ($tr['assessment'] === 'Passed' || $tr['enrollment_status'] === 'certified');
-                $is_failed = ($tr['assessment'] === 'Failed');
-                
-                if ($is_drop) {
-                    $st = 'dropout';
-                    $status_display_text = 'Dropout';
-                } elseif ($is_cert) {
-                    $st = 'certified';
-                    $status_display_text = 'Certified';
-                } elseif ($is_failed) {
-                    $st = 'failed';
-                    $status_display_text = 'Failed';
-                } else {
-                    $st = 'ongoing';
-                    $status_display_text = 'Ongoing';
-                }
-                
-                $ass_display = $tr['assessment'] ?? 'Not yet graded';
-                
-                if ($ass_display === 'Passed' || $tr['enrollment_status'] === 'certified') $ass_cls = 'assessment-passed';
-                elseif ($ass_display === 'Failed') $ass_cls = 'assessment-failed';
-                elseif ($ass_display === 'Pending') $ass_cls = 'assessment-pending';
-                else $ass_cls = 'assessment-not-graded';
-            }
+            // Use pre-calculated status from getTraineesByTrainerProgram
+            $st = $tr['status_display'];
+            $status_display_text = $tr['status_text'];
+            
+            // Use pre-calculated assessment display
+            $ass_display = $tr['assessment_display'] ?? ($tr['assessment'] ?? 'Not yet graded');
+            $ass_cls = $tr['assessment_class'] ?? 'assessment-not-graded';
+
+            $is_cert = ($st === 'certified');
+            $is_drop = ($st === 'dropout');
+            $is_failed = ($st === 'failed');
+            $is_ongoing = ($st === 'ongoing');
+            $needs_feedback = isset($tr['needs_feedback']) && $tr['needs_feedback'];
 
             $today_att  = $tr['today_attendance_status']??null;
             $is_marked  = ($today_att==='present' || $today_att==='absent');
             $att_disp = $today_att ?? 'unmarked';
 
+            // For certified trainees, today's status should show "Certified"
+            if ($is_cert) {
+                $att_disp = 'certified';
+                $today_att = 'certified';
+            }
+
             // Can attendance be marked for this trainee at all?
             $can_mark = $program_started && $within_schedule && !$program_ended
-                        && !$is_cert && !$is_drop && !$is_failed;
+                        && !$is_cert && !$is_drop && !$is_failed && !$needs_feedback;
           ?>
           <tr id="row-<?= $eid ?>"
               data-eid="<?= $eid ?>"
               data-certified="<?= $is_cert?'true':'false' ?>"
               data-dropout="<?= $is_drop?'true':'false' ?>"
               data-failed="<?= $is_failed?'true':'false' ?>"
-              data-pending-feedback="<?= isset($tr['needs_feedback'])?'true':'false' ?>"
+              data-pending-feedback="<?= $needs_feedback?'true':'false' ?>"
               data-assessment="<?= htmlspecialchars($ass_display) ?>"
               data-estatus="<?= htmlspecialchars($tr['enrollment_status']) ?>"
               data-marked="<?= $is_marked?'true':'false' ?>"
@@ -834,7 +818,7 @@ tbody tr:hover{background:#f8f9fa;}
 
             <td>
               <strong><?= htmlspecialchars($tr['fullname']) ?></strong>
-              <?php if (isset($tr['needs_feedback']) && $tr['needs_feedback']): ?>
+              <?php if ($needs_feedback): ?>
                 <span class="feedback-required"><i class="fas fa-exclamation-circle"></i> Feedback Required</span>
               <?php endif; ?>
             </td>
@@ -858,13 +842,15 @@ tbody tr:hover{background:#f8f9fa;}
               </span>
             </td>
 
-            <!-- TODAY'S STATUS -->
+            <!-- TODAY'S STATUS - Now consistent with certified filter -->
             <td>
               <span class="att-badge <?= $att_disp ?>" id="attbadge-<?= $eid ?>">
                 <?php if ($today_att==='present'): ?>
                   <i class="fas fa-check-circle"></i> Present
                 <?php elseif ($today_att==='absent'): ?>
                   <i class="fas fa-times-circle"></i> Absent
+                <?php elseif ($today_att==='certified' || $is_cert): ?>
+                  <i class="fas fa-certificate"></i> Certified
                 <?php else: ?>
                   <i class="fas fa-clock"></i> Unmarked
                 <?php endif; ?>
@@ -908,7 +894,7 @@ tbody tr:hover{background:#f8f9fa;}
 
               <?php else: ?>
                 <div style="font-size:11px;color:#9ca3af;">
-                  <?php if (isset($tr['needs_feedback']) && $tr['needs_feedback']): ?>
+                  <?php if ($needs_feedback): ?>
                     <i class="fas fa-clock"></i> Awaiting Feedback
                   <?php elseif ($is_cert):   ?>
                     <i class="fas fa-certificate"></i> Certified
@@ -935,7 +921,7 @@ tbody tr:hover{background:#f8f9fa;}
                 <button class="btn btn-warning" onclick="location.href='comprehensive_assessment.php?enrollment_id=<?= $eid ?>&program_id=<?= $program_id ?>'">
                   <i class="fas fa-clipboard-check"></i>Comprehensive Assessment</button>
                 <button class="btn btn-danger" onclick="doDropout(<?= $eid ?>)"
-                  <?= ($is_drop||$is_cert||$is_failed||isset($tr['needs_feedback']))?'disabled':'' ?>>
+                  <?= ($is_drop||$is_cert||$is_failed||$needs_feedback)?'disabled':'' ?>>
                   <i class="fas fa-user-times"></i> Dropout</button>
               </div>
             </td>
