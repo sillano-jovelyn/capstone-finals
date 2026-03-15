@@ -429,7 +429,7 @@ function deactivatePastPrograms($conn) {
             FROM programs p 
             LEFT JOIN program_categories pc ON p.category_id = pc.id 
             WHERE p.status = 'active' 
-            AND DATE(p.scheduleEnd) <= ?";
+            AND DATE(p.scheduleEnd) < ?";
     
     $stmt = $conn->prepare($sql);
     
@@ -817,6 +817,26 @@ function archiveProgramEnrollmentsAndFeedback($conn, $program_id, $program_data)
         $user_id = $enrollment['user_id'];
         
         error_log("Processing enrollment ID: $enrollment_id for user ID: $user_id");
+        
+        // CHECK IF THIS ENROLLMENT ALREADY EXISTS IN archived_history
+        $check_sql = "SELECT id FROM archived_history WHERE enrollment_id = ? AND user_id = ?";
+        $check_stmt = $conn->prepare($check_sql);
+        
+        if ($check_stmt) {
+            $check_stmt->bind_param("ii", $enrollment_id, $user_id);
+            $check_stmt->execute();
+            $check_result = $check_stmt->get_result();
+            
+            if ($check_result->num_rows > 0) {
+                error_log("Enrollment ID $enrollment_id for user ID $user_id already exists in archived_history. Skipping...");
+                $check_stmt->close();
+                continue; // Skip this enrollment if it already exists
+            }
+            $check_stmt->close();
+        } else {
+            error_log("Prepare failed for duplicate check query: " . $conn->error);
+            // Continue with the insertion attempt even if check fails
+        }
         
         // Get feedback for this user and program (if exists)
         $feedback_sql = "SELECT * FROM feedback WHERE user_id = ? AND program_id = ?";
