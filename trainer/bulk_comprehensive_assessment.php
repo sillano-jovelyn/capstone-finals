@@ -1,5 +1,5 @@
 <?php
-// BULK COMPREHENSIVE ASSESSMENT
+// BULK COMPREHENSIVE ASSESSMENT WITH RUBRIC SCORING - PRESERVES TRAINEE SUBMISSIONS
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
@@ -15,15 +15,12 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'trainer') {
 $user_id = $_SESSION['user_id'];
 $fullname = $_SESSION['fullname'] ?? 'Trainer';
 
-
 // DATABASE CONNECTION
-
 require_once __DIR__ . '/../db.php';
 
 if (!$conn) {
     die("Database connection failed");
 }
-
 
 // GET PROGRAM ID
 $program_id = isset($_GET['program_id']) ? intval($_GET['program_id']) : 0;
@@ -32,7 +29,6 @@ if (!$program_id) {
     header('Location: trainer_programs.php');
     exit;
 }
-
 
 // GET PROGRAM INFO
 $program = $conn->query("SELECT * FROM programs WHERE id = $program_id")->fetch_assoc();
@@ -166,7 +162,6 @@ if (isset($_POST['load_questions_to_all'])) {
     exit;
 }
 
-
 // SAVE BULK PASSING PERCENTAGES
 if (isset($_POST['save_bulk_passing_percentages'])) {
     $practical_passing = floatval($_POST['practical_passing_percentage'] ?? 75);
@@ -205,7 +200,7 @@ if (isset($_POST['save_bulk_passing_percentages'])) {
     exit;
 }
 
-// SAVE BULK PROJECT SETUP (Title, Instructions, Rubrics)
+// SAVE BULK PROJECT SETUP (Title, Instructions, Rubrics) - PRESERVES TRAINEE SUBMISSIONS
 if (isset($_POST['save_bulk_project_setup'])) {
     $project_title_override = $conn->real_escape_string($_POST['project_title_override'] ?? '');
     $project_instruction = $conn->real_escape_string($_POST['project_instruction'] ?? '');
@@ -224,24 +219,158 @@ if (isset($_POST['save_bulk_project_setup'])) {
     foreach ($enrollments as $enrollment) {
         $enrollment_id = $enrollment['id'];
         
+        // Get existing assessment to preserve trainee submission
+        $existing = $conn->query("SELECT project_title, project_description, project_photo_path, 
+                                          project_submitted_by_trainee, project_submitted_at, project_rubrics,
+                                          project_score, project_passed
+                                   FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
+        
+        // Merge existing scores with new rubric structure if available
+        $existing_rubrics = [];
+        if ($existing && !empty($existing['project_rubrics'])) {
+            $existing_rubrics = json_decode($existing['project_rubrics'], true);
+            if (!is_array($existing_rubrics)) $existing_rubrics = [];
+        }
+        
+        // Create merged rubrics - preserve existing scores if criteria match by name
+        $merged_rubrics = [];
+        foreach ($rubrics_data as $new_criterion) {
+            $found = false;
+            foreach ($existing_rubrics as $existing_criterion) {
+                if ($existing_criterion['name'] === $new_criterion['name']) {
+                    $merged_criterion = $new_criterion;
+                    $merged_criterion['score'] = $existing_criterion['score'] ?? 0;
+                    $merged_rubrics[] = $merged_criterion;
+                    $found = true;
+                    break;
+                }
+            }
+            if (!$found) {
+                $new_criterion['score'] = 0;
+                $merged_rubrics[] = $new_criterion;
+            }
+        }
+        
+        $final_rubrics_json = json_encode($merged_rubrics);
+        $safe_final_rubrics = $conn->real_escape_string($final_rubrics_json);
+        
+        // Recalculate total score from merged rubrics
+        $total_earned_score = 0;
+        $total_max_score = 0;
+        foreach ($merged_rubrics as $criterion) {
+            $total_max_score += floatval($criterion['max_score'] ?? 0);
+            $total_earned_score += floatval($criterion['score'] ?? 0);
+        }
+        
+        $passing_query = $conn->query("SELECT project_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
+        $passing_percentage = 75;
+        if ($passing_query && $row = $passing_query->fetch_assoc()) {
+            $passing_percentage = $row['project_passing_percentage'] ?? 75;
+        }
+        
+        $percentage = $total_max_score > 0 ? ($total_earned_score / $total_max_score) * 100 : 0;
+        $passed = ($percentage >= $passing_percentage) ? 1 : 0;
+        
         $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
         if ($check->num_rows > 0) {
+            // Update ONLY project setup fields - preserve all trainee submission data
             $conn->query("UPDATE assessment_components SET 
                 project_title_override = '$project_title_override',
                 project_instruction = '$project_instruction',
-                project_rubrics = '$safe_rubrics',
-                project_total_max = $project_total_max
+                project_rubrics = '$safe_final_rubrics',
+                project_total_max = $total_max_score,
+                project_score = $total_earned_score,
+                project_passed = $passed
                 WHERE enrollment_id = $enrollment_id");
         } else {
             $conn->query("INSERT INTO assessment_components 
-                (enrollment_id, project_title_override, project_instruction, project_rubrics, project_total_max, oral_max_score,
+                (enrollment_id, project_title_override, project_instruction, project_rubrics, project_total_max, 
+                 project_score, project_passed, oral_max_score,
                  practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                VALUES ($enrollment_id, '$project_title_override', '$project_instruction', '$safe_rubrics', $project_total_max, 100, 75, 75, 75)");
+                VALUES ($enrollment_id, '$project_title_override', '$project_instruction', '$safe_final_rubrics', $total_max_score,
+                        $total_earned_score, $passed, 100, 75, 75, 75)");
         }
         $updated++;
     }
     
-    $_SESSION['message'] = "$updated trainee(s) - Project setup updated! (Title, Instructions, and Rubrics applied to all)";
+    $_SESSION['message'] = "$updated trainee(s) - Project setup updated! (Trainee submissions preserved)";
+    $_SESSION['message_type'] = 'success';
+    header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=project");
+    exit;
+}
+
+// SAVE BULK RUBRIC SCORES (Detailed per-criterion scoring) - PRESERVES TRAINEE SUBMISSIONS
+if (isset($_POST['save_bulk_rubric_scores'])) {
+    $enrollment_ids = $_POST['enrollment_id'] ?? [];
+    $rubric_scores_data = $_POST['rubric_scores'] ?? [];
+    $project_notes = $_POST['project_notes'] ?? [];
+    
+    $updated = 0;
+    
+    foreach ($enrollment_ids as $index => $enrollment_id) {
+        if (isset($rubric_scores_data[$index])) {
+            $rubric_scores = json_decode($rubric_scores_data[$index], true);
+            $notes = $conn->real_escape_string($project_notes[$index] ?? '');
+            
+            if (is_array($rubric_scores)) {
+                // Get existing assessment data (including trainee submission)
+                $existing = $conn->query("SELECT project_rubrics, project_title, project_description, 
+                                                  project_photo_path, project_submitted_by_trainee, project_submitted_at,
+                                                  project_title_override, project_instruction, project_passing_percentage
+                                           FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
+                
+                $rubrics_data = [];
+                if ($existing && !empty($existing['project_rubrics'])) {
+                    $rubrics_data = json_decode($existing['project_rubrics'], true);
+                    if (!is_array($rubrics_data)) $rubrics_data = [];
+                }
+                
+                // Update scores in rubrics data (preserve all other rubric properties)
+                foreach ($rubric_scores as $criterion_index => $score) {
+                    if (isset($rubrics_data[$criterion_index])) {
+                        $rubrics_data[$criterion_index]['score'] = floatval($score);
+                    }
+                }
+                
+                // Calculate total score
+                $total_earned_score = 0;
+                $total_max_score = 0;
+                foreach ($rubrics_data as $criterion) {
+                    $total_max_score += floatval($criterion['max_score'] ?? 0);
+                    $total_earned_score += floatval($criterion['score'] ?? 0);
+                }
+                
+                // Get passing percentage
+                $passing_percentage = $existing['project_passing_percentage'] ?? 75;
+                
+                $percentage = $total_max_score > 0 ? ($total_earned_score / $total_max_score) * 100 : 0;
+                $passed = ($percentage >= $passing_percentage) ? 1 : 0;
+                
+                $rubrics_json = json_encode($rubrics_data);
+                $safe_rubrics = $conn->real_escape_string($rubrics_json);
+                
+                // Update ONLY scores and notes - preserve ALL trainee submission data
+                $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
+                if ($check->num_rows > 0) {
+                    $conn->query("UPDATE assessment_components SET 
+                        project_rubrics = '$safe_rubrics',
+                        project_score = $total_earned_score,
+                        project_total_max = $total_max_score,
+                        project_passed = $passed,
+                        project_notes = '$notes'
+                        WHERE enrollment_id = $enrollment_id");
+                } else {
+                    $conn->query("INSERT INTO assessment_components 
+                        (enrollment_id, project_rubrics, project_score, project_total_max, project_passed, project_notes, oral_max_score,
+                         practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
+                        VALUES ($enrollment_id, '$safe_rubrics', $total_earned_score, $total_max_score, $passed, '$notes', 100, 75, 75, 75)");
+                }
+                $updated++;
+            }
+        }
+    }
+    
+    $_SESSION['message'] = "$updated trainee(s) - Rubric scores updated! (Trainee submissions preserved)";
     $_SESSION['message_type'] = 'success';
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=project");
     exit;
@@ -407,51 +536,6 @@ if (isset($_POST['save_bulk_practical_detailed'])) {
     exit;
 }
 
-// SAVE BULK PROJECT SCORES
-if (isset($_POST['save_bulk_project'])) {
-    $enrollment_ids = $_POST['enrollment_id'] ?? [];
-    $project_scores = $_POST['project_score'] ?? [];
-    $project_notes = $_POST['project_notes'] ?? [];
-    
-    $updated = 0;
-    
-    foreach ($enrollment_ids as $index => $enrollment_id) {
-        if (isset($project_scores[$index]) && $project_scores[$index] !== '') {
-            $score = floatval($project_scores[$index]);
-            $notes = $conn->real_escape_string($project_notes[$index] ?? '');
-            
-            $passing_query = $conn->query("SELECT project_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            $passing_percentage = 75;
-            if ($passing_query && $row = $passing_query->fetch_assoc()) {
-                $passing_percentage = $row['project_passing_percentage'] ?? 75;
-            }
-            
-            $passed = ($score >= $passing_percentage) ? 1 : 0;
-            
-            $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            if ($check->num_rows > 0) {
-                $conn->query("UPDATE assessment_components SET 
-                    project_score = $score,
-                    project_passed = $passed,
-                    project_notes = '$notes'
-                    WHERE enrollment_id = $enrollment_id");
-            } else {
-                $conn->query("INSERT INTO assessment_components 
-                    (enrollment_id, project_score, project_passed, project_notes, oral_max_score,
-                     practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                    VALUES ($enrollment_id, $score, $passed, '$notes', 100, 75, 75, 75)");
-            }
-            $updated++;
-        }
-    }
-    
-    $_SESSION['message'] = "$updated trainee(s) - Project scores updated successfully!";
-    $_SESSION['message_type'] = 'success';
-    header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=project");
-    exit;
-}
-
-
 // SAVE BULK ORAL SCORES
 if (isset($_POST['save_bulk_oral'])) {
     $enrollment_ids = $_POST['enrollment_id'] ?? [];
@@ -502,7 +586,6 @@ if (isset($_POST['save_bulk_oral'])) {
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=oral");
     exit;
 }
-
 
 // CALCULATE ALL OVERALL RESULTS
 if (isset($_POST['calculate_all_results'])) {
@@ -735,7 +818,6 @@ if (isset($_POST['toggle_all_visibility'])) {
     exit;
 }
 
-
 // TOGGLE INDIVIDUAL VISIBILITY 
 if (isset($_GET['toggle_project'])) {
     $enrollment_id = intval($_GET['enrollment_id']);
@@ -904,7 +986,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>Bulk Comprehensive Assessment - <?php echo htmlspecialchars($program['name']); ?></title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
@@ -942,8 +1024,13 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         
         .rubric-container { background: white; border: 2px solid #e0e0e0; border-radius: 12px; padding: 20px; margin: 20px 0; }
         .rubric-header { background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 20px; }
-        .rubric-criterion { background: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
+        .rubric-criterion { background: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin-bottom: 20px; border-radius: 8px; transition: all 0.3s ease; }
+        .rubric-criterion:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .rubric-criterion h4 { color: #007bff; margin-bottom: 10px; }
+        .rubric-criterion-score { margin-bottom: 12px; padding: 8px; background: #f8f9fa; border-radius: 5px; transition: all 0.3s ease; }
+        .rubric-criterion-score:hover { background: #e8f0fe !important; }
+        .rubric-score-input { width: 100px; text-align: center; font-weight: 600; }
+        .rubric-score-input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
         
         .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .tab { padding: 12px 25px; background: white; border: 2px solid #e0e0e0; border-radius: 50px; cursor: pointer; font-weight: 600; transition: all 0.3s; }
@@ -1058,388 +1145,36 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             font-size: 11px;
         }
         
+        /* Mobile Responsive Styles */
+        @media screen and (max-width: 768px) {
+            body { padding: 10px; }
+            .container { padding: 0; }
+            .header { padding: 20px 15px; margin-bottom: 20px; }
+            .header h1 { font-size: 20px; }
+            .tabs { gap: 5px; }
+            .tab { padding: 8px 15px; font-size: 12px; flex: 1; text-align: center; min-width: 80px; }
+            .table-container { padding: 10px; }
+            table th, table td { padding: 8px; font-size: 12px; min-width: 100px; }
+            .rubric-score-input { width: 70px; }
+            .btn { padding: 6px 12px; font-size: 12px; }
+            .summary-stats { flex-direction: column; gap: 10px; }
+            .summary-stat-item { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.3); padding: 10px; }
+            .summary-stat-item:last-child { border-bottom: none; }
+        }
+        
         @media print {
             .header, .tabs, .btn-group, .btn, .back-link, .bulk-actions, .program-section, 
             .toggle-switch, .image-modal, .close-modal, .stats-grid, .summary-stats,
             .bulk-actions, .program-section, .passing-settings, .project-setup-section, .print\:hidden {
                 display: none !important;
             }
-            
             body { background: white; padding: 0; }
             .container { max-width: 100%; margin: 0; padding: 20px; }
             .table-container { box-shadow: none; padding: 0; margin: 0; background: white; }
             table { border-collapse: collapse; width: 100%; border: 1px solid #000; font-size: 10pt; }
             th { background: #333 !important; color: white !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
             td, th { border: 1px solid #000; padding: 6px; }
-            tr:nth-child(even) { background: #f9f9f9; }
         }
-
-            /* Mobile Responsive Styles */
-            @media screen and (max-width: 768px) {
-                body {
-                    padding: 10px;
-                }
-                
-                .container {
-                    padding: 0;
-                }
-                
-                .header {
-                    padding: 20px 15px;
-                    margin-bottom: 20px;
-                }
-                
-                .header h1 {
-                    font-size: 20px;
-                    margin-bottom: 8px;
-                }
-                
-                .header .subtitle {
-                    font-size: 14px;
-                }
-                
-                .info-grid {
-                    grid-template-columns: 1fr;
-                    gap: 10px;
-                    padding: 15px;
-                }
-                
-                .info-item {
-                    margin-bottom: 5px;
-                }
-                
-                .info-value {
-                    font-size: 16px;
-                }
-                
-                .tabs {
-                    gap: 5px;
-                    margin-bottom: 15px;
-                    flex-wrap: wrap;
-                }
-                
-                .tab {
-                    padding: 8px 15px;
-                    font-size: 12px;
-                    flex: 1;
-                    text-align: center;
-                    min-width: 80px;
-                }
-                
-                .assessment-card {
-                    padding: 15px;
-                    margin-bottom: 20px;
-                }
-                
-                .card-title {
-                    font-size: 18px;
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 10px;
-                }
-                
-                .toggle-container {
-                    margin-left: 0;
-                    width: 100%;
-                    justify-content: space-between;
-                }
-                
-                .row {
-                    flex-direction: column;
-                    gap: 15px;
-                }
-                
-                .col {
-                    min-width: 100%;
-                }
-                
-                .form-control {
-                    font-size: 16px; /* Prevents zoom on mobile */
-                    padding: 10px;
-                }
-                
-                .custom-skill-row {
-                    padding: 12px;
-                }
-                
-                .custom-skill-row > div {
-                    flex-direction: column !important;
-                    gap: 10px !important;
-                }
-                
-                .custom-skill-row > div > div {
-                    width: 100%;
-                }
-                
-                .custom-skill-row .remove-btn {
-                    align-self: flex-end;
-                    margin-top: 5px;
-                }
-                
-                .button-group {
-                    flex-direction: column;
-                    gap: 8px;
-                }
-                
-                .button-group button {
-                    width: 100%;
-                    justify-content: center;
-                }
-                
-                .add-btn, .delete-btn, .save-trainee-skills-btn, 
-                .save-trainee-questions-btn, .save-scores-btn, 
-                .clear-answers-btn, .save-tab-btn, .submit-btn {
-                    width: 100%;
-                    justify-content: center;
-                    padding: 12px 20px;
-                    font-size: 14px;
-                }
-                
-                .scoring-section {
-                    padding: 15px;
-                }
-                
-                .scoring-section .custom-skill-row > div {
-                    flex-direction: column !important;
-                    gap: 12px !important;
-                }
-                
-                .score-input {
-                    width: 100%;
-                    max-width: 120px;
-                }
-                
-                .passing-percentage-group {
-                    padding: 12px;
-                }
-                
-                .passing-percentage-wrapper {
-                    flex-direction: column;
-                    align-items: stretch;
-                    gap: 10px;
-                }
-                
-                .passing-percentage-input {
-                    width: 100%;
-                }
-                
-                .btn-save-settings {
-                    width: 100%;
-                    justify-content: center;
-                }
-                
-                .total-display {
-                    font-size: 18px;
-                    text-align: center;
-                }
-                
-                .summary-cards {
-                    grid-template-columns: 1fr;
-                    gap: 15px;
-                }
-                
-                .summary-card {
-                    padding: 15px;
-                }
-                
-                .summary-card .score {
-                    font-size: 28px;
-                }
-                
-                /* Table responsive */
-                table {
-                    display: block;
-                    overflow-x: auto;
-                    -webkit-overflow-scrolling: touch;
-                }
-                
-                table thead, table tbody {
-                    display: table;
-                    width: 100%;
-                }
-                
-                table th, table td {
-                    padding: 8px 10px;
-                    font-size: 13px;
-                    min-width: 100px;
-                }
-                
-                /* Modal responsive */
-                .modal-content {
-                    width: 95%;
-                    margin: 20% auto;
-                    padding: 20px;
-                }
-                
-                .back-btn {
-                    font-size: 14px;
-                    padding: 8px 15px;
-                    margin-bottom: 15px;
-                }
-                
-                /* Rubric section responsive */
-                .rubric-container {
-                    padding: 15px;
-                }
-                
-                .rubric-criterion {
-                    padding: 12px;
-                }
-                
-                .rubric-criterion > div:first-child {
-                    flex-direction: column !important;
-                    align-items: stretch !important;
-                    gap: 10px !important;
-                }
-                
-                .criterion-name {
-                    width: 100% !important;
-                    margin: 10px 0;
-                }
-                
-                .remove-rubric-btn {
-                    align-self: flex-end;
-                }
-                
-                .rubric-total {
-                    text-align: center;
-                }
-                
-                .rubric-total > div {
-                    flex-direction: column;
-                    gap: 10px;
-                }
-                
-                /* Alert messages */
-                .alert-success, .alert-info, .alert-warning, .alert-danger {
-                    padding: 12px;
-                    font-size: 14px;
-                    margin-bottom: 15px;
-                }
-                
-                /* Waiting message */
-                .waiting-message {
-                    padding: 30px 20px;
-                }
-                
-                .waiting-message h3 {
-                    font-size: 16px;
-                }
-                
-                /* Answer box */
-                .answer-box {
-                    padding: 12px;
-                    margin-top: 10px;
-                }
-                
-                .answer-text {
-                    font-size: 14px;
-                }
-                
-                /* Training section */
-                .trainee-section {
-                    padding: 15px;
-                }
-                
-                .trainee-section h4 {
-                    font-size: 16px;
-                }
-            }
-
-            /* Extra small devices (phones, 480px and below) */
-            @media screen and (max-width: 480px) {
-                .tab {
-                    font-size: 11px;
-                    padding: 6px 12px;
-                    min-width: 70px;
-                }
-                
-                .card-title {
-                    font-size: 16px;
-                }
-                
-                .header h1 {
-                    font-size: 18px;
-                }
-                
-                .info-value {
-                    font-size: 14px;
-                }
-                
-                .form-control {
-                    font-size: 14px;
-                }
-                
-                .custom-skill-row {
-                    padding: 10px;
-                }
-                
-                .score-input {
-                    font-size: 14px;
-                    padding: 6px;
-                }
-                
-                table th, table td {
-                    font-size: 12px;
-                    padding: 6px 8px;
-                    min-width: 80px;
-                }
-                
-                .summary-card .score {
-                    font-size: 24px;
-                }
-                
-                .summary-card h3 {
-                    font-size: 14px;
-                }
-                
-                .pass-badge, .fail-badge, .pending-badge {
-                    font-size: 10px;
-                    padding: 2px 8px;
-                }
-                
-                .saved-status, .visibility-status {
-                    font-size: 11px;
-                    padding: 2px 8px;
-                }
-            }
-
-            /* Landscape mode on mobile */
-            @media screen and (max-width: 768px) and (orientation: landscape) {
-                body {
-                    padding: 10px;
-                }
-                
-                .tabs {
-                    flex-wrap: wrap;
-                }
-                
-                .tab {
-                    flex: 0 1 auto;
-                }
-                
-                .custom-skill-row > div {
-                    flex-direction: row !important;
-                    flex-wrap: wrap;
-                }
-                
-                .custom-skill-row > div > div {
-                    flex: 1;
-                    min-width: 120px;
-                }
-            }
-
-            /* Touch-friendly adjustments */
-            @media (hover: none) and (pointer: coarse) {
-                button, .tab, .back-btn, .add-btn, .delete-btn, 
-                .save-tab-btn, .submit-btn, .remove-btn {
-                    min-height: 44px; /* Minimum touch target size */
-                }
-                
-                input, select, textarea {
-                    font-size: 16px; /* Prevents zoom on focus in iOS */
-                }
-            }
     </style>
 </head>
 <body>
@@ -1466,7 +1201,15 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 <i class="fas fa-info-circle"></i> <?php echo htmlspecialchars($message); ?>
             </div>
         <?php endif; ?>
-       
+        
+        <!-- Statistics Grid -->
+        <div class="stats-grid">
+            <div class="stat-card"><h3><i class="fas fa-users"></i> Total Trainees</h3><div class="number"><?php echo $total_trainees; ?></div></div>
+            <div class="stat-card"><h3><i class="fas fa-check-circle"></i> Passed</h3><div class="number" style="color:#28a745;"><?php echo $passed_count; ?></div></div>
+            <div class="stat-card"><h3><i class="fas fa-times-circle"></i> Failed</h3><div class="number" style="color:#dc3545;"><?php echo $failed_count; ?></div></div>
+            <div class="stat-card"><h3><i class="fas fa-clock"></i> Pending</h3><div class="number" style="color:#ffc107;"><?php echo $pending_count; ?></div></div>
+            <div class="stat-card"><h3><i class="fas fa-chart-line"></i> Completion</h3><div class="number"><?php echo $completion_rate; ?>%</div></div>
+        </div>
         
         <!-- Passing Percentage Settings (Global) -->
         <div class="passing-settings">
@@ -1482,12 +1225,11 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             <i class="fas fa-utensils"></i> Practical Skills
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" id="practical_passing_percentage" name="practical_passing_percentage" 
+                            <input type="number" name="practical_passing_percentage" 
                                    class="form-control" value="<?php echo $global_practical_passing; ?>" 
                                    min="65" max="100" step="0.5" style="width: 100px;">
                             <span>%</span>
                         </div>
-                        <small style="font-size: 11px; color: #666;">(65% - 100%)</small>
                     </div>
                     
                     <div style="flex: 1; min-width: 150px;">
@@ -1495,12 +1237,11 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             <i class="fas fa-project-diagram"></i> Project Output
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" id="project_passing_percentage" name="project_passing_percentage" 
+                            <input type="number" name="project_passing_percentage" 
                                    class="form-control" value="<?php echo $global_project_passing; ?>" 
                                    min="65" max="100" step="0.5" style="width: 100px;">
                             <span>%</span>
                         </div>
-                        <small style="font-size: 11px; color: #666;">(65% - 100%)</small>
                     </div>
                     
                     <div style="flex: 1; min-width: 150px;">
@@ -1508,39 +1249,32 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             <i class="fas fa-microphone-alt"></i> Oral Assessment
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" id="oral_passing_percentage" name="oral_passing_percentage" 
+                            <input type="number" name="oral_passing_percentage" 
                                    class="form-control" value="<?php echo $global_oral_passing; ?>" 
                                    min="65" max="100" step="0.5" style="width: 100px;">
                             <span>%</span>
                         </div>
-                        <small style="font-size: 11px; color: #666;">(65% - 100%)</small>
                     </div>
                     
                     <div>
-                        <button type="submit" class="btn btn-warning" style="background: #ffc107; color: #212529;">
+                        <button type="submit" class="btn btn-warning">
                             <i class="fas fa-save"></i> Apply to All Trainees
                         </button>
                     </div>
                 </div>
             </form>
-            
-            <div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-radius: 5px; font-size: 12px;">
-                <i class="fas fa-info-circle"></i> 
-                <strong>Note:</strong> These passing percentages determine whether a trainee passes or fails each component. 
-                The overall passing score is calculated as a weighted average based on these percentages.
-            </div>
         </div>
         
         <!-- Tabs -->
         <div class="tabs">
             <div class="tab <?php echo $current_tab == 'practical' ? 'active' : ''; ?>" onclick="switchTab('practical')">
-                <i class="fas fa-utensils"></i> Practical Skills (<?php echo $practical_completed; ?>/<?php echo $total_trainees; ?>)
+                <i class="fas fa-utensils"></i> Practical Skills
             </div>
             <div class="tab <?php echo $current_tab == 'project' ? 'active' : ''; ?>" onclick="switchTab('project')">
-                <i class="fas fa-project-diagram"></i> Project Output (<?php echo $project_completed; ?>/<?php echo $total_trainees; ?>)
+                <i class="fas fa-project-diagram"></i> Project Output (Rubric)
             </div>
             <div class="tab <?php echo $current_tab == 'oral' ? 'active' : ''; ?>" onclick="switchTab('oral')">
-                <i class="fas fa-microphone-alt"></i> Oral Assessment (<?php echo $oral_completed; ?>/<?php echo $total_trainees; ?>)
+                <i class="fas fa-microphone-alt"></i> Oral Assessment
             </div>
             <div class="tab <?php echo $current_tab == 'summary' ? 'active' : ''; ?>" onclick="switchTab('summary')">
                 <i class="fas fa-table"></i> Summary & Results
@@ -1596,12 +1330,12 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 <div class="btn-group">
                     <form method="POST" style="display: inline;">
                         <button type="submit" name="load_skills_to_all" class="btn btn-info" <?php echo !$program_skills_exist ? 'disabled' : ''; ?>>
-                            <i class="fas fa-download"></i> Load Skills to All (Create Individual Records)
+                            <i class="fas fa-download"></i> Load Skills to All
                         </button>
                     </form>
-                    <form method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to reset ALL trainees\' skills? This will delete all individual skill records.');">
+                    <form method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to reset ALL trainees\' skills?');">
                         <button type="submit" name="reset_all_skills" class="btn btn-warning">
-                            <i class="fas fa-undo"></i> Reset All Skills (Delete Individual Records)
+                            <i class="fas fa-undo"></i> Reset All Skills
                         </button>
                     </form>
                 </div>
@@ -1610,7 +1344,6 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             <!-- Detailed Skills Entry per Trainee -->
             <form method="POST" id="practicalForm">
                 <input type="hidden" name="save_bulk_practical_detailed" value="1">
-                <input type="hidden" name="practical_date" value="<?php echo date('Y-m-d'); ?>">
                 <div class="table-container">
                     <table>
                         <thead>
@@ -1643,10 +1376,9 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                     <input type="hidden" name="enrollment_id[]" value="<?php echo $enrollment['id']; ?>">
                                     <div style="margin-top: 5px;">
                                         <?php if (!empty($trainee_skills)): ?>
-                                            <span class="badge badge-success"><i class="fas fa-check"></i> Skills Loaded</span>
-                                            <span class="badge badge-info"><?php echo count($trainee_skills); ?> skills</span>
+                                            <span class="badge badge-success"><?php echo count($trainee_skills); ?> skills</span>
                                         <?php else: ?>
-                                            <span class="badge badge-warning"><i class="fas fa-exclamation"></i> No skills</span>
+                                            <span class="badge badge-warning">No skills</span>
                                         <?php endif; ?>
                                     </div>
                                 </td>
@@ -1660,28 +1392,25 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                                 $score = $skill['score'] ?? 0;
                                         ?>
                                         <div class="skill-detail-row">
-                                            <span style="flex: 2; font-size: 12px; font-weight: 500;">
+                                            <span style="flex: 2; font-size: 12px;">
                                                 <?php echo htmlspecialchars($skill['skill_name']); ?> 
-                                                <span style="color: #666;">(max: <?php echo $skill['max_score']; ?>)</span>
+                                                (max: <?php echo $skill['max_score']; ?>)
                                             </span>
                                             <input type="number" class="form-control mini skill-score" 
                                                    data-index="<?php echo $index; ?>" 
                                                    data-skill-id="<?php echo $skill_id; ?>"
                                                    value="<?php echo $score; ?>" 
                                                    min="0" max="<?php echo $skill['max_score']; ?>" 
-                                                   style="flex: 1; width: 60px;" 
+                                                   style="width: 70px;" 
                                                    onchange="updateSkillTotal(<?php echo $index; ?>)">
-                                            <span style="flex: 0.5; font-size: 11px; color: #666;">
-                                                <?php echo $score >= ($skill['max_score'] * $trainee_practical_passing / 100) ? '✅' : '❌'; ?>
-                                            </span>
                                         </div>
                                         <?php 
                                                 $skill_scores_json[$skill_id] = ['score' => $score];
                                             endforeach;
                                         else: 
                                         ?>
-                                        <div style="color: #999; font-style: italic; padding: 10px; text-align: center;">
-                                            <i class="fas fa-info-circle"></i> No skills loaded. Click "Load Skills to All" first.
+                                        <div style="color: #999; padding: 10px; text-align: center;">
+                                            No skills loaded. Click "Load Skills to All" first.
                                         </div>
                                         <?php endif; ?>
                                     </div>
@@ -1689,38 +1418,29 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                 </td>
                                 <td>
                                     <div class="total-display" id="practical-total-<?php echo $index; ?>"><?php echo $practical_total; ?></div>
-                                    <div style="font-size: 11px; color: #666;">out of <?php echo $practical_max; ?></div>
-                                    <div style="font-size: 10px; color: #666;">Target: <?php echo $trainee_practical_passing; ?>%</div>
+                                    <div style="font-size: 11px;">out of <?php echo $practical_max; ?></div>
+                                    <div style="font-size: 10px;">Target: <?php echo $trainee_practical_passing; ?>%</div>
                                     <?php if ($practical_total > 0): ?>
                                         <?php if ($practical_percentage >= $trainee_practical_passing): ?>
-                                            <span class="badge badge-success"><i class="fas fa-check-circle"></i> PASS</span>
+                                            <span class="badge badge-success">PASS</span>
                                         <?php else: ?>
-                                            <span class="badge badge-danger"><i class="fas fa-times-circle"></i> FAIL</span>
+                                            <span class="badge badge-danger">FAIL</span>
                                         <?php endif; ?>
                                     <?php endif; ?>
                                 </td>
                                 <td>
-                                    <textarea name="practical_notes[]" class="form-control" rows="3" 
-                                              placeholder="Add notes/observations..."><?php echo htmlspecialchars($enrollment['practical_notes'] ?? ''); ?></textarea>
+                                    <textarea name="practical_notes[]" class="form-control" rows="2" 
+                                              placeholder="Add notes..."><?php echo htmlspecialchars($enrollment['practical_notes'] ?? ''); ?></textarea>
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            
-                            <?php if (empty($enrollments)): ?>
-                            <tr>
-                                <td colspan="5" style="text-align: center; padding: 40px;">
-                                    <i class="fas fa-users-slash" style="font-size: 48px; color: #ccc; margin-bottom: 10px;"></i>
-                                    <p>No approved trainees found for this program.</p>
-                                </td>
-                            </tr>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
                 
                 <?php if (!empty($enrollments)): ?>
-                <div style="text-align: center; margin-top: 20px; margin-bottom: 30px;">
-                    <button type="submit" class="btn btn-primary" style="padding: 15px 40px; font-size: 16px;">
+                <div style="text-align: center; margin: 20px 0;">
+                    <button type="submit" class="btn btn-primary" style="padding: 12px 30px;">
                         <i class="fas fa-save"></i> Save All Practical Scores
                     </button>
                 </div>
@@ -1728,16 +1448,22 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             </form>
         <?php endif; ?>
         
-        <!-- TAB 2: PROJECT OUTPUT -->
+        <!-- TAB 2: PROJECT OUTPUT WITH RUBRIC SCORING (PRESERVES TRAINEE SUBMISSIONS) -->
         <?php if ($current_tab == 'project'): ?>
             <!-- Project Setup Section -->
             <div class="project-setup-section">
                 <h4><i class="fas fa-pen-alt"></i> Project Setup (Apply to All Trainees)</h4>
-                <p>Set up the project title, instructions, and grading rubric. These will be applied to ALL trainees in this program.</p>
+                <p>Set up the project title, instructions, and grading rubric. These will be applied to ALL trainees <strong>without affecting their submitted content</strong>.</p>
+                
+                <div class="alert-info" style="margin-bottom: 15px; padding: 10px;">
+                    <i class="fas fa-info-circle"></i> 
+                    <strong>Note:</strong> Applying project setup will NOT delete or modify any trainee submissions. 
+                    Only the rubric structure and project instructions will be updated. Existing rubric scores will be preserved where criteria match by name.
+                </div>
                 
                 <div style="background: #f0f7ff; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
                     <div class="form-group">
-                        <label class="form-label" style="font-weight: 600; margin-bottom: 8px; display: block;">
+                        <label style="font-weight: 600; margin-bottom: 8px; display: block;">
                             <i class="fas fa-tag"></i> Project Title:
                         </label>
                         <input type="text" id="project_title_override" class="form-control" 
@@ -1746,26 +1472,25 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                     </div>
                     
                     <div class="form-group">
-                        <label class="form-label" style="font-weight: 600; margin-bottom: 8px; display: block;">
+                        <label style="font-weight: 600; margin-bottom: 8px; display: block;">
                             <i class="fas fa-info-circle"></i> Instructions for Trainees:
                         </label>
                         <textarea id="project_instruction" class="form-control" rows="4" 
-                                  placeholder="Enter detailed instructions for the project..."><?php echo htmlspecialchars($default_project_instruction); ?></textarea>
-                        <small style="font-size: 11px; color: #666;">These instructions will be visible to trainees when the project is made visible.</small>
+                                  placeholder="Enter detailed instructions..."><?php echo htmlspecialchars($default_project_instruction); ?></textarea>
                     </div>
                     
                     <!-- RUBRIC SECTION -->
                     <div class="rubric-container">
                         <div class="rubric-header">
                             <h3><i class="fas fa-chart-line"></i> Grading Rubric</h3>
-                            <p>Define criteria and max points for evaluation. These will be used for all trainees.</p>
+                            <p>Define criteria and max points for evaluation.</p>
                         </div>
                         
                         <div id="rubric-criteria-container">
                             <?php foreach ($default_rubrics_data as $index => $criterion): ?>
                             <div class="rubric-criterion" data-criterion-index="<?php echo $index; ?>">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                    <h4 style="margin: 0; color: #007bff;">
+                                    <h4 style="margin: 0;">
                                         <i class="fas fa-check-circle"></i> Criterion <?php echo $index + 1; ?>:
                                         <input type="text" class="form-control criterion-name"
                                                style="display: inline-block; width: auto; min-width: 200px; margin-left: 10px;"
@@ -1776,35 +1501,31 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                         <i class="fas fa-trash"></i> Remove
                                     </button>
                                 </div>
-                                <div style="margin-bottom: 10px;">
+                                <div>
                                     <label>Max Points: </label>
                                     <input type="number" class="form-control rubric-max-score"
                                            style="width: 100px; display: inline-block;"
                                            value="<?php echo $criterion['max_score'] ?? 20; ?>"
                                            min="1" max="1000" step="1" onchange="updateRubricTotal()">
                                 </div>
-                                <div class="rubric-score-display" style="font-size: 12px; color: #666;">
-                                    Score will be entered per trainee in the section below
-                                </div>
                             </div>
                             <?php endforeach; ?>
                         </div>
                         
-                        <div style="margin-top: 15px; display: flex; gap: 10px;">
+                        <div style="margin-top: 15px;">
                             <button type="button" class="btn btn-success" onclick="addRubricCriterion()">
                                 <i class="fas fa-plus"></i> Add Criterion
                             </button>
                         </div>
                         
-                        <div class="rubric-total" style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-top: 20px; text-align: center;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <div class="rubric-total" style="margin-top: 20px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
                                 <h4 style="margin: 0;">Rubric Summary:</h4>
-                                <div style="text-align: right;">
-                                    <span style="font-size: 14px; color: #666;">Total Max Points: </span>
-                                    <span id="rubric-max-total" style="font-size: 18px; font-weight: bold; color: #667eea;">0</span>
+                                <div>
+                                    <span>Total Max Points: </span>
+                                    <span id="rubric-max-total" style="font-size: 18px; font-weight: bold;">0</span>
                                 </div>
                             </div>
-                            <p class="rubric-score-display" style="font-size: 12px; color: #666;">Project total max points = Sum of all rubric max scores</p>
                         </div>
                         
                         <div style="margin-top: 20px; text-align: center;">
@@ -1833,21 +1554,20 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 </div>
             </div>
             
-            <!-- Project Scores Entry with Submission Details -->
-            <form method="POST">
-                <input type="hidden" name="save_bulk_project" value="1">
+            <!-- Project Rubric Scores Entry with Submission Display -->
+            <form method="POST" id="bulkRubricForm">
+                <input type="hidden" name="save_bulk_rubric_scores" value="1">
                 <div class="table-container">
                     <table>
                         <thead>
                             <tr>
                                 <th width="3%">#</th>
-                                <th width="15%">Trainee</th>
+                                <th width="12%">Trainee</th>
                                 <th width="25%">Submission Details</th>
-                                <th width="10%">Image</th>
-                                <th width="10%">Score / Status</th>
-                                <th width="20%">Feedback</th>
-                                <th width="10%">Status</th>
-                                <th width="7%">Visibility</th>
+                                <th width="35%">Rubric Criteria Scores</th>
+                                <th width="10%">Total / Status</th>
+                                <th width="10%">Feedback</th>
+                                <th width="5%">Status</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1856,28 +1576,34 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                 $image_path = $enrollment['project_photo_path'] ?? '';
                                 $submission_date = $enrollment['project_submitted_at'] ?? '';
                                 $project_passing = $enrollment['project_passing_percentage'] ?? 75;
-                                $project_score = $enrollment['project_score'] ?? null;
-                                $project_total_max = $enrollment['project_total_max'] ?? 100;
                                 
+                                // Get trainee-specific rubrics
                                 $trainee_rubrics = [];
                                 if (!empty($enrollment['project_rubrics'])) {
                                     $trainee_rubrics = json_decode($enrollment['project_rubrics'], true);
                                     if (!is_array($trainee_rubrics)) $trainee_rubrics = [];
                                 }
+                                
+                                // Calculate totals
+                                $rubric_total = 0;
+                                $rubric_max = 0;
+                                $rubric_scores_array = [];
+                                foreach ($trainee_rubrics as $criterion_index => $criterion) {
+                                    $rubric_max += floatval($criterion['max_score'] ?? 0);
+                                    $score = floatval($criterion['score'] ?? 0);
+                                    $rubric_total += $score;
+                                    $rubric_scores_array[$criterion_index] = $score;
+                                }
+                                
+                                $rubric_percentage = $rubric_max > 0 ? ($rubric_total / $rubric_max) * 100 : 0;
+                                $rubric_passed = $rubric_percentage >= $project_passing;
                             ?>
                             <tr>
                                 <td><?php echo $index + 1; ?></td>
                                 <td>
                                     <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
                                     <input type="hidden" name="enrollment_id[]" value="<?php echo $enrollment['id']; ?>">
-                                    <div style="font-size: 11px; color: #666; margin-top: 3px;">
-                                        <?php echo htmlspecialchars($enrollment['email']); ?>
-                                    </div>
-                                    <?php if (!empty($trainee_rubrics)): ?>
-                                        <div style="margin-top: 5px;">
-                                            <span class="badge badge-info">Rubric: <?php echo count($trainee_rubrics); ?> criteria</span>
-                                        </div>
-                                    <?php endif; ?>
+                                    <div style="font-size: 11px; color: #666;"><?php echo htmlspecialchars($enrollment['email']); ?></div>
                                 </td>
                                 <td>
                                     <?php if ($has_submission): ?>
@@ -1885,121 +1611,102 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                             <div style="font-weight: bold; color: #28a745; margin-bottom: 5px;">
                                                 <i class="fas fa-check-circle"></i> Submitted
                                                 <?php if ($submission_date): ?>
-                                                    <span style="font-size: 11px; margin-left: 5px;">
-                                                        (<?php echo date('M d, Y h:i A', strtotime($submission_date)); ?>)
-                                                    </span>
+                                                    <span style="font-size: 11px;">(<?php echo date('M d, Y', strtotime($submission_date)); ?>)</span>
                                                 <?php endif; ?>
                                             </div>
                                             <?php if (!empty($enrollment['project_title'])): ?>
-                                                <div style="margin-top: 5px;">
-                                                    <strong>Title:</strong> 
-                                                    <span style="color: #333;"><?php echo htmlspecialchars($enrollment['project_title']); ?></span>
-                                                </div>
+                                                <div><strong>Title:</strong> <?php echo htmlspecialchars($enrollment['project_title']); ?></div>
                                             <?php endif; ?>
                                             <?php if (!empty($enrollment['project_description'])): ?>
-                                                <div style="margin-top: 8px;">
-                                                    <strong>Description:</strong>
-                                                    <div style="background: white; padding: 8px; border-radius: 5px; margin-top: 3px; font-size: 12px; max-height: 80px; overflow-y: auto;">
-                                                        <?php echo nl2br(htmlspecialchars($enrollment['project_description'])); ?>
-                                                    </div>
+                                                <div><strong>Description:</strong></div>
+                                                <div style="background: white; padding: 5px; border-radius: 5px; margin-top: 3px; font-size: 12px; max-height: 60px; overflow-y: auto;">
+                                                    <?php echo nl2br(htmlspecialchars(substr($enrollment['project_description'], 0, 100))); ?>
+                                                    <?php if (strlen($enrollment['project_description']) > 100): ?>...<?php endif; ?>
+                                                </div>
+                                            <?php endif; ?>
+                                            <?php if (!empty($image_path) && file_exists($_SERVER['DOCUMENT_ROOT'] . '/' . $image_path)): ?>
+                                                <div style="margin-top: 5px;">
+                                                    <img src="/<?php echo $image_path; ?>" style="max-width: 60px; max-height: 60px; border-radius: 4px; cursor: pointer;" 
+                                                         onclick="showImageModal('/<?php echo $image_path; ?>', '<?php echo htmlspecialchars($enrollment['project_title'] ?? 'Project Image'); ?>')">
                                                 </div>
                                             <?php endif; ?>
                                         </div>
                                     <?php else: ?>
-                                        <div class="pending-box" style="text-align: center;">
-                                            <i class="fas fa-clock" style="color: #856404; font-size: 20px; margin-bottom: 5px;"></i>
-                                            <div style="color: #856404;">No submission yet</div>
+                                        <div class="pending-box">
+                                            <i class="fas fa-clock"></i> No submission yet
                                         </div>
-                                    <?php endif; ?>
-                                </td>
-                                <td style="text-align: center;">
-                                    <?php if ($has_submission && !empty($image_path)): ?>
-                                        <?php 
-                                        $image_full_path = $_SERVER['DOCUMENT_ROOT'] . '/' . $image_path;
-                                        if (file_exists($image_full_path)): 
-                                        ?>
-                                            <div>
-                                                <img src="/<?php echo $image_path; ?>" 
-                                                     alt="Project Image" 
-                                                     class="project-thumbnail"
-                                                     onclick="showImageModal('/<?php echo $image_path; ?>', '<?php echo htmlspecialchars($enrollment['project_title'] ?: 'Project Image'); ?>')">
-                                                <div style="margin-top: 5px;">
-                                                    <button type="button" class="btn btn-info btn-sm" 
-                                                            onclick="showImageModal('/<?php echo $image_path; ?>', '<?php echo htmlspecialchars($enrollment['project_title'] ?: 'Project Image'); ?>')">
-                                                        <i class="fas fa-search-plus"></i> View
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        <?php else: ?>
-                                            <span class="badge badge-warning"><i class="fas fa-exclamation-triangle"></i> Image not found</span>
-                                        <?php endif; ?>
-                                    <?php elseif ($has_submission): ?>
-                                        <span class="badge badge-secondary"><i class="fas fa-image"></i> No image</span>
-                                    <?php else: ?>
-                                        <span class="badge badge-secondary"><i class="fas fa-eye-slash"></i> No image</span>
                                     <?php endif; ?>
                                 </td>
                                 <td>
-                                    <div style="display: flex; flex-direction: column; gap: 5px; align-items: center;">
-                                        <input type="number" name="project_score[]" class="form-control" 
-                                               value="<?php echo $project_score; ?>" 
-                                               min="0" max="<?php echo $project_total_max; ?>" step="0.5"
-                                               style="width: 80px; text-align: center; font-weight: bold;"
-                                               onchange="updateProjectStatus(this, <?php echo $index; ?>, <?php echo $project_passing; ?>)">
-                                        <div id="project-status-<?php echo $index; ?>">
-                                            <?php if (!is_null($project_score)): ?>
-                                                <?php if ($project_score >= $project_passing): ?>
-                                                    <span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>
-                                                <?php else: ?>
-                                                    <span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>
-                                                <?php endif; ?>
-                                            <?php endif; ?>
-                                        </div>
-                                        <small style="font-size: 10px;">Target: <?php echo $project_passing; ?>%</small>
-                                        <small style="font-size: 9px; color: #666;">Max: <?php echo $project_total_max; ?></small>
+                                    <div id="rubric-scores-<?php echo $index; ?>" class="rubric-scores-container">
+                                        <?php if (!empty($trainee_rubrics)): ?>
+                                            <?php foreach ($trainee_rubrics as $criterion_index => $criterion): ?>
+                                                <div class="rubric-criterion-score">
+                                                    <div style="font-weight: 600; font-size: 12px; margin-bottom: 5px;">
+                                                        <?php echo htmlspecialchars($criterion['name'] ?? 'Criterion ' . ($criterion_index + 1)); ?>
+                                                        <span style="color: #666;">(Max: <?php echo $criterion['max_score']; ?>)</span>
+                                                    </div>
+                                                    <div style="display: flex; align-items: center; gap: 10px;">
+                                                        <input type="number" 
+                                                               class="form-control rubric-score-input" 
+                                                               data-index="<?php echo $index; ?>"
+                                                               data-criterion-index="<?php echo $criterion_index; ?>"
+                                                               value="<?php echo $criterion['score'] ?? 0; ?>"
+                                                               min="0" 
+                                                               max="<?php echo $criterion['max_score']; ?>"
+                                                               step="0.5"
+                                                               style="width: 80px;"
+                                                               onchange="updateRubricTraineeTotal(<?php echo $index; ?>)">
+                                                        <span>/ <?php echo $criterion['max_score']; ?></span>
+                                                    </div>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        <?php else: ?>
+                                            <div style="color: #999; padding: 10px; text-align: center;">
+                                                <i class="fas fa-info-circle"></i> No rubric criteria set. Save project setup first.
+                                            </div>
+                                        <?php endif; ?>
+                                    </div>
+                                    <input type="hidden" name="rubric_scores[]" id="rubric-scores-json-<?php echo $index; ?>" value='<?php echo json_encode($rubric_scores_array); ?>'>
+                                </td>
+                                <td>
+                                    <div class="total-display" id="rubric-total-<?php echo $index; ?>" style="font-size: 18px;">
+                                        <?php echo $rubric_total; ?>
+                                    </div>
+                                    <div style="font-size: 11px;">out of <?php echo $rubric_max; ?></div>
+                                    <div style="font-size: 10px;">Target: <?php echo $project_passing; ?>%</div>
+                                    <?php if ($rubric_total > 0): ?>
+                                        <?php if ($rubric_passed): ?>
+                                            <span class="badge badge-success">PASS</span>
+                                        <?php else: ?>
+                                            <span class="badge badge-danger">FAIL</span>
+                                        <?php endif; ?>
+                                    <?php endif; ?>
+                                    <div style="margin-top: 5px;">
+                                        <small><?php echo round($rubric_percentage, 1); ?>%</small>
                                     </div>
                                 </td>
                                 <td>
-                                    <textarea name="project_notes[]" class="form-control" rows="3" 
+                                    <textarea name="project_notes[]" class="form-control" rows="2" 
                                               placeholder="Enter feedback..."><?php echo htmlspecialchars($enrollment['project_notes'] ?? ''); ?></textarea>
                                 </td>
                                 <td style="text-align: center;">
                                     <?php if ($has_submission): ?>
-                                        <span class="badge badge-success" style="display: block; margin-bottom: 5px;">
-                                            <i class="fas fa-check-circle"></i> Submitted
-                                        </span>
+                                        <span class="badge badge-success">Submitted</span>
                                     <?php else: ?>
-                                        <span class="badge badge-warning" style="display: block; margin-bottom: 5px;">
-                                            <i class="fas fa-clock"></i> Pending
-                                        </span>
-                                    <?php endif; ?>
-                                    <?php if (!is_null($project_score)): ?>
-                                        <small style="display: block; color: #666;">Score: <?php echo $project_score; ?>/<?php echo $project_total_max; ?></small>
+                                        <span class="badge badge-warning">Pending</span>
                                     <?php endif; ?>
                                     <?php if (!empty($enrollment['is_finalized'])): ?>
-                                        <span class="finalized-badge" style="margin-top: 5px;"><i class="fas fa-check-circle"></i> Finalized</span>
+                                        <div class="finalized-badge" style="margin-top: 5px;">Finalized</div>
                                     <?php endif; ?>
-                                </td>
-                                <td style="text-align: center;">
-                                    <label class="toggle-switch" title="Toggle visibility for this trainee">
-                                        <input type="checkbox" 
-                                               onchange="toggleVisibility('project', <?php echo $enrollment['id']; ?>, this)"
-                                               <?php echo ($enrollment['project_visible_to_trainee'] ?? 0) ? 'checked' : ''; ?>
-                                               <?php echo !empty($enrollment['is_finalized']) ? 'disabled' : ''; ?>>
-                                        <span class="toggle-slider"></span>
-                                    </label>
-                                    <div style="font-size: 10px; margin-top: 3px;">
-                                        <?php echo ($enrollment['project_visible_to_trainee'] ?? 0) ? 'Visible' : 'Hidden'; ?>
-                                    </div>
                                 </td>
                             </tr>
                             <?php endforeach; ?>
                             
                             <?php if (empty($enrollments)): ?>
                             <tr>
-                                <td colspan="8" style="text-align: center; padding: 40px;">
-                                    <i class="fas fa-users-slash" style="font-size: 48px; color: #ccc; margin-bottom: 10px;"></i>
-                                    <p>No approved trainees found for this program.</p>
+                                <td colspan="7" style="text-align: center; padding: 40px;">
+                                    No approved trainees found.
                                 </td>
                             </tr>
                             <?php endif; ?>
@@ -2008,9 +1715,9 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 </div>
                 
                 <?php if (!empty($enrollments)): ?>
-                <div style="text-align: center; margin-top: 20px; margin-bottom: 30px;">
-                    <button type="submit" class="btn btn-primary" style="padding: 15px 40px; font-size: 16px;">
-                        <i class="fas fa-save"></i> Save All Project Scores
+                <div style="text-align: center; margin: 20px 0;">
+                    <button type="submit" class="btn btn-primary" style="padding: 12px 30px;">
+                        <i class="fas fa-save"></i> Save All Rubric Scores
                     </button>
                 </div>
                 <?php endif; ?>
@@ -2022,7 +1729,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             <!-- Program Questions Setup (Template) -->
             <div class="program-section">
                 <h4><i class="fas fa-cog"></i> Program Default Oral Questions (Template)</h4>
-                <p>Define the questions template that can be loaded to all trainees. Questions saved here will be loaded to individual trainee records.</p>
+                <p>Define the questions template that can be loaded to all trainees.</p>
                 
                 <div id="program-questions-container">
                     <?php foreach ($program_questions as $index => $q): ?>
@@ -2040,7 +1747,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                     <?php if (empty($program_questions)): ?>
                     <div class="question-row">
                         <div style="display: flex; gap: 10px; align-items: center;">
-                            <input type="text" class="form-control program-question" value="What are the basic safety procedures?" placeholder="Question" style="flex: 3;">
+                            <input type="text" class="form-control program-question" value="Sample Question" placeholder="Question" style="flex: 3;">
                             <input type="number" class="form-control program-question-max" value="25" min="1" max="100" style="flex: 1;">
                             <button type="button" class="btn btn-danger btn-sm" onclick="removeProgramQuestion(this)">
                                 <i class="fas fa-trash"></i>
@@ -2050,12 +1757,12 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                     <?php endif; ?>
                 </div>
                 
-                <div style="margin-top: 15px; display: flex; gap: 10px;">
+                <div style="margin-top: 15px;">
                     <button type="button" class="btn btn-success" onclick="addProgramQuestion()">
                         <i class="fas fa-plus"></i> Add Question
                     </button>
                     <button type="button" class="btn btn-primary" onclick="saveProgramQuestions()">
-                        <i class="fas fa-save"></i> Save Program Questions Template
+                        <i class="fas fa-save"></i> Save Questions Template
                     </button>
                 </div>
             </div>
@@ -2064,17 +1771,17 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             <div class="bulk-actions">
                 <h4><i class="fas fa-bolt"></i> Bulk Actions - Oral Assessment</h4>
                 <div class="btn-group">
-                    <form method="POST" style="display: inline;">
-                        <button type="submit" name="load_questions_to_all" class="btn btn-info" <?php echo !$program_questions_exist ? 'disabled' : ''; ?>>
-                            <i class="fas fa-download"></i> Load Questions to All (Create Individual Records)
+                    <form method="POST">
+                        <button type="submit" name="load_questions_to_all" class="btn btn-info">
+                            <i class="fas fa-download"></i> Load Questions to All
                         </button>
                     </form>
-                    <form method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to reset ALL trainees\' questions? This will delete all individual question records.');">
+                    <form method="POST" onsubmit="return confirm('Reset ALL questions?');">
                         <button type="submit" name="reset_all_questions" class="btn btn-warning">
-                            <i class="fas fa-undo"></i> Reset All Questions (Delete Individual Records)
+                            <i class="fas fa-undo"></i> Reset All Questions
                         </button>
                     </form>
-                    <form method="POST" style="display: inline;">
+                    <form method="POST">
                         <input type="hidden" name="toggle_all_visibility" value="1">
                         <input type="hidden" name="visibility_type" value="oral">
                         <button type="submit" name="visibility_value" value="1" class="btn btn-success">
@@ -2087,7 +1794,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 </div>
             </div>
             
-            <!-- Oral Scores Entry with Answer Preview -->
+            <!-- Oral Scores Entry -->
             <form method="POST">
                 <input type="hidden" name="save_bulk_oral" value="1">
                 <div class="table-container">
@@ -2095,13 +1802,11 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                         <thead>
                             <tr>
                                 <th width="3%">#</th>
-                                <th width="15%">Trainee</th>
-                                <th width="25%">Questions & Answers</th>
+                                <th width="20%">Trainee</th>
                                 <th width="8%">Max</th>
-                                <th width="8%">Score / Status</th>
-                                <th width="15%">Feedback</th>
-                                <th width="15%">Status</th>
-                                <th width="8%">Visibility</th>
+                                <th width="10%">Score</th>
+                                <th width="25%">Feedback</th>
+                                <th width="10%">Status</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -2113,133 +1818,50 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                 }
                                 if ($oral_max == 0) $oral_max = 100;
                                 
-                                $answers = $enrollment['decoded_answers'];
-                                $has_answers = !empty($answers);
-                                $questions_set = !empty($trainee_questions);
-                                $submission_date = $enrollment['oral_submitted_at'] ?? '';
+                                $has_answers = !empty($enrollment['oral_answers']);
                                 $oral_passing = $enrollment['oral_passing_percentage'] ?? 75;
                                 $oral_score = $enrollment['oral_score'] ?? null;
+                                $questions_set = !empty($trainee_questions);
                             ?>
                             <tr>
                                 <td><?php echo $index + 1; ?></td>
                                 <td>
                                     <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
                                     <input type="hidden" name="enrollment_id[]" value="<?php echo $enrollment['id']; ?>">
-                                    <div style="font-size: 11px; color: #666; margin-top: 3px;">
-                                        <?php echo htmlspecialchars($enrollment['email']); ?>
-                                    </div>
-                                </td>
-                                <td>
-                                    <?php if ($questions_set && !empty($trainee_questions)): ?>
-                                        <div style="background: #f8f9fa; padding: 10px; border-radius: 8px; max-height: 200px; overflow-y: auto;">
-                                            <?php foreach ($trainee_questions as $q_index => $q): ?>
-                                                <div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #dee2e6;">
-                                                    <div style="font-weight: 600; color: #17a2b8; font-size: 12px;">
-                                                        Q<?php echo $q_index + 1; ?>: <?php echo htmlspecialchars($q['question']); ?>
-                                                        <span style="color: #666; font-weight: normal;"> (<?php echo $q['max_score']; ?> pts)</span>
-                                                    </div>
-                                                    <?php if ($has_answers && isset($answers[$q_index])): ?>
-                                                        <div style="margin-top: 5px; background: white; padding: 8px; border-radius: 5px; font-size: 12px;">
-                                                            <span style="color: #28a745;"><i class="fas fa-comment"></i></span>
-                                                            <?php echo nl2br(htmlspecialchars(substr($answers[$q_index], 0, 100))); ?>
-                                                            <?php if (strlen($answers[$q_index]) > 100): ?>
-                                                                <a href="#" onclick="showFullAnswer(<?php echo $index; ?>, <?php echo $q_index; ?>); return false;">... more</a>
-                                                                <div id="answer-<?php echo $index; ?>-<?php echo $q_index; ?>" style="display: none;">
-                                                                    <?php echo nl2br(htmlspecialchars($answers[$q_index])); ?>
-                                                                </div>
-                                                            <?php endif; ?>
-                                                        </div>
-                                                    <?php elseif ($questions_set): ?>
-                                                        <div style="margin-top: 5px; color: #856404; font-style: italic; font-size: 12px;">
-                                                            <i class="fas fa-clock"></i> No answer yet
-                                                        </div>
-                                                    <?php endif; ?>
-                                                </div>
-                                            <?php endforeach; ?>
-                                        </div>
-                                    <?php else: ?>
-                                        <div class="pending-box" style="text-align: center;">
-                                            <i class="fas fa-exclamation-triangle" style="color: #856404;"></i>
-                                            <span style="color: #856404;"> Questions not set. Load questions first.</span>
-                                        </div>
+                                    <div style="font-size: 11px;"><?php echo htmlspecialchars($enrollment['email']); ?></div>
+                                    <?php if ($has_answers): ?>
+                                        <span class="badge badge-success">Answers Submitted</span>
                                     <?php endif; ?>
                                 </td>
-                                <td style="text-align: center; font-weight: bold;"><?php echo $oral_max; ?></td>
+                                <td style="text-align: center;"><?php echo $oral_max; ?></td>
                                 <td>
-                                    <div style="display: flex; flex-direction: column; gap: 5px; align-items: center;">
-                                        <input type="number" name="oral_score[]" class="form-control" 
-                                               value="<?php echo $oral_score; ?>" 
-                                               min="0" max="<?php echo $oral_max; ?>" step="0.5"
-                                               style="width: 70px; text-align: center; font-weight: bold;"
-                                               onchange="updateOralStatus(this, <?php echo $index; ?>, <?php echo $oral_max; ?>, <?php echo $oral_passing; ?>)"
-                                               <?php echo !$questions_set ? 'disabled' : ''; ?>>
-                                        <div id="oral-status-<?php echo $index; ?>">
-                                            <?php if (!is_null($oral_score)): ?>
-                                                <?php if ($oral_score >= ($oral_max * $oral_passing / 100)): ?>
-                                                    <span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>
-                                                <?php else: ?>
-                                                    <span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>
-                                                <?php endif; ?>
-                                            <?php endif; ?>
-                                        </div>
-                                        <small style="font-size: 10px;">Target: <?php echo $oral_passing; ?>%</small>
-                                    </div>
+                                    <input type="number" name="oral_score[]" class="form-control" 
+                                           value="<?php echo $oral_score; ?>" 
+                                           min="0" max="<?php echo $oral_max; ?>" step="0.5"
+                                           style="width: 80px;"
+                                           <?php echo !$questions_set ? 'disabled' : ''; ?>>
                                 </td>
                                 <td>
-                                    <textarea name="oral_notes[]" class="form-control" rows="3" 
-                                              placeholder="Enter feedback..." <?php echo !$questions_set ? 'disabled' : ''; ?>><?php echo htmlspecialchars($enrollment['oral_notes'] ?? ''); ?></textarea>
+                                    <textarea name="oral_notes[]" class="form-control" rows="2" 
+                                              placeholder="Feedback..."><?php echo htmlspecialchars($enrollment['oral_notes'] ?? ''); ?></textarea>
                                 </td>
                                 <td>
                                     <?php if ($questions_set): ?>
-                                        <span class="badge badge-info" style="display: block; margin-bottom: 5px;">
-                                            <i class="fas fa-check-circle"></i> Set
-                                        </span>
-                                    <?php endif; ?>
-                                    <?php if ($has_answers): ?>
-                                        <span class="badge badge-success" style="display: block; margin-bottom: 5px;">
-                                            <i class="fas fa-comment"></i> Answered
-                                            <?php if ($submission_date): ?>
-                                                <span style="font-size: 10px;">(<?php echo date('M d', strtotime($submission_date)); ?>)</span>
-                                            <?php endif; ?>
-                                        </span>
+                                        <span class="badge badge-info">Set</span>
                                     <?php endif; ?>
                                     <?php if (!is_null($oral_score)): ?>
-                                        <small style="display: block; color: #666;">Score: <?php echo $oral_score; ?>/<?php echo $oral_max; ?></small>
+                                        <div><?php echo $oral_score; ?>/<?php echo $oral_max; ?></div>
                                     <?php endif; ?>
-                                    <?php if (!empty($enrollment['is_finalized'])): ?>
-                                        <span class="finalized-badge" style="margin-top: 5px;"><i class="fas fa-check-circle"></i> Finalized</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td style="text-align: center;">
-                                    <label class="toggle-switch" title="Toggle visibility for this trainee">
-                                        <input type="checkbox" 
-                                               onchange="toggleVisibility('oral', <?php echo $enrollment['id']; ?>, this)"
-                                               <?php echo ($enrollment['oral_questions_visible_to_trainee'] ?? 0) ? 'checked' : ''; ?>
-                                               <?php echo !$questions_set || !empty($enrollment['is_finalized']) ? 'disabled' : ''; ?>>
-                                        <span class="toggle-slider"></span>
-                                    </label>
-                                    <div style="font-size: 10px; margin-top: 3px;">
-                                        <?php echo ($enrollment['oral_questions_visible_to_trainee'] ?? 0) ? 'Visible' : 'Hidden'; ?>
-                                    </div>
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            
-                            <?php if (empty($enrollments)): ?>
-                            <tr>
-                                <td colspan="8" style="text-align: center; padding: 40px;">
-                                    <i class="fas fa-users-slash" style="font-size: 48px; color: #ccc; margin-bottom: 10px;"></i>
-                                    <p>No approved trainees found for this program.</p>
-                                </td>
-                            </tr>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
                 
                 <?php if (!empty($enrollments)): ?>
-                <div style="text-align: center; margin-top: 20px; margin-bottom: 30px;">
-                    <button type="submit" class="btn btn-primary" style="padding: 15px 40px; font-size: 16px;">
+                <div style="text-align: center; margin: 20px 0;">
+                    <button type="submit" class="btn btn-primary">
                         <i class="fas fa-save"></i> Save All Oral Scores
                     </button>
                 </div>
@@ -2249,16 +1871,15 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         
         <!-- TAB 4: SUMMARY & RESULTS -->
         <?php if ($current_tab == 'summary'): ?>
-            <!-- Calculate All Button -->
             <div class="bulk-actions">
                 <h4><i class="fas fa-calculator"></i> Finalize Assessments</h4>
-                <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                    <form method="POST" style="display: inline;" onsubmit="return confirm('Calculate results for ALL trainees? This will update overall results based on current scores.');">
+                <div class="btn-group">
+                    <form method="POST" onsubmit="return confirm('Calculate results for ALL trainees?');">
                         <button type="submit" name="calculate_all_results" class="btn btn-primary">
                             <i class="fas fa-calculator"></i> Calculate All Results
                         </button>
                     </form>
-                    <form method="POST" style="display: inline;" onsubmit="return confirm('Finalize ALL completed assessments? This will update enrollment status and cannot be undone.');">
+                    <form method="POST" onsubmit="return confirm('Finalize ALL completed assessments?');">
                         <input type="hidden" name="finalize_all_completed" value="1">
                         <button type="submit" class="btn btn-primary">
                             <i class="fas fa-check-circle"></i> Finalize All Completed
@@ -2267,130 +1888,39 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 </div>
             </div>
 
-            <!-- Print Button and Program Info -->
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
-                <div style="background: #f8f9fa; padding: 10px 15px; border-radius: 8px;">
-                    <strong>Program:</strong> <?php echo htmlspecialchars($program['name']); ?> | 
-                    <strong>Total Trainees:</strong> <?php echo $total_trainees; ?> |
-                    <strong>Date:</strong> <?php echo date('F d, Y'); ?>
-                </div>
-                <div style="display: flex; gap: 10px;">
-                    <button onclick="printSummary()" class="btn btn-primary">
-                        <i class="fas fa-print"></i> Print Summary
-                    </button>
-                </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 15px;">
+                <div><strong>Program:</strong> <?php echo htmlspecialchars($program['name']); ?> | <strong>Total:</strong> <?php echo $total_trainees; ?></div>
+                <button onclick="window.print()" class="btn btn-secondary"><i class="fas fa-print"></i> Print</button>
             </div>
             
-            <!-- Passing Thresholds Summary -->
-            <div style="background: #fff3cd; padding: 15px; border-radius: 10px; margin-bottom: 20px;">
-                <h4><i class="fas fa-percent"></i> Current Passing Thresholds</h4>
-                <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 10px;">
-                    <div><strong>Practical:</strong> <span style="color: #28a745;"><?php echo $global_practical_passing; ?>%</span></div>
-                    <div><strong>Project:</strong> <span style="color: #17a2b8;"><?php echo $global_project_passing; ?>%</span></div>
-                    <div><strong>Oral:</strong> <span style="color: #8b5cf6;"><?php echo $global_oral_passing; ?>%</span></div>
-                    <div><strong>Overall:</strong> <span style="color: #667eea;">Weighted Average (Calculated)</span></div>
-                </div>
-            </div>
-
-            <!-- Summary Statistics -->
-            <div class="summary-stats">
-                <div class="summary-stat-item">
-                    <div class="summary-stat-number"><?php echo $passed_count; ?></div>
-                    <div class="summary-stat-label">Passed</div>
-                </div>
-                <div class="summary-stat-item">
-                    <div class="summary-stat-number"><?php echo $failed_count; ?></div>
-                    <div class="summary-stat-label">Failed</div>
-                </div>
-                <div class="summary-stat-item">
-                    <div class="summary-stat-number"><?php echo $pending_count; ?></div>
-                    <div class="summary-stat-label">Pending</div>
-                </div>
-                <div class="summary-stat-item">
-                    <div class="summary-stat-number"><?php echo $completion_rate; ?>%</div>
-                    <div class="summary-stat-label">Completion Rate</div>
-                </div>
-            </div>
-
             <!-- Summary Table -->
-            <div class="table-container" id="summaryTable">
+            <div class="table-container">
                 <table>
                     <thead>
                         <tr>
-                            <th width="3%">#</th>
-                            <th width="15%">Trainee Name</th>
-                            <th width="8%">Practical</th>
-                            <th width="8%">Practical Status</th>
-                            <th width="8%">Project</th>
-                            <th width="8%">Project Status</th>
-                            <th width="10%">Oral</th>
-                            <th width="8%">Oral Status</th>
-                            <th width="8%">Total</th>
-                            <th width="8%">Result</th>
-                            <th width="8%">Status</th>
+                            <th>#</th>
+                            <th>Trainee</th>
+                            <th>Practical</th>
+                            <th>Project</th>
+                            <th>Oral</th>
+                            <th>Total</th>
+                            <th>Result</th>
+                            <th>Status</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php 
-                        $total_practical = 0;
-                        $total_project = 0;
-                        $total_oral = 0;
-                        $total_overall = 0;
-                        $practical_count = 0;
-                        $project_count = 0;
-                        $oral_count = 0;
-                        
-                        foreach ($enrollments as $index => $enrollment):
+                        <?php foreach ($enrollments as $index => $enrollment):
                             $enrollment_id = $enrollment['id'];
                             
                             $practical_query = $conn->query("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-                            $practical = 0;
-                            if ($practical_query && $row = $practical_query->fetch_assoc()) {
-                                $practical = $row['total'] ?? 0;
-                            }
+                            $practical = $practical_query && ($row = $practical_query->fetch_assoc()) ? ($row['total'] ?? 0) : 0;
                             
                             $project = $enrollment['project_score'] ?? 0;
                             
                             $oral_query = $conn->query("SELECT SUM(score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-                            $oral = 0;
-                            if ($oral_query && $row = $oral_query->fetch_assoc()) {
-                                $oral = $row['total'] ?? 0;
-                            }
-                            
-                            $oral_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-                            $oral_max = 100;
-                            if ($oral_max_query && $row = $oral_max_query->fetch_assoc()) {
-                                $oral_max = $row['total'] ?? 100;
-                            }
-                            
-                            $practical_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-                            $practical_max = 100;
-                            if ($practical_max_query && $row = $practical_max_query->fetch_assoc()) {
-                                $practical_max = $row['total'] ?? 100;
-                            }
-                            
-                            $project_total_max = $enrollment['project_total_max'] ?? 100;
-                            
-                            $practical_passing = $enrollment['practical_passing_percentage'] ?? 75;
-                            $project_passing = $enrollment['project_passing_percentage'] ?? 75;
-                            $oral_passing = $enrollment['oral_passing_percentage'] ?? 75;
+                            $oral = $oral_query && ($row = $oral_query->fetch_assoc()) ? ($row['total'] ?? 0) : 0;
                             
                             $total = $practical + $project + $oral;
-                            $max_total = $practical_max + $project_total_max + $oral_max;
-                            $percentage = $max_total > 0 ? round(($total / $max_total) * 100, 1) : 0;
-                            
-                            $practical_percentage = $practical_max > 0 ? ($practical / $practical_max) * 100 : 0;
-                            $project_percentage = $project_total_max > 0 ? ($project / $project_total_max) * 100 : 0;
-                            $oral_percentage = $oral_max > 0 ? ($oral / $oral_max) * 100 : 0;
-                            
-                            $practical_status = $practical_percentage >= $practical_passing ? 'PASS' : ($practical > 0 ? 'FAIL' : 'Pending');
-                            $project_status = $project_percentage >= $project_passing ? 'PASS' : ($project > 0 ? 'FAIL' : 'Pending');
-                            $oral_status = $oral_percentage >= $oral_passing ? 'PASS' : ($oral > 0 ? 'FAIL' : 'Pending');
-                            
-                            if ($practical > 0) { $total_practical += $practical; $practical_count++; }
-                            if ($project > 0) { $total_project += $project; $project_count++; }
-                            if ($oral > 0) { $total_oral += $oral; $oral_count++; }
-                            $total_overall += $total;
                             
                             $result_class = '';
                             $result_text = '';
@@ -2406,80 +1936,17 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             }
                         ?>
                         <tr>
-                            <td style="text-align: center;"><?php echo $index + 1; ?></td>
-                            <td>
-                                <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
-                                <div style="font-size: 11px; color: #666;"><?php echo htmlspecialchars($enrollment['email']); ?></div>
-                            </td>
-                            <td style="text-align: center; font-weight: bold;"><?php echo $practical ?: '-'; ?></td>
-                            <td style="text-align: center;">
-                                <?php if ($practical_status == 'PASS'): ?>
-                                    <span class="badge badge-success">PASS</span>
-                                <?php elseif ($practical_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger">FAIL</span>
-                                <?php else: ?>
-                                    <span class="badge badge-warning">Pending</span>
-                                <?php endif; ?>
-                                <div class="percentage-badge">Target: <?php echo $practical_passing; ?>%</div>
-                            </td>
-                            <td style="text-align: center; font-weight: bold;"><?php echo $project ?: '-'; ?></td>
-                            <td style="text-align: center;">
-                                <?php if ($project_status == 'PASS'): ?>
-                                    <span class="badge badge-success">PASS</span>
-                                <?php elseif ($project_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger">FAIL</span>
-                                <?php else: ?>
-                                    <span class="badge badge-warning">Pending</span>
-                                <?php endif; ?>
-                                <div class="percentage-badge">Target: <?php echo $project_passing; ?>%</div>
-                            </td>
-                            <td style="text-align: center; font-weight: bold;"><?php echo $oral ? $oral . '/' . $oral_max : '-'; ?></td>
-                            <td style="text-align: center;">
-                                <?php if ($oral_status == 'PASS'): ?>
-                                    <span class="badge badge-success">PASS</span>
-                                <?php elseif ($oral_status == 'FAIL'): ?>
-                                    <span class="badge badge-danger">FAIL</span>
-                                <?php else: ?>
-                                    <span class="badge badge-warning">Pending</span>
-                                <?php endif; ?>
-                                <div class="percentage-badge">Target: <?php echo $oral_passing; ?>%</div>
-                            </td>
-                            <td style="text-align: center; font-weight: bold;"><?php echo $total ?: '-'; ?></td>
-                            <td style="text-align: center;">
-                                <span class="badge <?php echo $result_class; ?>"><?php echo $result_text; ?></span>
-                            </td>
-                            <td style="text-align: center;">
-                                <?php if ($practical > 0 && $project > 0 && $oral > 0): ?>
-                                    <span class="badge badge-success">Complete</span>
-                                <?php else: ?>
-                                    <span class="badge badge-warning">Incomplete</span>
-                                <?php endif; ?>
-                            </td>
-                        </tr>
+                            <td><?php echo $index + 1; ?></td>
+                            <td><strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>                             <td><?php echo $practical ?: '-'; ?></td>
+                             <td><?php echo $project ?: '-'; ?></td>
+                             <td><?php echo $oral ?: '-'; ?></td>
+                             <td><strong><?php echo $total ?: '-'; ?></strong></td>
+                             <td><span class="badge <?php echo $result_class; ?>"><?php echo $result_text; ?></span></td>
+                             <td><?php echo !empty($enrollment['is_finalized']) ? 'Finalized' : 'Pending'; ?></td>
+                         </tr>
                         <?php endforeach; ?>
-                        
-                        <?php if (!empty($enrollments)): ?>
-                        <tr style="background: #e8f5e9; font-weight: bold;">
-                            <td colspan="2" style="text-align: right;">TOTALS / AVERAGES:</td>
-                            <td style="text-align: center;"><?php echo $practical_count ? round($total_practical / $practical_count, 1) : 0; ?></td>
-                            <td></td>
-                            <td style="text-align: center;"><?php echo $project_count ? round($total_project / $project_count, 1) : 0; ?></td>
-                            <td></td>
-                            <td style="text-align: center;"><?php echo $oral_count ? round($total_oral / $oral_count, 1) : 0; ?></td>
-                            <td></td>
-                            <td style="text-align: center;"><?php echo $total_trainees ? round($total_overall / $total_trainees, 1) : 0; ?></td>
-                            <td colspan="2"></td>
-                        </tr>
-                        <?php endif; ?>
                     </tbody>
                 </table>
-                
-                <?php if (empty($enrollments)): ?>
-                <div style="text-align: center; padding: 40px;">
-                    <i class="fas fa-users-slash" style="font-size: 48px; color: #ccc; margin-bottom: 10px;"></i>
-                    <p>No approved trainees found for this program.</p>
-                </div>
-                <?php endif; ?>
             </div>
         <?php endif; ?>
     </div>
@@ -2490,22 +1957,6 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         <div class="modal-content">
             <img id="modalImage" class="modal-image">
             <div id="modalCaption" class="modal-caption"></div>
-            <div style="margin-top: 15px;">
-                <a id="downloadLink" href="#" download class="btn btn-success">
-                    <i class="fas fa-download"></i> Download Image
-                </a>
-            </div>
-        </div>
-    </div>
-
-    <!-- Answer Modal -->
-    <div id="answerModal" class="image-modal" style="z-index: 10000;">
-        <span class="close-modal" onclick="closeAnswerModal()">&times;</span>
-        <div class="modal-content">
-            <div style="background: white; padding: 30px; border-radius: 10px; max-width: 600px; max-height: 80vh; overflow-y: auto;">
-                <h3 style="margin-bottom: 20px; color: #17a2b8;">Full Answer</h3>
-                <div id="fullAnswer" style="white-space: pre-wrap; line-height: 1.6;"></div>
-            </div>
         </div>
     </div>
 
@@ -2535,7 +1986,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         function removeProgramSkill(btn) {
             Swal.fire({
                 title: 'Remove Skill?',
-                text: 'Are you sure you want to remove this skill from the template?',
+                text: 'Are you sure?',
                 icon: 'warning',
                 showCancelButton: true,
                 confirmButtonColor: '#dc3545',
@@ -2553,7 +2004,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 const nameInput = row.querySelector('.program-skill-name');
                 const maxInput = row.querySelector('.program-skill-max');
                 
-                if (nameInput && maxInput && nameInput.value.trim() !== '') {
+                if (nameInput && nameInput.value.trim() !== '') {
                     skills.push({
                         name: nameInput.value.trim(),
                         max_score: parseInt(maxInput.value) || 20
@@ -2568,11 +2019,8 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             
             const form = document.createElement('form');
             form.method = 'POST';
-            form.action = 'bulk_comprehensive_assessment.php?program_id=<?php echo $program_id; ?>';
-            
             addField(form, 'save_program_skills', '1');
             addField(form, 'program_skills', JSON.stringify(skills));
-            
             document.body.appendChild(form);
             form.submit();
         }
@@ -2597,7 +2045,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         function removeProgramQuestion(btn) {
             Swal.fire({
                 title: 'Remove Question?',
-                text: 'Are you sure you want to remove this question from the template?',
+                text: 'Are you sure?',
                 icon: 'warning',
                 showCancelButton: true,
                 confirmButtonColor: '#dc3545',
@@ -2615,7 +2063,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 const questionInput = row.querySelector('.program-question');
                 const maxInput = row.querySelector('.program-question-max');
                 
-                if (questionInput && maxInput && questionInput.value.trim() !== '') {
+                if (questionInput && questionInput.value.trim() !== '') {
                     questions.push({
                         question: questionInput.value.trim(),
                         max_score: parseInt(maxInput.value) || 25
@@ -2630,16 +2078,13 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             
             const form = document.createElement('form');
             form.method = 'POST';
-            form.action = 'bulk_comprehensive_assessment.php?program_id=<?php echo $program_id; ?>';
-            
             addField(form, 'save_program_questions', '1');
             addField(form, 'program_questions', JSON.stringify(questions));
-            
             document.body.appendChild(form);
             form.submit();
         }
         
-        // Update skill total for a trainee
+        // Practical Skills Functions
         function updateSkillTotal(index) {
             let total = 0;
             const skillScores = {};
@@ -2655,95 +2100,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             document.getElementById(`skill-scores-${index}`).value = JSON.stringify(skillScores);
         }
         
-        // Update project status with passing percentage
-        function updateProjectStatus(input, index, passingPercentage) {
-            const score = parseFloat(input.value) || 0;
-            const statusDiv = document.getElementById('project-status-' + index);
-            
-            if (score >= passingPercentage) {
-                statusDiv.innerHTML = '<span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>';
-            } else if (score > 0) {
-                statusDiv.innerHTML = '<span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>';
-            } else {
-                statusDiv.innerHTML = '';
-            }
-        }
-        
-        // Update oral status with passing percentage
-        function updateOralStatus(input, index, maxScore, passingPercentage) {
-            const score = parseFloat(input.value) || 0;
-            const statusDiv = document.getElementById('oral-status-' + index);
-            const passingScore = maxScore * (passingPercentage / 100);
-            
-            if (score >= passingScore) {
-                statusDiv.innerHTML = '<span class="badge badge-success"><i class="fas fa-check"></i> PASS</span>';
-            } else if (score > 0) {
-                statusDiv.innerHTML = '<span class="badge badge-danger"><i class="fas fa-times"></i> FAIL</span>';
-            } else {
-                statusDiv.innerHTML = '';
-            }
-        }
-        
-        // Toggle visibility (individual)
-        function toggleVisibility(type, enrollmentId, checkbox) {
-            const newValue = checkbox.checked ? 1 : 0;
-            const toggleType = type === 'project' ? 'toggle_project' : 'toggle_oral';
-            
-            fetch(`bulk_comprehensive_assessment.php?${toggleType}=1&enrollment_id=${enrollmentId}&set=${newValue}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        const badge = checkbox.closest('td').querySelector('div:last-child');
-                        if (badge) {
-                            badge.innerHTML = newValue ? 'Visible' : 'Hidden';
-                        }
-                        Swal.fire({
-                            icon: 'success',
-                            title: 'Updated!',
-                            text: `Visibility ${newValue ? 'enabled' : 'disabled'} for this trainee.`,
-                            timer: 1500,
-                            showConfirmButton: false
-                        });
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        // Image modal functions
-        function showImageModal(imageSrc, title) {
-            document.getElementById('modalImage').src = imageSrc;
-            document.getElementById('modalCaption').innerHTML = title || 'Project Image';
-            document.getElementById('downloadLink').href = imageSrc;
-            document.getElementById('imageModal').style.display = 'block';
-        }
-        
-        function closeImageModal() {
-            document.getElementById('imageModal').style.display = 'none';
-        }
-        
-        // Answer modal functions
-        function showFullAnswer(index, qIndex) {
-            const answerDiv = document.getElementById(`answer-${index}-${qIndex}`);
-            if (answerDiv) {
-                document.getElementById('fullAnswer').innerHTML = answerDiv.innerHTML;
-                document.getElementById('answerModal').style.display = 'block';
-            }
-        }
-        
-        function closeAnswerModal() {
-            document.getElementById('answerModal').style.display = 'none';
-        }
-        
-        // Helper function to add form fields
-        function addField(form, name, value) {
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = name;
-            input.value = value;
-            form.appendChild(input);
-        }
-        
-        // Rubric management functions
+        // Rubric Functions
         let rubricCriterionCount = <?php echo count($default_rubrics_data); ?>;
         
         function addRubricCriterion() {
@@ -2752,10 +2109,9 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             const el = document.createElement('div');
             el.className = 'rubric-criterion';
             el.setAttribute('data-criterion-index', rubricCriterionCount - 1);
-            el.style.cssText = 'background: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin-bottom: 20px; border-radius: 8px;';
             el.innerHTML = `
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                    <h4 style="margin: 0; color: #007bff;">
+                    <h4 style="margin: 0;">
                         <i class="fas fa-check-circle"></i> Criterion ${rubricCriterionCount}:
                         <input type="text" class="form-control criterion-name"
                                style="display: inline-block; width: auto; min-width: 200px; margin-left: 10px;"
@@ -2766,15 +2122,13 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                         <i class="fas fa-trash"></i> Remove
                     </button>
                 </div>
-                <div style="margin-bottom: 10px;">
+                <div>
                     <label>Max Points: </label>
                     <input type="number" class="form-control rubric-max-score"
                            style="width: 100px; display: inline-block;"
                            value="20" min="1" max="1000" step="1" onchange="updateRubricTotal()">
                 </div>
-                <div class="rubric-score-display" style="font-size: 12px; color: #666;">
-                    Score will be entered per trainee in the section below
-                </div>`;
+            `;
             container.appendChild(el);
             updateRubricTotal();
         }
@@ -2796,7 +2150,6 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             const text = h4.innerHTML;
                             h4.innerHTML = text.replace(/Criterion \d+:/, `Criterion ${idx + 1}:`);
                         }
-                        c.setAttribute('data-criterion-index', idx);
                     });
                     updateRubricTotal();
                 }
@@ -2834,22 +2187,19 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             
             Swal.fire({
                 title: 'Apply to All Trainees?',
-                html: `This will apply the following project setup to ALL trainees:<br><br>
+                html: `This will apply to ALL trainees:<br><br>
                        <strong>Title:</strong> ${escapeHtml(projectTitle) || '(None)'}<br>
                        <strong>Rubric:</strong> ${rubrics.length} criteria, ${totalMax} total points<br><br>
-                       Existing project data will be overwritten.`,
+                       <strong>Note:</strong> Trainee submissions will be preserved. Existing scores will be kept for matching criteria.`,
                 icon: 'question',
                 showCancelButton: true,
-                confirmButtonText: 'Yes, Apply',
-                cancelButtonText: 'Cancel'
+                confirmButtonText: 'Yes, Apply'
             }).then((result) => {
                 if (result.isConfirmed) {
                     Swal.fire({ title: 'Applying...', allowOutsideClick: false, showConfirmButton: false, didOpen: () => Swal.showLoading() });
                     
                     const form = document.createElement('form');
                     form.method = 'POST';
-                    form.action = 'bulk_comprehensive_assessment.php?program_id=<?php echo $program_id; ?>';
-                    
                     addField(form, 'save_bulk_project_setup', '1');
                     addField(form, 'project_title_override', projectTitle);
                     addField(form, 'project_instruction', projectInstruction);
@@ -2861,59 +2211,67 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             });
         }
         
-        // Validate and submit passing percentages
-        function validatePassingPercentages() {
-            const practical = parseFloat(document.getElementById('practical_passing_percentage').value);
-            const project = parseFloat(document.getElementById('project_passing_percentage').value);
-            const oral = parseFloat(document.getElementById('oral_passing_percentage').value);
+        function updateRubricTraineeTotal(index) {
+            let total = 0;
+            const rubricScores = {};
             
-            let isValid = true;
-            let errorMessage = '';
-            
-            if (practical < 65 || practical > 100) {
-                isValid = false;
-                errorMessage += 'Practical passing percentage must be between 65% and 100%. ';
-            }
-            if (project < 65 || project > 100) {
-                isValid = false;
-                errorMessage += 'Project passing percentage must be between 65% and 100%. ';
-            }
-            if (oral < 65 || oral > 100) {
-                isValid = false;
-                errorMessage += 'Oral passing percentage must be between 65% and 100%. ';
-            }
-            
-            if (!isValid) {
-                Swal.fire({
-                    icon: 'error',
-                    title: 'Invalid Percentage',
-                    text: errorMessage,
-                    confirmButtonText: 'OK'
-                });
-                return false;
-            }
-            
-            Swal.fire({
-                title: 'Apply to All Trainees?',
-                html: `This will set the following passing percentages for ALL trainees:<br><br>
-                       <strong>Practical:</strong> ${practical}%<br>
-                       <strong>Project:</strong> ${project}%<br>
-                       <strong>Oral:</strong> ${oral}%<br><br>
-                       This will affect the pass/fail status for all components.`,
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonText: 'Yes, Apply',
-                cancelButtonText: 'Cancel'
-            }).then((result) => {
-                if (result.isConfirmed) {
-                    document.getElementById('passingPercentagesForm').submit();
-                }
+            document.querySelectorAll(`#rubric-scores-${index} .rubric-score-input`).forEach(input => {
+                const score = parseFloat(input.value) || 0;
+                const criterionIndex = input.dataset.criterionIndex;
+                total += score;
+                rubricScores[criterionIndex] = score;
             });
             
-            return false;
+            document.getElementById(`rubric-total-${index}`).textContent = total;
+            document.getElementById(`rubric-scores-json-${index}`).value = JSON.stringify(rubricScores);
+            
+            // Update pass/fail indicator
+            const totalMax = Array.from(document.querySelectorAll(`#rubric-scores-${index} .rubric-score-input`)).reduce((sum, input) => {
+                return sum + (parseFloat(input.max) || 0);
+            }, 0);
+            
+            const percentage = totalMax > 0 ? (total / totalMax) * 100 : 0;
+            const passingPercentage = <?php echo $global_project_passing; ?>;
+            const statusCell = document.getElementById(`rubric-total-${index}`).closest('td');
+            const existingBadge = statusCell.querySelector('.badge-success, .badge-danger');
+            
+            if (existingBadge) existingBadge.remove();
+            
+            if (total > 0) {
+                const badge = document.createElement('span');
+                badge.className = percentage >= passingPercentage ? 'badge badge-success' : 'badge badge-danger';
+                badge.innerHTML = percentage >= passingPercentage ? 'PASS' : 'FAIL';
+                statusCell.querySelector('.total-display').insertAdjacentElement('afterend', badge);
+            }
         }
         
-        // Escape HTML helper
+        // Toggle visibility
+        function toggleVisibility(type, enrollmentId, checkbox) {
+            const newValue = checkbox.checked ? 1 : 0;
+            const toggleType = type === 'project' ? 'toggle_project' : 'toggle_oral';
+            
+            fetch(`bulk_comprehensive_assessment.php?${toggleType}=1&enrollment_id=${enrollmentId}&set=${newValue}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const badge = checkbox.closest('td').querySelector('div:last-child');
+                        if (badge) {
+                            badge.innerHTML = newValue ? 'Visible' : 'Hidden';
+                        }
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        // Helper functions
+        function addField(form, name, value) {
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = name;
+            input.value = value;
+            form.appendChild(input);
+        }
+        
         function escapeHtml(text) {
             if (!text) return '';
             const div = document.createElement('div');
@@ -2921,110 +2279,45 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             return div.innerHTML;
         }
         
-        // Print Summary Function
-        function printSummary() {
-            const printWindow = window.open('', '_blank');
-            const today = new Date();
-            const formattedDate = today.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-            const programName = '<?php echo htmlspecialchars($program['name']); ?>';
-            const table = document.querySelector('#summaryTable table').cloneNode(true);
-            
-            const printContent = `
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Assessment Summary - ${programName}</title>
-                    <style>
-                        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.4; }
-                        .print-header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #333; }
-                        .print-header h1 { color: #333; margin-bottom: 10px; font-size: 24px; }
-                        .print-header h2 { color: #666; margin-bottom: 5px; font-size: 18px; }
-                        .print-header .date { color: #888; font-size: 14px; }
-                        .stats-summary { display: flex; justify-content: space-around; margin-bottom: 20px; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 8px; }
-                        .stat-item { text-align: center; }
-                        .stat-number { font-size: 24px; font-weight: bold; }
-                        .stat-label { font-size: 12px; opacity: 0.9; }
-                        table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
-                        th { background: #333; color: white; padding: 10px; text-align: left; font-size: 12px; }
-                        td { padding: 8px; border: 1px solid #ddd; }
-                        tr:nth-child(even) { background: #f9f9f9; }
-                        .badge { padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; display: inline-block; }
-                        .badge-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-                        .badge-danger { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-                        .badge-warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-                        .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; text-align: center; font-size: 12px; color: #666; }
-                        .signature { margin-top: 50px; display: flex; justify-content: space-between; }
-                        .signature-line { width: 200px; border-top: 1px solid #333; margin-top: 40px; text-align: center; }
-                        @media print { body { margin: 0.5in; } }
-                    </style>
-                </head>
-                <body>
-                    <div class="print-header">
-                        <h1>COMPREHENSIVE ASSESSMENT SUMMARY</h1>
-                        <h2>${programName}</h2>
-                        <div class="date">Date Printed: ${formattedDate}</div>
-                    </div>
-                    
-                    <div class="stats-summary">
-                        <div class="stat-item"><div class="stat-number"><?php echo $total_trainees; ?></div><div class="stat-label">Total Trainees</div></div>
-                        <div class="stat-item"><div class="stat-number"><?php echo $passed_count; ?></div><div class="stat-label">Passed</div></div>
-                        <div class="stat-item"><div class="stat-number"><?php echo $failed_count; ?></div><div class="stat-label">Failed</div></div>
-                        <div class="stat-item"><div class="stat-number"><?php echo $pending_count; ?></div><div class="stat-label">Pending</div></div>
-                        <div class="stat-item"><div class="stat-number"><?php echo $completion_rate; ?>%</div><div class="stat-label">Completion Rate</div></div>
-                    </div>
-                    
-                    ${table.outerHTML}
-                    
-                    <div class="footer"><p>This is a system-generated summary report. All scores are final and subject to validation.</p></div>
-                    <div class="signature">
-                        <div><div class="signature-line"></div><p>Assessed By: _________________________</p></div>
-                        <div><div class="signature-line"></div><p>Date: _________________________</p></div>
-                    </div>
-                    <script>window.onload = function() { window.print(); window.onafterprint = function() { window.close(); } }<\/script>
-                </body>
-                </html>
-            `;
-            
-            printWindow.document.write(printContent);
-            printWindow.document.close();
+        function showImageModal(imageSrc, title) {
+            document.getElementById('modalImage').src = imageSrc;
+            document.getElementById('modalCaption').innerHTML = title || 'Project Image';
+            document.getElementById('imageModal').style.display = 'block';
         }
         
-        // Initialize all skill totals on page load
+        function closeImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+        }
+        
+        // Initialize totals on page load
         document.addEventListener('DOMContentLoaded', function() {
-            <?php foreach ($enrollments_with_details as $index => $enrollment): ?>
-                updateSkillTotal(<?php echo $index; ?>);
+            <?php foreach ($enrollments as $index => $enrollment): ?>
+                if (typeof updateSkillTotal !== 'undefined') {
+                    updateSkillTotal(<?php echo $index; ?>);
+                }
+                if (typeof updateRubricTraineeTotal !== 'undefined') {
+                    updateRubricTraineeTotal(<?php echo $index; ?>);
+                }
             <?php endforeach; ?>
-            
-            updateRubricTotal();
-            
-            const passingForm = document.getElementById('passingPercentagesForm');
-            if (passingForm) {
-                passingForm.onsubmit = function(e) {
-                    e.preventDefault();
-                    validatePassingPercentages();
-                    return false;
-                };
+            if (typeof updateRubricTotal !== 'undefined') {
+                updateRubricTotal();
             }
-            
-            <?php if ($current_tab == 'summary' && !empty($enrollments)): ?>
-            setTimeout(function() { location.reload(); }, 30000);
-            <?php endif; ?>
         });
         
-        // Close modals when clicking outside
-        window.onclick = function(event) {
-            const imageModal = document.getElementById('imageModal');
-            const answerModal = document.getElementById('answerModal');
-            if (event.target == imageModal) imageModal.style.display = 'none';
-            if (event.target == answerModal) answerModal.style.display = 'none';
-        }
-        
+        // Close modal on escape key
         document.addEventListener('keydown', function(event) {
             if (event.key === 'Escape') {
                 closeImageModal();
-                closeAnswerModal();
             }
         });
+        
+        // Close modal on click outside
+        window.onclick = function(event) {
+            const modal = document.getElementById('imageModal');
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
     </script>
 </body>
 </html>
