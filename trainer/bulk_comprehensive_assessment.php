@@ -1,5 +1,5 @@
 <?php
-// BULK COMPREHENSIVE ASSESSMENT WITH RUBRIC SCORING - PRESERVES TRAINEE SUBMISSIONS
+// BULK COMPREHENSIVE ASSESSMENT 
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
@@ -22,6 +22,23 @@ if (!$conn) {
     die("Database connection failed");
 }
 
+//Sanitize user INPUT only. Converts literal "/n" typed by a user into real newlines.
+ 
+function sanitizeInstruction($input) {
+    if (empty($input)) return '';
+
+    // Convert user-typed slash sequences to real control characters
+    $input = str_replace(['/n', '/r', '/t', '//n', '//r', '//t'], ["\n", "\r", "\t", "\n", "\r", "\t"], $input);
+
+    return $input;
+}
+
+// Format DB text for HTML 
+function formatForDisplay($text) {
+    if (empty($text)) return '';
+    return nl2br(htmlspecialchars($text, ENT_QUOTES, 'UTF-8'));
+}
+
 // GET PROGRAM ID
 $program_id = isset($_GET['program_id']) ? intval($_GET['program_id']) : 0;
 
@@ -41,19 +58,18 @@ if (!$program) {
 // GET ALL ENROLLMENTS FOR THIS PROGRAM
 $enrollments = $conn->query("
     SELECT e.*, t.fullname, t.firstname, t.lastname, t.email, t.contact_number,
-           ac.id as assessment_id, ac.practical_score, ac.project_score, ac.oral_score,
-           ac.oral_max_score, ac.practical_skills_grading, ac.oral_questions,
-           ac.project_visible_to_trainee, ac.oral_questions_visible_to_trainee,
-           ac.project_submitted_by_trainee, ac.oral_submitted_by_trainee,
+           ac.id as assessment_id, ac.practical_score, ac.project_score,
+           ac.project_visible_to_trainee,
+           ac.project_submitted_by_trainee,
            ac.project_title, ac.project_description, ac.project_photo_path,
-           ac.oral_answers, ac.practical_notes, ac.project_notes, ac.oral_notes,
-           ac.practical_passed, ac.project_passed, ac.oral_passed,
+           ac.practical_notes, ac.project_notes,
+           ac.practical_passed, ac.project_passed,
            ac.overall_result as assessment_result, ac.overall_total_score,
-           ac.oral_questions_set, ac.practical_date,
-           ac.project_submitted_at, ac.oral_submitted_at,
+           ac.practical_date,
+           ac.project_submitted_at,
            ac.is_finalized, ac.assessed_by, ac.assessed_at,
-           ac.practical_skills_saved, ac.oral_questions_saved,
-           ac.practical_passing_percentage, ac.project_passing_percentage, ac.oral_passing_percentage,
+           ac.practical_skills_saved,
+           ac.practical_passing_percentage, ac.project_passing_percentage,
            ac.project_title_override, ac.project_instruction, ac.project_rubrics, ac.project_total_max
     FROM enrollments e
     JOIN trainees t ON e.user_id = t.user_id
@@ -81,8 +97,9 @@ if (isset($_POST['load_skills_to_all'])) {
             
             $stmt = $conn->prepare("INSERT INTO trainee_practical_skills (enrollment_id, skill_name, max_score, order_index, score) VALUES (?, ?, ?, ?, NULL)");
             foreach ($program_skills as $index => $skill) {
-                $skill_name = $skill['skill_name'];
+                $skill_name = sanitizeInstruction($skill['skill_name']);
                 $max_score = $skill['max_score'];
+                if ($max_score <= 0) $max_score = 1;
                 $stmt->bind_param("isii", $enrollment_id, $skill_name, $max_score, $index);
                 $stmt->execute();
             }
@@ -97,9 +114,9 @@ if (isset($_POST['load_skills_to_all'])) {
                     WHERE enrollment_id = $enrollment_id");
             } else {
                 $conn->query("INSERT INTO assessment_components 
-                    (enrollment_id, practical_skills_saved, practical_score, practical_passed, oral_max_score, 
-                     practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                    VALUES ($enrollment_id, 1, 0, 0, 100, 75, 75, 75)");
+                    (enrollment_id, practical_skills_saved, practical_score, practical_passed, 
+                     practical_passing_percentage, project_passing_percentage) 
+                    VALUES ($enrollment_id, 1, 0, 0, 75, 75)");
             }
             $success_count++;
         }
@@ -124,8 +141,9 @@ if (isset($_POST['load_questions_to_all'])) {
             
             $stmt = $conn->prepare("INSERT INTO trainee_oral_questions (enrollment_id, question, max_score, order_index, score) VALUES (?, ?, ?, ?, NULL)");
             foreach ($program_questions as $index => $q) {
-                $question = $q['question'];
+                $question = sanitizeInstruction($q['question']);
                 $max_score = $q['max_score'];
+                if ($max_score <= 0) $max_score = 1;
                 $stmt->bind_param("isii", $enrollment_id, $question, $max_score, $index);
                 $stmt->execute();
             }
@@ -142,13 +160,14 @@ if (isset($_POST['load_questions_to_all'])) {
                     oral_questions_saved = 1,
                     oral_max_score = $total_max,
                     oral_questions_set = 1,
-                    oral_score = 0
+                    oral_score = 0,
+                    oral_passed = 0
                     WHERE enrollment_id = $enrollment_id");
             } else {
                 $conn->query("INSERT INTO assessment_components 
                     (enrollment_id, oral_questions_saved, oral_max_score, oral_questions_set, oral_questions_visible_to_trainee, 
-                     project_visible_to_trainee, oral_score, practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                    VALUES ($enrollment_id, 1, $total_max, 1, 0, 0, 0, 75, 75, 75)");
+                     project_visible_to_trainee, oral_score, oral_passed, practical_passing_percentage, project_passing_percentage) 
+                    VALUES ($enrollment_id, 1, $total_max, 1, 0, 0, 0, 0, 75, 75)");
             }
             $success_count++;
         }
@@ -162,18 +181,34 @@ if (isset($_POST['load_questions_to_all'])) {
     exit;
 }
 
-// SAVE BULK PASSING PERCENTAGES
+// SAVE BULK PASSING PERCENTAGES - WITH VALIDATION
 if (isset($_POST['save_bulk_passing_percentages'])) {
     $practical_passing = floatval($_POST['practical_passing_percentage'] ?? 75);
     $project_passing = floatval($_POST['project_passing_percentage'] ?? 75);
-    $oral_passing = floatval($_POST['oral_passing_percentage'] ?? 75);
     
-    if ($practical_passing < 65) $practical_passing = 65;
-    if ($practical_passing > 100) $practical_passing = 100;
-    if ($project_passing < 65) $project_passing = 65;
-    if ($project_passing > 100) $project_passing = 100;
-    if ($oral_passing < 65) $oral_passing = 65;
-    if ($oral_passing > 100) $oral_passing = 100;
+    // VALIDATION: Ensure percentages are between 65 and 100
+    $validation_errors = [];
+    $was_adjusted = false;
+    
+    if ($practical_passing < 65) {
+        $validation_errors[] = "Practical passing percentage cannot be less than 65% (entered: {$practical_passing}%)";
+        $practical_passing = 65;
+        $was_adjusted = true;
+    } elseif ($practical_passing > 100) {
+        $validation_errors[] = "Practical passing percentage cannot exceed 100% (entered: {$practical_passing}%)";
+        $practical_passing = 100;
+        $was_adjusted = true;
+    }
+    
+    if ($project_passing < 65) {
+        $validation_errors[] = "Project passing percentage cannot be less than 65% (entered: {$project_passing}%)";
+        $project_passing = 65;
+        $was_adjusted = true;
+    } elseif ($project_passing > 100) {
+        $validation_errors[] = "Project passing percentage cannot exceed 100% (entered: {$project_passing}%)";
+        $project_passing = 100;
+        $was_adjusted = true;
+    }
     
     $updated = 0;
     foreach ($enrollments as $enrollment) {
@@ -183,32 +218,41 @@ if (isset($_POST['save_bulk_passing_percentages'])) {
         if ($check->num_rows > 0) {
             $conn->query("UPDATE assessment_components SET 
                 practical_passing_percentage = $practical_passing,
-                project_passing_percentage = $project_passing,
-                oral_passing_percentage = $oral_passing
+                project_passing_percentage = $project_passing
                 WHERE enrollment_id = $enrollment_id");
         } else {
             $conn->query("INSERT INTO assessment_components 
-                (enrollment_id, practical_passing_percentage, project_passing_percentage, oral_passing_percentage, oral_max_score) 
-                VALUES ($enrollment_id, $practical_passing, $project_passing, $oral_passing, 100)");
+                (enrollment_id, practical_passing_percentage, project_passing_percentage) 
+                VALUES ($enrollment_id, $practical_passing, $project_passing)");
         }
         $updated++;
     }
     
-    $_SESSION['message'] = "$updated trainee(s) - Passing percentages updated! (Practical: $practical_passing%, Project: $project_passing%, Oral: $oral_passing%)";
-    $_SESSION['message_type'] = 'success';
+    // Build message
+    $message = "$updated trainee(s) - Passing percentages updated! (Practical: $practical_passing%, Project: $project_passing%)";
+    if (!empty($validation_errors)) {
+        $message = implode('<br>', $validation_errors) . "<br>Values have been adjusted to valid range (65-100%).<br>" . $message;
+        $_SESSION['message_type'] = 'warning';
+    } else {
+        $_SESSION['message_type'] = 'success';
+    }
+    
+    $_SESSION['message'] = $message;
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=" . ($_POST['current_tab'] ?? 'practical'));
     exit;
 }
 
 // SAVE BULK PROJECT SETUP (Title, Instructions, Rubrics) - PRESERVES TRAINEE SUBMISSIONS
 if (isset($_POST['save_bulk_project_setup'])) {
-    $project_title_override = $conn->real_escape_string($_POST['project_title_override'] ?? '');
-    $project_instruction = $conn->real_escape_string($_POST['project_instruction'] ?? '');
+    $project_title_override = $conn->real_escape_string(sanitizeInstruction($_POST['project_title_override'] ?? ''));
+    $project_instruction = $conn->real_escape_string(sanitizeInstruction($_POST['project_instruction'] ?? ''));
     $rubrics_data = json_decode($_POST['rubrics_data'] ?? '[]', true);
     
     $project_total_max = 0;
     foreach ($rubrics_data as $criterion) {
-        $project_total_max += floatval($criterion['max_score'] ?? 0);
+        $max_score = floatval($criterion['max_score'] ?? 0);
+        if ($max_score <= 0) $max_score = 1;
+        $project_total_max += $max_score;
     }
     if ($project_total_max == 0) $project_total_max = 100;
     
@@ -239,14 +283,19 @@ if (isset($_POST['save_bulk_project_setup'])) {
             foreach ($existing_rubrics as $existing_criterion) {
                 if ($existing_criterion['name'] === $new_criterion['name']) {
                     $merged_criterion = $new_criterion;
-                    $merged_criterion['score'] = $existing_criterion['score'] ?? 0;
+                    // Preserve existing score if it exists and is not null/empty
+                    if (isset($existing_criterion['score']) && $existing_criterion['score'] !== null && $existing_criterion['score'] !== '') {
+                        $merged_criterion['score'] = $existing_criterion['score'];
+                    } else {
+                        $merged_criterion['score'] = null;
+                    }
                     $merged_rubrics[] = $merged_criterion;
                     $found = true;
                     break;
                 }
             }
             if (!$found) {
-                $new_criterion['score'] = 0;
+                $new_criterion['score'] = null;
                 $merged_rubrics[] = $new_criterion;
             }
         }
@@ -254,22 +303,34 @@ if (isset($_POST['save_bulk_project_setup'])) {
         $final_rubrics_json = json_encode($merged_rubrics);
         $safe_final_rubrics = $conn->real_escape_string($final_rubrics_json);
         
-        // Recalculate total score from merged rubrics
+        // Recalculate total score from merged rubrics (only if scores exist)
         $total_earned_score = 0;
         $total_max_score = 0;
+        $has_any_score = false;
         foreach ($merged_rubrics as $criterion) {
             $total_max_score += floatval($criterion['max_score'] ?? 0);
-            $total_earned_score += floatval($criterion['score'] ?? 0);
+            $score = $criterion['score'] ?? null;
+            if ($score !== null && $score !== '') {
+                $total_earned_score += floatval($score);
+                $has_any_score = true;
+            }
         }
         
-        $passing_query = $conn->query("SELECT project_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        $passing_percentage = 75;
-        if ($passing_query && $row = $passing_query->fetch_assoc()) {
-            $passing_percentage = $row['project_passing_percentage'] ?? 75;
+        // Only calculate pass/fail if there's at least one score entered
+        $passed = 0;
+        if ($has_any_score && $total_max_score > 0) {
+            $passing_query = $conn->query("SELECT project_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
+            $passing_percentage = 75;
+            if ($passing_query && $row = $passing_query->fetch_assoc()) {
+                $passing_percentage = $row['project_passing_percentage'] ?? 75;
+            }
+            
+            $percentage = ($total_earned_score / $total_max_score) * 100;
+            $passed = ($percentage >= $passing_percentage) ? 1 : 0;
+        } else {
+            // Keep existing passed status if no scores yet
+            $passed = $existing['project_passed'] ?? 0;
         }
-        
-        $percentage = $total_max_score > 0 ? ($total_earned_score / $total_max_score) * 100 : 0;
-        $passed = ($percentage >= $passing_percentage) ? 1 : 0;
         
         $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
         if ($check->num_rows > 0) {
@@ -285,10 +346,9 @@ if (isset($_POST['save_bulk_project_setup'])) {
         } else {
             $conn->query("INSERT INTO assessment_components 
                 (enrollment_id, project_title_override, project_instruction, project_rubrics, project_total_max, 
-                 project_score, project_passed, oral_max_score,
-                 practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
+                 project_score, project_passed, practical_passing_percentage, project_passing_percentage) 
                 VALUES ($enrollment_id, '$project_title_override', '$project_instruction', '$safe_final_rubrics', $total_max_score,
-                        $total_earned_score, $passed, 100, 75, 75, 75)");
+                        $total_earned_score, $passed, 75, 75)");
         }
         $updated++;
     }
@@ -299,24 +359,26 @@ if (isset($_POST['save_bulk_project_setup'])) {
     exit;
 }
 
-// SAVE BULK RUBRIC SCORES (Detailed per-criterion scoring) - PRESERVES TRAINEE SUBMISSIONS
+// SAVE BULK RUBRIC SCORES (Detailed per-criterion scoring) - PRESERVES TRAINEE SUBMISSIONS WITH VALIDATION
 if (isset($_POST['save_bulk_rubric_scores'])) {
     $enrollment_ids = $_POST['enrollment_id'] ?? [];
     $rubric_scores_data = $_POST['rubric_scores'] ?? [];
     $project_notes = $_POST['project_notes'] ?? [];
     
     $updated = 0;
+    $validation_errors = [];
     
     foreach ($enrollment_ids as $index => $enrollment_id) {
         if (isset($rubric_scores_data[$index])) {
             $rubric_scores = json_decode($rubric_scores_data[$index], true);
-            $notes = $conn->real_escape_string($project_notes[$index] ?? '');
+            $notes = $conn->real_escape_string(sanitizeInstruction($project_notes[$index] ?? ''));
             
             if (is_array($rubric_scores)) {
                 // Get existing assessment data (including trainee submission)
                 $existing = $conn->query("SELECT project_rubrics, project_title, project_description, 
                                                   project_photo_path, project_submitted_by_trainee, project_submitted_at,
-                                                  project_title_override, project_instruction, project_passing_percentage
+                                                  project_title_override, project_instruction, project_passing_percentage,
+                                                  project_score, project_passed
                                            FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
                 
                 $rubrics_data = [];
@@ -326,25 +388,62 @@ if (isset($_POST['save_bulk_rubric_scores'])) {
                 }
                 
                 // Update scores in rubrics data (preserve all other rubric properties)
+                $has_errors = false;
+                $has_any_score = false;
                 foreach ($rubric_scores as $criterion_index => $score) {
                     if (isset($rubrics_data[$criterion_index])) {
-                        $rubrics_data[$criterion_index]['score'] = floatval($score);
+                        $score_val = ($score !== '' && $score !== null) ? floatval($score) : null;
+                        $max_score = $rubrics_data[$criterion_index]['max_score'];
+                        
+                        if ($score_val !== null) {
+                            // Validate score doesn't exceed max
+                            if ($score_val > $max_score) {
+                                $validation_errors[] = "Score ($score_val) exceeds maximum ($max_score) for criterion: " . ($rubrics_data[$criterion_index]['name'] ?? 'Unnamed');
+                                $has_errors = true;
+                            } elseif ($score_val < 0) {
+                                $validation_errors[] = "Score cannot be negative for criterion: " . ($rubrics_data[$criterion_index]['name'] ?? 'Unnamed');
+                                $has_errors = true;
+                            } else {
+                                $rubrics_data[$criterion_index]['score'] = $score_val;
+                                $has_any_score = true;
+                            }
+                        } else {
+                            $rubrics_data[$criterion_index]['score'] = null;
+                        }
                     }
                 }
+                
+                if ($has_errors) continue;
                 
                 // Calculate total score
                 $total_earned_score = 0;
                 $total_max_score = 0;
+                $all_scores_filled = true;
                 foreach ($rubrics_data as $criterion) {
                     $total_max_score += floatval($criterion['max_score'] ?? 0);
-                    $total_earned_score += floatval($criterion['score'] ?? 0);
+                    if (isset($criterion['score']) && $criterion['score'] !== null && $criterion['score'] !== '') {
+                        $total_earned_score += floatval($criterion['score']);
+                    } else {
+                        $all_scores_filled = false;
+                    }
                 }
                 
-                // Get passing percentage
-                $passing_percentage = $existing['project_passing_percentage'] ?? 75;
+                // Validate total doesn't exceed max
+                if ($total_earned_score > $total_max_score) {
+                    $validation_errors[] = "Total score exceeds maximum possible score";
+                    continue;
+                }
                 
-                $percentage = $total_max_score > 0 ? ($total_earned_score / $total_max_score) * 100 : 0;
-                $passed = ($percentage >= $passing_percentage) ? 1 : 0;
+                // Only calculate passed if there's at least one score entered and all are filled
+                $passed = 0;
+                if ($has_any_score && $all_scores_filled && $total_max_score > 0) {
+                    $passing_percentage = $existing['project_passing_percentage'] ?? 75;
+                    $percentage = ($total_earned_score / $total_max_score) * 100;
+                    $passed = ($percentage >= $passing_percentage) ? 1 : 0;
+                } else {
+                    // Keep existing passed status if scores incomplete
+                    $passed = $existing['project_passed'] ?? 0;
+                }
                 
                 $rubrics_json = json_encode($rubrics_data);
                 $safe_rubrics = $conn->real_escape_string($rubrics_json);
@@ -361,17 +460,22 @@ if (isset($_POST['save_bulk_rubric_scores'])) {
                         WHERE enrollment_id = $enrollment_id");
                 } else {
                     $conn->query("INSERT INTO assessment_components 
-                        (enrollment_id, project_rubrics, project_score, project_total_max, project_passed, project_notes, oral_max_score,
-                         practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                        VALUES ($enrollment_id, '$safe_rubrics', $total_earned_score, $total_max_score, $passed, '$notes', 100, 75, 75, 75)");
+                        (enrollment_id, project_rubrics, project_score, project_total_max, project_passed, project_notes,
+                         practical_passing_percentage, project_passing_percentage) 
+                        VALUES ($enrollment_id, '$safe_rubrics', $total_earned_score, $total_max_score, $passed, '$notes', 75, 75)");
                 }
                 $updated++;
             }
         }
     }
     
-    $_SESSION['message'] = "$updated trainee(s) - Rubric scores updated! (Trainee submissions preserved)";
-    $_SESSION['message_type'] = 'success';
+    if (!empty($validation_errors)) {
+        $_SESSION['message'] = implode(', ', $validation_errors);
+        $_SESSION['message_type'] = 'danger';
+    } else {
+        $_SESSION['message'] = "$updated trainee(s) - Rubric scores updated! (Trainee submissions preserved)";
+        $_SESSION['message_type'] = 'success';
+    }
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=project");
     exit;
 }
@@ -431,8 +535,9 @@ if (isset($_POST['save_program_skills'])) {
     if (is_array($skills)) {
         $stmt = $conn->prepare("INSERT INTO program_practical_skills (program_id, skill_name, max_score, order_index) VALUES (?, ?, ?, ?)");
         foreach ($skills as $index => $skill) {
-            $skill_name = $skill['name'];
-            $max_score = $skill['max_score'];
+            $skill_name = sanitizeInstruction($skill['name']);
+            $max_score = intval($skill['max_score']);
+            if ($max_score <= 0) $max_score = 1;
             $stmt->bind_param("isii", $program_id, $skill_name, $max_score, $index);
             $stmt->execute();
         }
@@ -454,8 +559,9 @@ if (isset($_POST['save_program_questions'])) {
     if (is_array($questions)) {
         $stmt = $conn->prepare("INSERT INTO program_oral_questions (program_id, question, max_score, order_index) VALUES (?, ?, ?, ?)");
         foreach ($questions as $index => $q) {
-            $question = $q['question'];
-            $max_score = $q['max_score'];
+            $question = sanitizeInstruction($q['question']);
+            $max_score = intval($q['max_score']);
+            if ($max_score <= 0) $max_score = 1;
             $stmt->bind_param("isii", $program_id, $question, $max_score, $index);
             $stmt->execute();
         }
@@ -467,7 +573,7 @@ if (isset($_POST['save_program_questions'])) {
     exit;
 }
 
-// SAVE BULK PRACTICAL SCORES
+// SAVE BULK PRACTICAL SCORES - WITH COMPREHENSIVE VALIDATION
 if (isset($_POST['save_bulk_practical_detailed'])) {
     $enrollment_ids = $_POST['enrollment_id'] ?? [];
     $skill_scores_data = $_POST['skill_scores'] ?? [];
@@ -475,117 +581,105 @@ if (isset($_POST['save_bulk_practical_detailed'])) {
     $practical_date = $_POST['practical_date'] ?? date('Y-m-d');
     
     $updated = 0;
+    $validation_errors = [];
     
     foreach ($enrollment_ids as $index => $enrollment_id) {
         if (isset($skill_scores_data[$index])) {
             $skill_scores = json_decode($skill_scores_data[$index], true);
-            $notes = $conn->real_escape_string($practical_notes[$index] ?? '');
+            $notes = $conn->real_escape_string(sanitizeInstruction($practical_notes[$index] ?? ''));
             
             if (is_array($skill_scores)) {
+                $has_errors = false;
                 foreach ($skill_scores as $skill_id => $grade_data) {
                     if (strpos($skill_id, 'skill_') === 0) {
                         $skill_db_id = str_replace('skill_', '', $skill_id);
-                        $score = is_array($grade_data) ? ($grade_data['score'] ?? 0) : $grade_data;
-                        $conn->query("UPDATE trainee_practical_skills SET score = $score WHERE id = $skill_db_id AND enrollment_id = $enrollment_id");
+                        $score = is_array($grade_data) ? ($grade_data['score'] ?? null) : $grade_data;
+                        
+                        // Get max score for validation
+                        $max_check = $conn->query("SELECT max_score, skill_name FROM trainee_practical_skills WHERE id = $skill_db_id AND enrollment_id = $enrollment_id");
+                        if ($max_check && $max_row = $max_check->fetch_assoc()) {
+                            $max_score = $max_row['max_score'];
+                            $skill_name = $max_row['skill_name'];
+                            
+                            if ($score !== null && $score !== '') {
+                                $score_val = floatval($score);
+                                // Server-side validation
+                                if ($score_val > $max_score) {
+                                    $validation_errors[] = "Score ($score_val) exceeds maximum ($max_score) for skill: $skill_name";
+                                    $has_errors = true;
+                                } elseif ($score_val < 0) {
+                                    $validation_errors[] = "Score cannot be negative for skill: $skill_name";
+                                    $has_errors = true;
+                                } else {
+                                    $conn->query("UPDATE trainee_practical_skills SET score = $score_val WHERE id = $skill_db_id AND enrollment_id = $enrollment_id");
+                                }
+                            } else {
+                                $conn->query("UPDATE trainee_practical_skills SET score = NULL WHERE id = $skill_db_id AND enrollment_id = $enrollment_id");
+                            }
+                        }
                     }
                 }
+                
+                if ($has_errors) continue;
+                
+                // Recalculate total after saving
+                $total_query = $conn->query("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
+                $practical_total = 0;
+                if ($total_query && $row = $total_query->fetch_assoc()) {
+                    $practical_total = $row['total'] ?? 0;
+                }
+                
+                $passing_query = $conn->query("SELECT practical_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
+                $passing_percentage = 75;
+                if ($passing_query && $row = $passing_query->fetch_assoc()) {
+                    $passing_percentage = $row['practical_passing_percentage'] ?? 75;
+                }
+                
+                $max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
+                $max_total = 0;
+                if ($max_query && $row = $max_query->fetch_assoc()) {
+                    $max_total = $row['total'] ?? 0;
+                }
+                
+                // Validate total doesn't exceed max total
+                if ($practical_total > $max_total) {
+                    $validation_errors[] = "Total score ($practical_total) exceeds maximum possible score ($max_total)";
+                    continue;
+                }
+                
+                $percentage = $max_total > 0 ? ($practical_total / $max_total) * 100 : 0;
+                $practical_passed = ($percentage >= $passing_percentage) ? 1 : 0;
+                
+                $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
+                if ($check->num_rows > 0) {
+                    $conn->query("UPDATE assessment_components SET 
+                        practical_score = $practical_total,
+                        practical_passed = $practical_passed,
+                        practical_notes = '$notes',
+                        practical_date = '$practical_date'
+                        WHERE enrollment_id = $enrollment_id");
+                } else {
+                    $conn->query("INSERT INTO assessment_components 
+                        (enrollment_id, practical_score, practical_passed, practical_notes, practical_date,
+                         practical_passing_percentage, project_passing_percentage) 
+                        VALUES ($enrollment_id, $practical_total, $practical_passed, '$notes', '$practical_date', 75, 75)");
+                }
+                $updated++;
             }
-            
-            $total_query = $conn->query("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-            $practical_total = 0;
-            if ($total_query && $row = $total_query->fetch_assoc()) {
-                $practical_total = $row['total'] ?? 0;
-            }
-            
-            $passing_query = $conn->query("SELECT practical_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            $passing_percentage = 75;
-            if ($passing_query && $row = $passing_query->fetch_assoc()) {
-                $passing_percentage = $row['practical_passing_percentage'] ?? 75;
-            }
-            
-            $max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-            $max_total = 0;
-            if ($max_query && $row = $max_query->fetch_assoc()) {
-                $max_total = $row['total'] ?? 0;
-            }
-            
-            $percentage = $max_total > 0 ? ($practical_total / $max_total) * 100 : 0;
-            $practical_passed = ($percentage >= $passing_percentage) ? 1 : 0;
-            
-            $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            if ($check->num_rows > 0) {
-                $conn->query("UPDATE assessment_components SET 
-                    practical_score = $practical_total,
-                    practical_passed = $practical_passed,
-                    practical_notes = '$notes',
-                    practical_date = '$practical_date'
-                    WHERE enrollment_id = $enrollment_id");
-            } else {
-                $conn->query("INSERT INTO assessment_components 
-                    (enrollment_id, practical_score, practical_passed, practical_notes, practical_date, oral_max_score,
-                     practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                    VALUES ($enrollment_id, $practical_total, $practical_passed, '$notes', '$practical_date', 100, 75, 75, 75)");
-            }
-            $updated++;
         }
     }
     
-    $_SESSION['message'] = "$updated trainee(s) - Practical scores updated successfully!";
-    $_SESSION['message_type'] = 'success';
+    if (!empty($validation_errors)) {
+        $_SESSION['message'] = implode(', ', $validation_errors);
+        $_SESSION['message_type'] = 'danger';
+    } else {
+        $_SESSION['message'] = "$updated trainee(s) - Practical scores updated successfully!";
+        $_SESSION['message_type'] = 'success';
+    }
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=practical");
     exit;
 }
 
-// SAVE BULK ORAL SCORES
-if (isset($_POST['save_bulk_oral'])) {
-    $enrollment_ids = $_POST['enrollment_id'] ?? [];
-    $oral_scores = $_POST['oral_score'] ?? [];
-    $oral_notes = $_POST['oral_notes'] ?? [];
-    
-    $updated = 0;
-    
-    foreach ($enrollment_ids as $index => $enrollment_id) {
-        if (isset($oral_scores[$index]) && $oral_scores[$index] !== '') {
-            $score = floatval($oral_scores[$index]);
-            $notes = $conn->real_escape_string($oral_notes[$index] ?? '');
-            
-            $max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-            $oral_max = 100;
-            if ($max_query && $row = $max_query->fetch_assoc()) {
-                $oral_max = $row['total'] ?? 100;
-            }
-            
-            $passing_query = $conn->query("SELECT oral_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            $passing_percentage = 75;
-            if ($passing_query && $row = $passing_query->fetch_assoc()) {
-                $passing_percentage = $row['oral_passing_percentage'] ?? 75;
-            }
-            
-            $passed = ($score >= ($oral_max * $passing_percentage / 100)) ? 1 : 0;
-            
-            $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            if ($check->num_rows > 0) {
-                $conn->query("UPDATE assessment_components SET 
-                    oral_score = $score,
-                    oral_passed = $passed,
-                    oral_notes = '$notes',
-                    oral_max_score = $oral_max
-                    WHERE enrollment_id = $enrollment_id");
-            } else {
-                $conn->query("INSERT INTO assessment_components 
-                    (enrollment_id, oral_score, oral_passed, oral_notes, oral_max_score,
-                     practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                    VALUES ($enrollment_id, $score, $passed, '$notes', $oral_max, 75, 75, 75)");
-            }
-            $updated++;
-        }
-    }
-    
-    $_SESSION['message'] = "$updated trainee(s) - Oral scores updated successfully!";
-    $_SESSION['message_type'] = 'success';
-    header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=oral");
-    exit;
-}
 
 // CALCULATE ALL OVERALL RESULTS
 if (isset($_POST['calculate_all_results'])) {
@@ -596,59 +690,51 @@ if (isset($_POST['calculate_all_results'])) {
     foreach ($enrollments as $enrollment) {
         $enrollment_id = $enrollment['id'];
         
+        // Get practical total
         $practical_query = $conn->query("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
         $practical = 0;
         if ($practical_query && $row = $practical_query->fetch_assoc()) {
             $practical = $row['total'] ?? 0;
         }
         
+        // Get project total
         $project_query = $conn->query("SELECT project_score FROM assessment_components WHERE enrollment_id = $enrollment_id");
         $project = 0;
         if ($project_query && $row = $project_query->fetch_assoc()) {
             $project = $row['project_score'] ?? 0;
         }
         
-        $oral_query = $conn->query("SELECT SUM(score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        $oral = 0;
-        if ($oral_query && $row = $oral_query->fetch_assoc()) {
-            $oral = $row['total'] ?? 0;
-        }
-        
+        // Get practical max
         $practical_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
         $practical_max = 100;
         if ($practical_max_query && $row = $practical_max_query->fetch_assoc()) {
             $practical_max = $row['total'] ?? 100;
         }
         
+        // Get project max
         $project_max_query = $conn->query("SELECT project_total_max FROM assessment_components WHERE enrollment_id = $enrollment_id");
         $project_max = 100;
         if ($project_max_query && $row = $project_max_query->fetch_assoc()) {
             $project_max = $row['project_total_max'] ?? 100;
         }
         
-        $oral_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        $oral_max = 100;
-        if ($oral_max_query && $row = $oral_max_query->fetch_assoc()) {
-            $oral_max = $row['total'] ?? 100;
-        }
-        
-        $passing_query = $conn->query("SELECT practical_passing_percentage, project_passing_percentage, oral_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
+        // Get passing percentages
+        $passing_query = $conn->query("SELECT practical_passing_percentage, project_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
         $practical_passing = 75;
         $project_passing = 75;
-        $oral_passing = 75;
         if ($passing_query && $row = $passing_query->fetch_assoc()) {
             $practical_passing = $row['practical_passing_percentage'] ?? 75;
             $project_passing = $row['project_passing_percentage'] ?? 75;
-            $oral_passing = $row['oral_passing_percentage'] ?? 75;
         }
         
-        $total = $practical + $project + $oral;
-        $max_total = $practical_max + $project_max + $oral_max;
+        // Calculate totals
+        $total = $practical + $project;
+        $max_total = $practical_max + $project_max;
         $percentage = $max_total > 0 ? ($total / $max_total) * 100 : 0;
         
-        $total_weight = $practical_max + $project_max + $oral_max;
+        $total_weight = $practical_max + $project_max;
         $overall_passing_percentage = $total_weight > 0
-            ? ($practical_max * $practical_passing + $project_max * $project_passing + $oral_max * $oral_passing) / $total_weight
+            ? ($practical_max * $practical_passing + $project_max * $project_passing) / $total_weight
             : 75;
         
         $overall_result = ($percentage >= $overall_passing_percentage) ? 'Passed' : 'Failed';
@@ -656,6 +742,7 @@ if (isset($_POST['calculate_all_results'])) {
         if ($overall_result == 'Passed') $passed_count++;
         else $failed_count++;
         
+        // Update assessment components
         $conn->query("UPDATE assessment_components SET 
             overall_total_score = $total,
             overall_result = '$overall_result',
@@ -664,6 +751,7 @@ if (isset($_POST['calculate_all_results'])) {
             is_finalized = 1
             WHERE enrollment_id = $enrollment_id");
         
+        // Update enrollment
         $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
         $conn->query("UPDATE enrollments SET 
             enrollment_status = '$enrollment_status',
@@ -688,104 +776,142 @@ if (isset($_POST['finalize_all_completed'])) {
     $updated = 0;
     $passed_count = 0;
     $failed_count = 0;
+    $errors = [];
     
-    foreach ($enrollments as $enrollment) {
-        $enrollment_id = $enrollment['id'];
-        
-        $practical_query = $conn->query("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-        $practical = 0;
-        if ($practical_query && $row = $practical_query->fetch_assoc()) {
-            $practical = $row['total'] ?? 0;
-        }
-        
-        $project_query = $conn->query("SELECT project_score FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        $project = 0;
-        if ($project_query && $row = $project_query->fetch_assoc()) {
-            $project = $row['project_score'] ?? 0;
-        }
-        
-        $oral_query = $conn->query("SELECT SUM(score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        $oral = 0;
-        if ($oral_query && $row = $oral_query->fetch_assoc()) {
-            $oral = $row['total'] ?? 0;
-        }
-        
-        $practical_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-        $practical_max = 100;
-        if ($practical_max_query && $row = $practical_max_query->fetch_assoc()) {
-            $practical_max = $row['total'] ?? 100;
-        }
-        
-        $project_max_query = $conn->query("SELECT project_total_max FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        $project_max = 100;
-        if ($project_max_query && $row = $project_max_query->fetch_assoc()) {
-            $project_max = $row['project_total_max'] ?? 100;
-        }
-        
-        $oral_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        $oral_max = 100;
-        if ($oral_max_query && $row = $oral_max_query->fetch_assoc()) {
-            $oral_max = $row['total'] ?? 100;
-        }
-        
-        $passing_query = $conn->query("SELECT practical_passing_percentage, project_passing_percentage, oral_passing_percentage FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        $practical_passing = 75;
-        $project_passing = 75;
-        $oral_passing = 75;
-        if ($passing_query && $row = $passing_query->fetch_assoc()) {
-            $practical_passing = $row['practical_passing_percentage'] ?? 75;
-            $project_passing = $row['project_passing_percentage'] ?? 75;
-            $oral_passing = $row['oral_passing_percentage'] ?? 75;
-        }
-        
-        $has_practical_scores = $practical > 0;
-        $has_project_scores = $project > 0;
-        $has_oral_scores = $oral > 0;
-        
-        if ($has_practical_scores && $has_project_scores && $has_oral_scores) {
-            $total = $practical + $project + $oral;
-            $max_total = $practical_max + $project_max + $oral_max;
-            $percentage = $max_total > 0 ? ($total / $max_total) * 100 : 0;
+    // Start transaction
+    $conn->begin_transaction();
+    
+    try {
+        foreach ($enrollments as $enrollment) {
+            $enrollment_id = $enrollment['id'];
             
-            $total_weight = $practical_max + $project_max + $oral_max;
-            $overall_passing_percentage = $total_weight > 0
-                ? ($practical_max * $practical_passing + $project_max * $project_passing + $oral_max * $oral_passing) / $total_weight
-                : 75;
+            // Get practical scores using prepared statements
+            $practical_stmt = $conn->prepare("SELECT SUM(score) as total FROM trainee_practical_skills WHERE enrollment_id = ?");
+            $practical_stmt->bind_param("i", $enrollment_id);
+            $practical_stmt->execute();
+            $practical_result = $practical_stmt->get_result();
+            $practical = 0;
+            if ($row = $practical_result->fetch_assoc()) {
+                $practical = $row['total'] ?? 0;
+            }
+            $practical_stmt->close();
             
-            $overall_result = ($percentage >= $overall_passing_percentage) ? 'Passed' : 'Failed';
+            // Get project score
+            $project_stmt = $conn->prepare("SELECT project_score FROM assessment_components WHERE enrollment_id = ?");
+            $project_stmt->bind_param("i", $enrollment_id);
+            $project_stmt->execute();
+            $project_result = $project_stmt->get_result();
+            $project = 0;
+            if ($row = $project_result->fetch_assoc()) {
+                $project = $row['project_score'] ?? 0;
+            }
+            $project_stmt->close();
             
-            if ($overall_result == 'Passed') $passed_count++;
-            else $failed_count++;
+            // Get practical max score
+            $practical_max_stmt = $conn->prepare("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = ?");
+            $practical_max_stmt->bind_param("i", $enrollment_id);
+            $practical_max_stmt->execute();
+            $practical_max_result = $practical_max_stmt->get_result();
+            $practical_max = 100;
+            if ($row = $practical_max_result->fetch_assoc()) {
+                $practical_max = $row['total'] ?? 100;
+            }
+            $practical_max_stmt->close();
             
-            $update_assessment = $conn->prepare("UPDATE assessment_components SET 
-                overall_total_score = ?,
-                overall_result = ?,
-                assessed_by = ?,
-                assessed_at = NOW(),
-                is_finalized = 1
-                WHERE enrollment_id = ?");
-            $update_assessment->bind_param("dssi", $total, $overall_result, $fullname, $enrollment_id);
-            $update_assessment->execute();
-            $update_assessment->close();
+            // Get project max score
+            $project_max_stmt = $conn->prepare("SELECT project_total_max FROM assessment_components WHERE enrollment_id = ?");
+            $project_max_stmt->bind_param("i", $enrollment_id);
+            $project_max_stmt->execute();
+            $project_max_result = $project_max_stmt->get_result();
+            $project_max = 100;
+            if ($row = $project_max_result->fetch_assoc()) {
+                $project_max = $row['project_total_max'] ?? 100;
+            }
+            $project_max_stmt->close();
             
-            $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
-            $update_enrollment = $conn->prepare("UPDATE enrollments SET 
-                enrollment_status = ?,
-                overall_result = ?,
-                completion_date = NOW(),
-                assessed_by = ?,
-                assessed_at = NOW()
-                WHERE id = ?");
-            $update_enrollment->bind_param("sssi", $enrollment_status, $overall_result, $fullname, $enrollment_id);
-            $update_enrollment->execute();
-            $update_enrollment->close();
+            // Check if both sections have scores (score > 0 indicates they've been assessed)
+            $has_practical_scores = $practical > 0;
+            $has_project_scores = $project > 0;
             
-            $updated++;
+            if ($has_practical_scores && $has_project_scores) {
+                $total = $practical + $project;
+                $max_total = $practical_max + $project_max;
+                $percentage = $max_total > 0 ? ($total / $max_total) * 100 : 0;
+                
+                // Get passing percentages
+                $passing_stmt = $conn->prepare("SELECT practical_passing_percentage, project_passing_percentage FROM assessment_components WHERE enrollment_id = ?");
+                $passing_stmt->bind_param("i", $enrollment_id);
+                $passing_stmt->execute();
+                $passing_result = $passing_stmt->get_result();
+                $practical_passing = 75;
+                $project_passing = 75;
+                if ($row = $passing_result->fetch_assoc()) {
+                    $practical_passing = $row['practical_passing_percentage'] ?? 75;
+                    $project_passing = $row['project_passing_percentage'] ?? 75;
+                }
+                $passing_stmt->close();
+                
+                $total_weight = $practical_max + $project_max;
+                $overall_passing_percentage = $total_weight > 0
+                    ? ($practical_max * $practical_passing + $project_max * $project_passing) / $total_weight
+                    : 75;
+                
+                $overall_result = ($percentage >= $overall_passing_percentage) ? 'Passed' : 'Failed';
+                
+                if ($overall_result == 'Passed') $passed_count++;
+                else $failed_count++;
+                
+                // Update assessment using prepared statement
+                $update_assessment = $conn->prepare("UPDATE assessment_components SET 
+                    overall_total_score = ?,
+                    overall_result = ?,
+                    assessed_by = ?,
+                    assessed_at = NOW(),
+                    is_finalized = 1
+                    WHERE enrollment_id = ?");
+                
+                $update_assessment->bind_param("issi", $total, $overall_result, $fullname, $enrollment_id);
+                
+                if (!$update_assessment->execute()) {
+                    throw new Exception("Failed to update assessment for enrollment ID: $enrollment_id - " . $update_assessment->error);
+                }
+                $update_assessment->close();
+                
+                // Update enrollment
+                $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
+                $update_enrollment = $conn->prepare("UPDATE enrollments SET
+                    enrollment_status = ?,
+                    results = ?,
+                    assessment = ?,
+                    completed_at = NOW()
+                    WHERE id = ?");
+                
+                $update_enrollment->bind_param("sssi", $enrollment_status, $overall_result, $overall_result, $enrollment_id);
+                
+                if (!$update_enrollment->execute()) {
+                    throw new Exception("Failed to update enrollment for ID: $enrollment_id - " . $update_enrollment->error);
+                }
+                $update_enrollment->close();
+                
+                $updated++;
+            }
         }
+        
+        // Commit transaction if all updates succeeded
+        $conn->commit();
+        
+        $_SESSION['message'] = "$updated trainee(s) finalized - $passed_count Passed, $failed_count Failed!";
+        $_SESSION['message_type'] = 'success';
+        
+    } catch (Exception $e) {
+        // Rollback transaction on error
+        $conn->rollback();
+        error_log("Error in bulk finalization: " . $e->getMessage());
+        
+        $_SESSION['message'] = "Error finalizing assessments: " . $e->getMessage();
+        $_SESSION['message_type'] = 'danger';
     }
     
-    $_SESSION['message'] = "$updated trainee(s) finalized - $passed_count Passed, $failed_count Failed!";
-    $_SESSION['message_type'] = 'success';
     header("Location: bulk_comprehensive_assessment.php?program_id=$program_id&tab=summary");
     exit;
 }
@@ -804,9 +930,9 @@ if (isset($_POST['toggle_all_visibility'])) {
         if ($check->num_rows > 0) {
             $conn->query("UPDATE assessment_components SET $field = $value WHERE enrollment_id = $enrollment_id");
         } else {
-            $conn->query("INSERT INTO assessment_components (enrollment_id, $field, oral_max_score, 
-                           practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                           VALUES ($enrollment_id, $value, 100, 75, 75, 75)");
+            $conn->query("INSERT INTO assessment_components (enrollment_id, $field, 
+                           practical_passing_percentage, project_passing_percentage) 
+                           VALUES ($enrollment_id, $value, 75, 75)");
         }
         $updated++;
     }
@@ -818,7 +944,7 @@ if (isset($_POST['toggle_all_visibility'])) {
     exit;
 }
 
-// TOGGLE INDIVIDUAL VISIBILITY 
+// TOGGLE INDIVIDUAL VISIBILITY (AJAX)
 if (isset($_GET['toggle_project'])) {
     $enrollment_id = intval($_GET['enrollment_id']);
     $new_value = isset($_GET['set']) ? intval($_GET['set']) : 1;
@@ -827,9 +953,9 @@ if (isset($_GET['toggle_project'])) {
     if ($check->num_rows > 0) {
         $conn->query("UPDATE assessment_components SET project_visible_to_trainee = $new_value WHERE enrollment_id = $enrollment_id");
     } else {
-        $conn->query("INSERT INTO assessment_components (enrollment_id, project_visible_to_trainee, oral_max_score,
-                       practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                       VALUES ($enrollment_id, $new_value, 100, 75, 75, 75)");
+        $conn->query("INSERT INTO assessment_components (enrollment_id, project_visible_to_trainee,
+                       practical_passing_percentage, project_passing_percentage) 
+                       VALUES ($enrollment_id, $new_value, 75, 75)");
     }
     
     echo json_encode(['success' => true]);
@@ -844,9 +970,9 @@ if (isset($_GET['toggle_oral'])) {
     if ($check->num_rows > 0) {
         $conn->query("UPDATE assessment_components SET oral_questions_visible_to_trainee = $new_value WHERE enrollment_id = $enrollment_id");
     } else {
-        $conn->query("INSERT INTO assessment_components (enrollment_id, oral_questions_visible_to_trainee, oral_max_score,
-                       practical_passing_percentage, project_passing_percentage, oral_passing_percentage) 
-                       VALUES ($enrollment_id, $new_value, 100, 75, 75, 75)");
+        $conn->query("INSERT INTO assessment_components (enrollment_id, oral_questions_visible_to_trainee,
+                       practical_passing_percentage, project_passing_percentage) 
+                       VALUES ($enrollment_id, $new_value, 75, 75)");
     }
     
     echo json_encode(['success' => true]);
@@ -877,7 +1003,7 @@ foreach ($enrollments as $enrollment) {
     foreach ($trainee_skills as $skill) {
         $skill_id = 'skill_' . $skill['id'];
         $enrollment['decoded_skills'][$skill_id] = [
-            'score' => $skill['score'] ?? 0,
+            'score' => $skill['score'] ?? null,
             'name' => $skill['skill_name'],
             'max_score' => $skill['max_score']
         ];
@@ -888,12 +1014,20 @@ foreach ($enrollments as $enrollment) {
         $enrollment['decoded_questions'][] = [
             'question' => $question['question'],
             'max_score' => $question['max_score'],
-            'score' => $question['score'] ?? 0
+            'score' => $question['score'] ?? null
         ];
     }
     
     $enrollment['decoded_answers'] = !empty($enrollment['oral_answers']) ? 
         json_decode($enrollment['oral_answers'], true) : [];
+    
+    // Parse project rubrics if exists
+    if (!empty($enrollment['project_rubrics'])) {
+        $enrollment['project_rubrics_data'] = json_decode($enrollment['project_rubrics'], true);
+        if (!is_array($enrollment['project_rubrics_data'])) $enrollment['project_rubrics_data'] = [];
+    } else {
+        $enrollment['project_rubrics_data'] = [];
+    }
     
     $enrollments_with_details[] = $enrollment;
 }
@@ -918,26 +1052,24 @@ if (!empty($enrollments)) {
 
 if (empty($default_rubrics_data)) {
     $default_rubrics_data = [
-        ['name' => 'Content Quality', 'max_score' => 30, 'score' => 0],
-        ['name' => 'Design & Creativity', 'max_score' => 25, 'score' => 0],
-        ['name' => 'Technical Execution', 'max_score' => 25, 'score' => 0],
-        ['name' => 'Presentation & Documentation', 'max_score' => 20, 'score' => 0]
+        ['name' => 'Content Quality', 'max_score' => 30, 'score' => null],
+        ['name' => 'Design & Creativity', 'max_score' => 25, 'score' => null],
+        ['name' => 'Technical Execution', 'max_score' => 25, 'score' => null],
+        ['name' => 'Presentation & Documentation', 'max_score' => 20, 'score' => null]
     ];
 }
 
 // GET GLOBAL PASSING PERCENTAGES
 $global_practical_passing = 75;
 $global_project_passing = 75;
-$global_oral_passing = 75;
 
 if (!empty($enrollments)) {
     $first_enrollment = $enrollments[0];
-    $ac_check = $conn->query("SELECT practical_passing_percentage, project_passing_percentage, oral_passing_percentage 
+    $ac_check = $conn->query("SELECT practical_passing_percentage, project_passing_percentage 
                               FROM assessment_components WHERE enrollment_id = {$first_enrollment['id']}");
     if ($ac_check && $row = $ac_check->fetch_assoc()) {
         $global_practical_passing = $row['practical_passing_percentage'] ?? 75;
         $global_project_passing = $row['project_passing_percentage'] ?? 75;
-        $global_oral_passing = $row['oral_passing_percentage'] ?? 75;
     }
 }
 
@@ -948,11 +1080,9 @@ $failed_count = 0;
 $pending_count = 0;
 $practical_completed = 0;
 $project_completed = 0;
-$oral_completed = 0;
 $skills_loaded = 0;
 $questions_loaded = 0;
 $project_submitted = 0;
-$oral_answered = 0;
 $finalized_count = 0;
 
 foreach ($enrollments as $e) {
@@ -973,9 +1103,7 @@ foreach ($enrollments as $e) {
     
     if (!is_null($e['practical_score']) && $e['practical_score'] > 0) $practical_completed++;
     if (!is_null($e['project_score']) && $e['project_score'] > 0) $project_completed++;
-    if (!is_null($e['oral_score']) && $e['oral_score'] > 0) $oral_completed++;
     if (!empty($e['project_submitted_by_trainee'])) $project_submitted++;
-    if (!empty($e['oral_answers'])) $oral_answered++;
     if (!empty($e['is_finalized'])) $finalized_count++;
 }
 
@@ -1003,6 +1131,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .alert-warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
         .alert-info { background: #cce5ff; color: #004085; border: 1px solid #b8daff; }
+        .alert-danger { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
         
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .stat-card { background: white; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
@@ -1048,6 +1177,48 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         .form-control.small { width: 70px; }
         .form-control.mini { width: 50px; padding: 4px; }
         
+        /* Validation error styling */
+        .input-error {
+            border-color: #dc3545 !important;
+            background-color: #fff8f8 !important;
+        }
+        
+        .input-error:focus {
+            border-color: #dc3545 !important;
+            box-shadow: 0 0 0 3px rgba(220, 53, 69, 0.1) !important;
+        }
+        
+        .validation-message {
+            font-size: 11px;
+            color: #dc3545;
+            margin-top: 5px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .validation-message i {
+            font-size: 10px;
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        /* Score input validation styling */
+        .score-input:invalid, .rubric-score-input:invalid, .skill-score:invalid {
+            border-color: #dc3545;
+        }
+        
+        .score-input:focus:invalid, .rubric-score-input:focus:invalid, .skill-score:focus:invalid {
+            box-shadow: 0 0 0 3px rgba(220, 53, 69, 0.1);
+        }
+        
+        .score-input:valid, .rubric-score-input:valid, .skill-score:valid {
+            border-color: #28a745;
+        }
+        
         .btn { padding: 8px 15px; border: none; border-radius: 50px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; transition: all 0.3s; }
         .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
         .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(102,126,234,0.4); }
@@ -1075,6 +1246,20 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         .status-passed { background: #d4edda; color: #155724; font-weight: 600; padding: 3px 8px; border-radius: 20px; }
         .status-failed { background: #f8d7da; color: #721c24; font-weight: 600; padding: 3px 8px; border-radius: 20px; }
         .status-pending { background: #fff3cd; color: #856404; font-weight: 600; padding: 3px 8px; border-radius: 20px; }
+        .status-incomplete { background: #cce5ff; color: #004085; font-weight: 600; padding: 3px 8px; border-radius: 20px; }
+        
+        .visibility-status { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+        .status-visible { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .status-hidden { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        
+        .visibility-toggle-container { display: flex; flex-direction: column; align-items: center; gap: 8px; min-width: 80px; }
+        
+        .toggle-switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .3s; border-radius: 20px; }
+        .toggle-slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .3s; border-radius: 50%; }
+        input:checked + .toggle-slider { background-color: #28a745; }
+        input:checked + .toggle-slider:before { transform: translateX(20px); }
         
         .back-link { display: inline-block; margin-bottom: 20px; color: #667eea; text-decoration: none; font-weight: 600; }
         .back-link i { margin-right: 5px; }
@@ -1085,13 +1270,6 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         .total-display { font-size: 18px; font-weight: 700; color: #667eea; margin-top: 5px; }
         
         .skill-detail-row { display: flex; gap: 10px; align-items: center; margin-bottom: 5px; padding: 5px; background: white; border-radius: 5px; }
-        
-        .toggle-switch { position: relative; display: inline-block; width: 40px; height: 20px; margin-left: 5px; }
-        .toggle-switch input { opacity: 0; width: 0; height: 0; }
-        .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .3s; border-radius: 20px; }
-        .toggle-slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: white; transition: .3s; border-radius: 50%; }
-        input:checked + .toggle-slider { background-color: #28a745; }
-        input:checked + .toggle-slider:before { transform: translateX(20px); }
         
         .submission-box { background: #e8f5e9; padding: 10px; border-radius: 8px; margin: 5px 0; border-left: 4px solid #28a745; }
         .pending-box { background: #fff3cd; padding: 10px; border-radius: 8px; margin: 5px 0; border-left: 4px solid #ffc107; }
@@ -1108,44 +1286,18 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         
-        .summary-stats { 
-            display: flex; 
-            gap: 20px; 
-            margin: 20px 0; 
-            padding: 20px; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 10px; 
-            color: white; 
-        }
-        .summary-stat-item { 
-            flex: 1; 
-            text-align: center; 
-            border-right: 1px solid rgba(255,255,255,0.3); 
-            padding: 0 20px;
-        }
-        .summary-stat-item:last-child { border-right: none; }
-        .summary-stat-number { font-size: 36px; font-weight: 700; }
-        .summary-stat-label { font-size: 14px; opacity: 0.9; }
+        .percentage-badge { font-size: 10px; padding: 2px 6px; border-radius: 12px; background: #e9ecef; color: #495057; display: inline-block; margin-top: 3px; }
         
-        .percentage-badge {
-            font-size: 10px;
-            padding: 2px 6px;
-            border-radius: 12px;
-            background: #e9ecef;
-            color: #495057;
-            display: inline-block;
-            margin-top: 3px;
-        }
+        .finalized-badge { background: #6f42c1; color: white; padding: 3px 8px; border-radius: 20px; font-size: 11px; margin-top: 5px; }
         
-        .finalized-badge {
-            background: #6f42c1;
-            color: white;
-            padding: 3px 8px;
-            border-radius: 20px;
-            font-size: 11px;
-        }
+        .scoring-section { background: #fff; padding: 20px; border-radius: 10px; margin-top: 30px; border: 2px solid #ffc107; }
+        .scoring-section h4 { color: #ffc107; margin-bottom: 15px; }
+        .score-input { width: 80px; text-align: center; padding: 8px; border: 2px solid #ffc107; border-radius: 5px; font-weight: 600; }
         
-        /* Mobile Responsive Styles */
+        .custom-skill-row { background: #f8f9fa; margin-bottom: 15px; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745; position: relative; }
+        
+        .input-label { font-size: 12px; color: #666; margin-top: 4px; display: block; }
+        
         @media screen and (max-width: 768px) {
             body { padding: 10px; }
             .container { padding: 0; }
@@ -1157,15 +1309,14 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             table th, table td { padding: 8px; font-size: 12px; min-width: 100px; }
             .rubric-score-input { width: 70px; }
             .btn { padding: 6px 12px; font-size: 12px; }
-            .summary-stats { flex-direction: column; gap: 10px; }
-            .summary-stat-item { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.3); padding: 10px; }
-            .summary-stat-item:last-child { border-bottom: none; }
+            .visibility-toggle-container { min-width: 60px; }
         }
         
         @media print {
             .header, .tabs, .btn-group, .btn, .back-link, .bulk-actions, .program-section, 
-            .toggle-switch, .image-modal, .close-modal, .stats-grid, .summary-stats,
-            .bulk-actions, .program-section, .passing-settings, .project-setup-section, .print\:hidden {
+            .toggle-switch, .image-modal, .close-modal, .stats-grid,
+            .bulk-actions, .program-section, .passing-settings, .project-setup-section, .print\:hidden,
+            .visibility-toggle-container {
                 display: none !important;
             }
             body { background: white; padding: 0; }
@@ -1198,25 +1349,20 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         
         <?php if ($message): ?>
             <div class="alert alert-<?php echo $message_type; ?>">
-                <i class="fas fa-info-circle"></i> <?php echo htmlspecialchars($message); ?>
+                <i class="fas fa-info-circle"></i> <?php echo $message; ?>
             </div>
         <?php endif; ?>
         
-        <!-- Statistics Grid -->
-        <div class="stats-grid">
-            <div class="stat-card"><h3><i class="fas fa-users"></i> Total Trainees</h3><div class="number"><?php echo $total_trainees; ?></div></div>
-            <div class="stat-card"><h3><i class="fas fa-check-circle"></i> Passed</h3><div class="number" style="color:#28a745;"><?php echo $passed_count; ?></div></div>
-            <div class="stat-card"><h3><i class="fas fa-times-circle"></i> Failed</h3><div class="number" style="color:#dc3545;"><?php echo $failed_count; ?></div></div>
-            <div class="stat-card"><h3><i class="fas fa-clock"></i> Pending</h3><div class="number" style="color:#ffc107;"><?php echo $pending_count; ?></div></div>
-            <div class="stat-card"><h3><i class="fas fa-chart-line"></i> Completion</h3><div class="number"><?php echo $completion_rate; ?>%</div></div>
-        </div>
-        
-        <!-- Passing Percentage Settings (Global) -->
+       
+        <!-- Passing Percentage Settings (Global) - WITH VALIDATION -->
         <div class="passing-settings">
             <h4><i class="fas fa-percent"></i> Global Passing Percentage Settings</h4>
-            <p style="font-size: 13px; color: #666; margin-bottom: 15px;">Set passing percentages for all assessment components. These will apply to all trainees.</p>
+            <p style="font-size: 13px; color: #666; margin-bottom: 15px;">
+                Set passing percentages for all assessment components. These will apply to all trainees.
+                <strong style="color: #dc3545;">* Percentages must be between 65% and 100%.</strong>
+            </p>
             
-            <form method="POST" id="passingPercentagesForm">
+            <form method="POST" id="passingPercentagesForm" onsubmit="return validatePassingPercentages()">
                 <input type="hidden" name="save_bulk_passing_percentages" value="1">
                 <input type="hidden" name="current_tab" value="<?php echo $current_tab; ?>">
                 <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-end;">
@@ -1225,11 +1371,19 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             <i class="fas fa-utensils"></i> Practical Skills
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" name="practical_passing_percentage" 
-                                   class="form-control" value="<?php echo $global_practical_passing; ?>" 
-                                   min="65" max="100" step="0.5" style="width: 100px;">
+                            <input type="number" 
+                                   name="practical_passing_percentage" 
+                                   id="practical_passing_percentage"
+                                   class="form-control" 
+                                   value="<?php echo $global_practical_passing; ?>" 
+                                   min="65" 
+                                   max="100" 
+                                   step="0.5" 
+                                   style="width: 100px;"
+                                   oninput="validatePercentage(this, 'practical')">
                             <span>%</span>
                         </div>
+                        <div id="practical-error" style="font-size: 11px; color: #dc3545; margin-top: 5px; display: none;"></div>
                     </div>
                     
                     <div style="flex: 1; min-width: 150px;">
@@ -1237,27 +1391,23 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             <i class="fas fa-project-diagram"></i> Project Output
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" name="project_passing_percentage" 
-                                   class="form-control" value="<?php echo $global_project_passing; ?>" 
-                                   min="65" max="100" step="0.5" style="width: 100px;">
+                            <input type="number" 
+                                   name="project_passing_percentage" 
+                                   id="project_passing_percentage"
+                                   class="form-control" 
+                                   value="<?php echo $global_project_passing; ?>" 
+                                   min="65" 
+                                   max="100" 
+                                   step="0.5" 
+                                   style="width: 100px;"
+                                   oninput="validatePercentage(this, 'project')">
                             <span>%</span>
                         </div>
-                    </div>
-                    
-                    <div style="flex: 1; min-width: 150px;">
-                        <label style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 5px; color: #8b5cf6;">
-                            <i class="fas fa-microphone-alt"></i> Oral Assessment
-                        </label>
-                        <div style="display: flex; align-items: center; gap: 10px;">
-                            <input type="number" name="oral_passing_percentage" 
-                                   class="form-control" value="<?php echo $global_oral_passing; ?>" 
-                                   min="65" max="100" step="0.5" style="width: 100px;">
-                            <span>%</span>
-                        </div>
+                        <div id="project-error" style="font-size: 11px; color: #dc3545; margin-top: 5px; display: none;"></div>
                     </div>
                     
                     <div>
-                        <button type="submit" class="btn btn-warning">
+                        <button type="submit" class="btn btn-warning" id="submitPercentagesBtn">
                             <i class="fas fa-save"></i> Apply to All Trainees
                         </button>
                     </div>
@@ -1272,9 +1422,6 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             </div>
             <div class="tab <?php echo $current_tab == 'project' ? 'active' : ''; ?>" onclick="switchTab('project')">
                 <i class="fas fa-project-diagram"></i> Project Output (Rubric)
-            </div>
-            <div class="tab <?php echo $current_tab == 'oral' ? 'active' : ''; ?>" onclick="switchTab('oral')">
-                <i class="fas fa-microphone-alt"></i> Oral Assessment
             </div>
             <div class="tab <?php echo $current_tab == 'summary' ? 'active' : ''; ?>" onclick="switchTab('summary')">
                 <i class="fas fa-table"></i> Summary & Results
@@ -1345,31 +1492,53 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             <form method="POST" id="practicalForm">
                 <input type="hidden" name="save_bulk_practical_detailed" value="1">
                 <div class="table-container">
-                    <table>
+                     <table>
                         <thead>
-                            <tr>
+                             <tr>
                                 <th width="3%">#</th>
                                 <th width="15%">Trainee</th>
                                 <th width="45%">Skills & Scores</th>
                                 <th width="12%">Total / Status</th>
                                 <th width="25%">Notes</th>
-                            </tr>
+                             </tr>
                         </thead>
                         <tbody>
                             <?php foreach ($enrollments_with_details as $index => $enrollment): 
                                 $practical_total = 0;
                                 $practical_max = 0;
                                 $trainee_skills = $enrollment['trainee_skills'];
+                                $filled_scores = 0;
+                                $total_skills = count($trainee_skills);
                                 
                                 foreach ($trainee_skills as $skill) {
-                                    $practical_total += $skill['score'] ?? 0;
                                     $practical_max += $skill['max_score'];
+                                    if ($skill['score'] !== null && $skill['score'] !== '') {
+                                        $practical_total += $skill['score'];
+                                        $filled_scores++;
+                                    }
                                 }
                                 
                                 $trainee_practical_passing = $enrollment['practical_passing_percentage'] ?? 75;
                                 $practical_percentage = $practical_max > 0 ? ($practical_total / $practical_max) * 100 : 0;
+                                $all_scores_filled = ($total_skills > 0 && $filled_scores == $total_skills);
+                                $practical_status_class = '';
+                                $practical_status_text = '';
+                                
+                                if ($total_skills == 0) {
+                                    $practical_status_class = 'status-pending';
+                                    $practical_status_text = 'No skills';
+                                } elseif (!$all_scores_filled) {
+                                    $practical_status_class = 'status-incomplete';
+                                    $practical_status_text = "Incomplete ($filled_scores/$total_skills)";
+                                } elseif ($practical_percentage >= $trainee_practical_passing) {
+                                    $practical_status_class = 'status-passed';
+                                    $practical_status_text = 'PASSED';
+                                } else {
+                                    $practical_status_class = 'status-failed';
+                                    $practical_status_text = 'FAILED';
+                                }
                             ?>
-                            <tr>
+                             <tr>
                                 <td><?php echo $index + 1; ?></td>
                                 <td>
                                     <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
@@ -1389,7 +1558,8 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                         if (!empty($trainee_skills)):
                                             foreach ($trainee_skills as $skill):
                                                 $skill_id = 'skill_' . $skill['id'];
-                                                $score = $skill['score'] ?? 0;
+                                                $score = $skill['score'] ?? '';
+                                                $score_display = ($score !== '' && $score !== null) ? $score : '';
                                         ?>
                                         <div class="skill-detail-row">
                                             <span style="flex: 2; font-size: 12px;">
@@ -1399,13 +1569,14 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                             <input type="number" class="form-control mini skill-score" 
                                                    data-index="<?php echo $index; ?>" 
                                                    data-skill-id="<?php echo $skill_id; ?>"
-                                                   value="<?php echo $score; ?>" 
+                                                   value="<?php echo $score_display; ?>" 
                                                    min="0" max="<?php echo $skill['max_score']; ?>" 
                                                    style="width: 70px;" 
-                                                   onchange="updateSkillTotal(<?php echo $index; ?>)">
+                                                   onchange="validateScoreInput(this, <?php echo $skill['max_score']; ?>, 'practical', <?php echo $index; ?>)"
+                                                   onkeyup="this.value = Math.min(Math.max(this.value, 0), <?php echo $skill['max_score']; ?>)">
                                         </div>
                                         <?php 
-                                                $skill_scores_json[$skill_id] = ['score' => $score];
+                                                $skill_scores_json[$skill_id] = ['score' => $score_display !== '' ? floatval($score_display) : null];
                                             endforeach;
                                         else: 
                                         ?>
@@ -1420,22 +1591,21 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                     <div class="total-display" id="practical-total-<?php echo $index; ?>"><?php echo $practical_total; ?></div>
                                     <div style="font-size: 11px;">out of <?php echo $practical_max; ?></div>
                                     <div style="font-size: 10px;">Target: <?php echo $trainee_practical_passing; ?>%</div>
-                                    <?php if ($practical_total > 0): ?>
-                                        <?php if ($practical_percentage >= $trainee_practical_passing): ?>
-                                            <span class="badge badge-success">PASS</span>
-                                        <?php else: ?>
-                                            <span class="badge badge-danger">FAIL</span>
-                                        <?php endif; ?>
+                                    <div style="margin-top: 5px;">
+                                        <span class="<?php echo $practical_status_class; ?>"><?php echo $practical_status_text; ?></span>
+                                    </div>
+                                    <?php if ($all_scores_filled && $practical_total > 0): ?>
+                                        <div class="percentage-badge"><?php echo round($practical_percentage, 1); ?>%</div>
                                     <?php endif; ?>
                                 </td>
                                 <td>
                                     <textarea name="practical_notes[]" class="form-control" rows="2" 
                                               placeholder="Add notes..."><?php echo htmlspecialchars($enrollment['practical_notes'] ?? ''); ?></textarea>
                                 </td>
-                            </tr>
+                             </tr>
                             <?php endforeach; ?>
                         </tbody>
-                    </table>
+                     </table>
                 </div>
                 
                 <?php if (!empty($enrollments)): ?>
@@ -1448,7 +1618,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             </form>
         <?php endif; ?>
         
-        <!-- TAB 2: PROJECT OUTPUT WITH RUBRIC SCORING (PRESERVES TRAINEE SUBMISSIONS) -->
+        <!-- TAB 2: PROJECT OUTPUT WITH RUBRIC SCORING AND VISIBILITY STATUS -->
         <?php if ($current_tab == 'project'): ?>
             <!-- Project Setup Section -->
             <div class="project-setup-section">
@@ -1554,21 +1724,22 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                 </div>
             </div>
             
-            <!-- Project Rubric Scores Entry with Submission Display -->
+            <!-- Project Rubric Scores Entry with Submission Display and Visibility Status -->
             <form method="POST" id="bulkRubricForm">
                 <input type="hidden" name="save_bulk_rubric_scores" value="1">
                 <div class="table-container">
-                    <table>
+                     <table>
                         <thead>
-                            <tr>
+                             <tr>
                                 <th width="3%">#</th>
                                 <th width="12%">Trainee</th>
-                                <th width="25%">Submission Details</th>
-                                <th width="35%">Rubric Criteria Scores</th>
+                                <th width="20%">Submission Details</th>
+                                <th width="30%">Rubric Criteria Scores</th>
                                 <th width="10%">Total / Status</th>
                                 <th width="10%">Feedback</th>
-                                <th width="5%">Status</th>
-                            </tr>
+                                <th width="10%">Visibility Status</th>
+                                <th width="5%">Submission Status</th>
+                             </tr>
                         </thead>
                         <tbody>
                             <?php foreach ($enrollments as $index => $enrollment): 
@@ -1576,6 +1747,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                 $image_path = $enrollment['project_photo_path'] ?? '';
                                 $submission_date = $enrollment['project_submitted_at'] ?? '';
                                 $project_passing = $enrollment['project_passing_percentage'] ?? 75;
+                                $is_visible = $enrollment['project_visible_to_trainee'] ?? 0;
                                 
                                 // Get trainee-specific rubrics
                                 $trainee_rubrics = [];
@@ -1584,21 +1756,47 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                     if (!is_array($trainee_rubrics)) $trainee_rubrics = [];
                                 }
                                 
-                                // Calculate totals
+                                // Calculate totals and filled scores
                                 $rubric_total = 0;
                                 $rubric_max = 0;
                                 $rubric_scores_array = [];
+                                $filled_scores = 0;
+                                $total_criteria = count($trainee_rubrics);
+                                
                                 foreach ($trainee_rubrics as $criterion_index => $criterion) {
                                     $rubric_max += floatval($criterion['max_score'] ?? 0);
-                                    $score = floatval($criterion['score'] ?? 0);
-                                    $rubric_total += $score;
-                                    $rubric_scores_array[$criterion_index] = $score;
+                                    $score = $criterion['score'] ?? null;
+                                    if ($score !== null && $score !== '') {
+                                        $rubric_total += floatval($score);
+                                        $filled_scores++;
+                                    }
+                                    $rubric_scores_array[$criterion_index] = $score !== null ? floatval($score) : null;
                                 }
                                 
                                 $rubric_percentage = $rubric_max > 0 ? ($rubric_total / $rubric_max) * 100 : 0;
-                                $rubric_passed = $rubric_percentage >= $project_passing;
+                                $all_scores_filled = ($total_criteria > 0 && $filled_scores == $total_criteria);
+                                
+                                // Determine status
+                                if (!$has_submission) {
+                                    $project_status_class = 'status-pending';
+                                    $project_status_text = 'No submission';
+                                } elseif (!$all_scores_filled) {
+                                    $project_status_class = 'status-incomplete';
+                                    $project_status_text = "Incomplete ($filled_scores/$total_criteria)";
+                                } elseif ($rubric_percentage >= $project_passing) {
+                                    $project_status_class = 'status-passed';
+                                    $project_status_text = 'PASSED';
+                                } else {
+                                    $project_status_class = 'status-failed';
+                                    $project_status_text = 'FAILED';
+                                }
+                                
+                                // Visibility status
+                                $visibility_class = $is_visible ? 'status-visible' : 'status-hidden';
+                                $visibility_text = $is_visible ? 'Visible' : 'Hidden';
+                                $visibility_icon = $is_visible ? 'fa-eye' : 'fa-eye-slash';
                             ?>
-                            <tr>
+                             <tr>
                                 <td><?php echo $index + 1; ?></td>
                                 <td>
                                     <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
@@ -1651,12 +1849,13 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                                                class="form-control rubric-score-input" 
                                                                data-index="<?php echo $index; ?>"
                                                                data-criterion-index="<?php echo $criterion_index; ?>"
-                                                               value="<?php echo $criterion['score'] ?? 0; ?>"
+                                                               value="<?php echo isset($criterion['score']) && $criterion['score'] !== null && $criterion['score'] !== '' ? $criterion['score'] : ''; ?>"
                                                                min="0" 
                                                                max="<?php echo $criterion['max_score']; ?>"
                                                                step="0.5"
                                                                style="width: 80px;"
-                                                               onchange="updateRubricTraineeTotal(<?php echo $index; ?>)">
+                                                               onchange="validateScoreInput(this, <?php echo $criterion['max_score']; ?>, 'project', <?php echo $index; ?>)"
+                                                               onkeyup="this.value = Math.min(Math.max(this.value, 0), <?php echo $criterion['max_score']; ?>)">
                                                         <span>/ <?php echo $criterion['max_score']; ?></span>
                                                     </div>
                                                 </div>
@@ -1675,20 +1874,29 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                     </div>
                                     <div style="font-size: 11px;">out of <?php echo $rubric_max; ?></div>
                                     <div style="font-size: 10px;">Target: <?php echo $project_passing; ?>%</div>
-                                    <?php if ($rubric_total > 0): ?>
-                                        <?php if ($rubric_passed): ?>
-                                            <span class="badge badge-success">PASS</span>
-                                        <?php else: ?>
-                                            <span class="badge badge-danger">FAIL</span>
-                                        <?php endif; ?>
-                                    <?php endif; ?>
                                     <div style="margin-top: 5px;">
-                                        <small><?php echo round($rubric_percentage, 1); ?>%</small>
+                                        <span class="<?php echo $project_status_class; ?>"><?php echo $project_status_text; ?></span>
                                     </div>
+                                    <?php if ($all_scores_filled && $rubric_total > 0): ?>
+                                        <div class="percentage-badge"><?php echo round($rubric_percentage, 1); ?>%</div>
+                                    <?php endif; ?>
                                 </td>
                                 <td>
                                     <textarea name="project_notes[]" class="form-control" rows="2" 
                                               placeholder="Enter feedback..."><?php echo htmlspecialchars($enrollment['project_notes'] ?? ''); ?></textarea>
+                                </td>
+                                <td style="text-align: center;">
+                                    <div class="visibility-toggle-container">
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" 
+                                                   onchange="toggleVisibility('project', <?php echo $enrollment['id']; ?>, this)"
+                                                   <?php echo $is_visible ? 'checked' : ''; ?>>
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                        <span class="visibility-status <?php echo $visibility_class; ?>">
+                                            <i class="fas <?php echo $visibility_icon; ?>"></i> <?php echo $visibility_text; ?>
+                                        </span>
+                                    </div>
                                 </td>
                                 <td style="text-align: center;">
                                     <?php if ($has_submission): ?>
@@ -1697,21 +1905,21 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                         <span class="badge badge-warning">Pending</span>
                                     <?php endif; ?>
                                     <?php if (!empty($enrollment['is_finalized'])): ?>
-                                        <div class="finalized-badge" style="margin-top: 5px;">Finalized</div>
+                                        <div class="finalized-badge">Finalized</div>
                                     <?php endif; ?>
                                 </td>
-                            </tr>
+                             </tr>
                             <?php endforeach; ?>
                             
                             <?php if (empty($enrollments)): ?>
-                            <tr>
-                                <td colspan="7" style="text-align: center; padding: 40px;">
+                             <tr>
+                                <td colspan="8" style="text-align: center; padding: 40px;">
                                     No approved trainees found.
                                 </td>
-                            </tr>
+                             </tr>
                             <?php endif; ?>
                         </tbody>
-                    </table>
+                     </table>
                 </div>
                 
                 <?php if (!empty($enrollments)): ?>
@@ -1724,152 +1932,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             </form>
         <?php endif; ?>
         
-        <!-- TAB 3: ORAL ASSESSMENT -->
-        <?php if ($current_tab == 'oral'): ?>
-            <!-- Program Questions Setup (Template) -->
-            <div class="program-section">
-                <h4><i class="fas fa-cog"></i> Program Default Oral Questions (Template)</h4>
-                <p>Define the questions template that can be loaded to all trainees.</p>
-                
-                <div id="program-questions-container">
-                    <?php foreach ($program_questions as $index => $q): ?>
-                    <div class="question-row">
-                        <div style="display: flex; gap: 10px; align-items: center;">
-                            <input type="text" class="form-control program-question" value="<?php echo htmlspecialchars($q['question']); ?>" placeholder="Question" style="flex: 3;">
-                            <input type="number" class="form-control program-question-max" value="<?php echo $q['max_score']; ?>" min="1" max="100" style="flex: 1;">
-                            <button type="button" class="btn btn-danger btn-sm" onclick="removeProgramQuestion(this)">
-                                <i class="fas fa-trash"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <?php endforeach; ?>
-                    
-                    <?php if (empty($program_questions)): ?>
-                    <div class="question-row">
-                        <div style="display: flex; gap: 10px; align-items: center;">
-                            <input type="text" class="form-control program-question" value="Sample Question" placeholder="Question" style="flex: 3;">
-                            <input type="number" class="form-control program-question-max" value="25" min="1" max="100" style="flex: 1;">
-                            <button type="button" class="btn btn-danger btn-sm" onclick="removeProgramQuestion(this)">
-                                <i class="fas fa-trash"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <?php endif; ?>
-                </div>
-                
-                <div style="margin-top: 15px;">
-                    <button type="button" class="btn btn-success" onclick="addProgramQuestion()">
-                        <i class="fas fa-plus"></i> Add Question
-                    </button>
-                    <button type="button" class="btn btn-primary" onclick="saveProgramQuestions()">
-                        <i class="fas fa-save"></i> Save Questions Template
-                    </button>
-                </div>
-            </div>
-            
-            <!-- Bulk Actions -->
-            <div class="bulk-actions">
-                <h4><i class="fas fa-bolt"></i> Bulk Actions - Oral Assessment</h4>
-                <div class="btn-group">
-                    <form method="POST">
-                        <button type="submit" name="load_questions_to_all" class="btn btn-info">
-                            <i class="fas fa-download"></i> Load Questions to All
-                        </button>
-                    </form>
-                    <form method="POST" onsubmit="return confirm('Reset ALL questions?');">
-                        <button type="submit" name="reset_all_questions" class="btn btn-warning">
-                            <i class="fas fa-undo"></i> Reset All Questions
-                        </button>
-                    </form>
-                    <form method="POST">
-                        <input type="hidden" name="toggle_all_visibility" value="1">
-                        <input type="hidden" name="visibility_type" value="oral">
-                        <button type="submit" name="visibility_value" value="1" class="btn btn-success">
-                            <i class="fas fa-eye"></i> Show to All
-                        </button>
-                        <button type="submit" name="visibility_value" value="0" class="btn btn-secondary">
-                            <i class="fas fa-eye-slash"></i> Hide from All
-                        </button>
-                    </form>
-                </div>
-            </div>
-            
-            <!-- Oral Scores Entry -->
-            <form method="POST">
-                <input type="hidden" name="save_bulk_oral" value="1">
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th width="3%">#</th>
-                                <th width="20%">Trainee</th>
-                                <th width="8%">Max</th>
-                                <th width="10%">Score</th>
-                                <th width="25%">Feedback</th>
-                                <th width="10%">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($enrollments_with_details as $index => $enrollment): 
-                                $trainee_questions = $enrollment['trainee_questions'];
-                                $oral_max = 0;
-                                foreach ($trainee_questions as $q) {
-                                    $oral_max += $q['max_score'];
-                                }
-                                if ($oral_max == 0) $oral_max = 100;
-                                
-                                $has_answers = !empty($enrollment['oral_answers']);
-                                $oral_passing = $enrollment['oral_passing_percentage'] ?? 75;
-                                $oral_score = $enrollment['oral_score'] ?? null;
-                                $questions_set = !empty($trainee_questions);
-                            ?>
-                            <tr>
-                                <td><?php echo $index + 1; ?></td>
-                                <td>
-                                    <strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>
-                                    <input type="hidden" name="enrollment_id[]" value="<?php echo $enrollment['id']; ?>">
-                                    <div style="font-size: 11px;"><?php echo htmlspecialchars($enrollment['email']); ?></div>
-                                    <?php if ($has_answers): ?>
-                                        <span class="badge badge-success">Answers Submitted</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td style="text-align: center;"><?php echo $oral_max; ?></td>
-                                <td>
-                                    <input type="number" name="oral_score[]" class="form-control" 
-                                           value="<?php echo $oral_score; ?>" 
-                                           min="0" max="<?php echo $oral_max; ?>" step="0.5"
-                                           style="width: 80px;"
-                                           <?php echo !$questions_set ? 'disabled' : ''; ?>>
-                                </td>
-                                <td>
-                                    <textarea name="oral_notes[]" class="form-control" rows="2" 
-                                              placeholder="Feedback..."><?php echo htmlspecialchars($enrollment['oral_notes'] ?? ''); ?></textarea>
-                                </td>
-                                <td>
-                                    <?php if ($questions_set): ?>
-                                        <span class="badge badge-info">Set</span>
-                                    <?php endif; ?>
-                                    <?php if (!is_null($oral_score)): ?>
-                                        <div><?php echo $oral_score; ?>/<?php echo $oral_max; ?></div>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                
-                <?php if (!empty($enrollments)): ?>
-                <div style="text-align: center; margin: 20px 0;">
-                    <button type="submit" class="btn btn-primary">
-                        <i class="fas fa-save"></i> Save All Oral Scores
-                    </button>
-                </div>
-                <?php endif; ?>
-            </form>
-        <?php endif; ?>
-        
-        <!-- TAB 4: SUMMARY & RESULTS -->
+        <!-- TAB 3: SUMMARY & RESULTS -->
         <?php if ($current_tab == 'summary'): ?>
             <div class="bulk-actions">
                 <h4><i class="fas fa-calculator"></i> Finalize Assessments</h4>
@@ -1895,18 +1958,17 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             
             <!-- Summary Table -->
             <div class="table-container">
-                <table>
+                 <table>
                     <thead>
-                        <tr>
+                         <tr>
                             <th>#</th>
                             <th>Trainee</th>
                             <th>Practical</th>
                             <th>Project</th>
-                            <th>Oral</th>
                             <th>Total</th>
                             <th>Result</th>
                             <th>Status</th>
-                        </tr>
+                         </tr>
                     </thead>
                     <tbody>
                         <?php foreach ($enrollments as $index => $enrollment):
@@ -1917,10 +1979,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                             
                             $project = $enrollment['project_score'] ?? 0;
                             
-                            $oral_query = $conn->query("SELECT SUM(score) as total FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-                            $oral = $oral_query && ($row = $oral_query->fetch_assoc()) ? ($row['total'] ?? 0) : 0;
-                            
-                            $total = $practical + $project + $oral;
+                            $total = $practical + $project;
                             
                             $result_class = '';
                             $result_text = '';
@@ -1935,18 +1994,18 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                                 $result_text = 'PENDING';
                             }
                         ?>
-                        <tr>
-                            <td><?php echo $index + 1; ?></td>
-                            <td><strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong>                             <td><?php echo $practical ?: '-'; ?></td>
-                             <td><?php echo $project ?: '-'; ?></td>
-                             <td><?php echo $oral ?: '-'; ?></td>
-                             <td><strong><?php echo $total ?: '-'; ?></strong></td>
-                             <td><span class="badge <?php echo $result_class; ?>"><?php echo $result_text; ?></span></td>
-                             <td><?php echo !empty($enrollment['is_finalized']) ? 'Finalized' : 'Pending'; ?></td>
-                         </tr>
+                         <tr>
+                            <td><?php echo $index + 1; ?>
+                                                          <td><strong><?php echo htmlspecialchars($enrollment['fullname']); ?></strong></td>
+                              <td><?php echo $practical ?: '-'; ?></td>
+                              <td><?php echo $project ?: '-'; ?></td>
+                              <td><strong><?php echo $total ?: '-'; ?></strong></td>
+                              <td><span class="badge <?php echo $result_class; ?>"><?php echo $result_text; ?></span></td>
+                              <td><?php echo !empty($enrollment['is_finalized']) ? 'Finalized' : 'Pending'; ?></td>
+                            </tr>
                         <?php endforeach; ?>
                     </tbody>
-                </table>
+                  </table>
             </div>
         <?php endif; ?>
     </div>
@@ -1964,6 +2023,60 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         // Tab switching
         function switchTab(tabName) {
             window.location.href = '?program_id=<?php echo $program_id; ?>&tab=' + tabName;
+        }
+        
+        // Validate score inputs (ensure they don't exceed max)
+        function validateScoreInput(input, maxScore, type, index) {
+            let value = parseFloat(input.value);
+            const max = parseFloat(maxScore);
+            
+            if (isNaN(value)) {
+                if (input.value !== '') {
+                    Swal.fire({
+                        icon: 'warning',
+                        title: 'Invalid Score',
+                        text: 'Please enter a valid number',
+                        timer: 2000
+                    });
+                    input.value = '';
+                }
+                // Update the total for this trainee
+                if (type === 'practical') {
+                    updateSkillTotal(index);
+                } else if (type === 'project') {
+                    updateRubricTraineeTotal(index);
+                }
+                return false;
+            }
+            
+            if (value > max) {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'Score Exceeds Maximum',
+                    text: `Score (${value}) cannot exceed ${max} points`,
+                    timer: 2000
+                });
+                input.value = max;
+                value = max;
+            } else if (value < 0) {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'Invalid Score',
+                    text: 'Score cannot be negative',
+                    timer: 2000
+                });
+                input.value = 0;
+                value = 0;
+            }
+            
+            // Update the total for this trainee
+            if (type === 'practical') {
+                updateSkillTotal(index);
+            } else if (type === 'project') {
+                updateRubricTraineeTotal(index);
+            }
+            
+            return true;
         }
         
         // Program Skills Functions
@@ -2088,16 +2201,76 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         function updateSkillTotal(index) {
             let total = 0;
             const skillScores = {};
+            let allValid = true;
             
             document.querySelectorAll(`#skills-${index} .skill-score`).forEach(input => {
-                const score = parseFloat(input.value) || 0;
+                let score = parseFloat(input.value);
+                const maxScore = parseFloat(input.getAttribute('max'));
                 const skillId = input.dataset.skillId;
-                total += score;
-                skillScores[skillId] = { score: score };
+                
+                // Validate on the fly
+                if (input.value !== '') {
+                    if (isNaN(score)) {
+                        allValid = false;
+                        input.classList.add('input-error');
+                    } else if (score > maxScore) {
+                        score = maxScore;
+                        input.value = maxScore;
+                        input.classList.add('input-error');
+                        allValid = false;
+                    } else if (score < 0) {
+                        score = 0;
+                        input.value = 0;
+                        input.classList.add('input-error');
+                        allValid = false;
+                    } else {
+                        input.classList.remove('input-error');
+                        total += score;
+                    }
+                    skillScores[skillId] = { score: score || null };
+                } else {
+                    skillScores[skillId] = { score: null };
+                }
             });
             
             document.getElementById(`practical-total-${index}`).textContent = total;
             document.getElementById(`skill-scores-${index}`).value = JSON.stringify(skillScores);
+            
+            // Update status indicator
+            const statusCell = document.getElementById(`practical-total-${index}`).closest('td');
+            const totalSkills = document.querySelectorAll(`#skills-${index} .skill-score`).length;
+            const filledScores = Array.from(document.querySelectorAll(`#skills-${index} .skill-score`)).filter(input => input.value !== '').length;
+            const passingPercentage = <?php echo $global_practical_passing; ?>;
+            const maxTotal = Array.from(document.querySelectorAll(`#skills-${index} .skill-score`)).reduce((sum, input) => {
+                return sum + (parseFloat(input.max) || 0);
+            }, 0);
+            const percentage = maxTotal > 0 ? (total / maxTotal) * 100 : 0;
+            
+            const existingStatusSpan = statusCell.querySelector('.status-passed, .status-failed, .status-pending, .status-incomplete');
+            if (existingStatusSpan) existingStatusSpan.remove();
+            
+            let statusSpan = document.createElement('span');
+            statusSpan.style.marginTop = '5px';
+            statusSpan.style.display = 'inline-block';
+            
+            if (totalSkills === 0) {
+                statusSpan.className = 'status-pending';
+                statusSpan.innerHTML = 'No skills';
+            } else if (filledScores < totalSkills) {
+                statusSpan.className = 'status-incomplete';
+                statusSpan.innerHTML = `Incomplete (${filledScores}/${totalSkills})`;
+            } else if (!allValid) {
+                statusSpan.className = 'status-incomplete';
+                statusSpan.innerHTML = 'Invalid scores detected';
+            } else if (percentage >= passingPercentage) {
+                statusSpan.className = 'status-passed';
+                statusSpan.innerHTML = 'PASSED';
+            } else {
+                statusSpan.className = 'status-failed';
+                statusSpan.innerHTML = 'FAILED';
+            }
+            
+            statusCell.querySelector('.total-display').insertAdjacentElement('afterend', statusSpan);
         }
         
         // Rubric Functions
@@ -2160,7 +2333,7 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             return Array.from(document.querySelectorAll('.rubric-criterion')).map((c, idx) => ({
                 name: c.querySelector('.criterion-name')?.value || `Criterion ${idx + 1}`,
                 max_score: parseFloat(c.querySelector('.rubric-max-score')?.value) || 0,
-                score: 0
+                score: null
             }));
         }
         
@@ -2214,53 +2387,228 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
         function updateRubricTraineeTotal(index) {
             let total = 0;
             const rubricScores = {};
+            let filledScores = 0;
+            let allValid = true;
+            const totalCriteria = document.querySelectorAll(`#rubric-scores-${index} .rubric-score-input`).length;
             
             document.querySelectorAll(`#rubric-scores-${index} .rubric-score-input`).forEach(input => {
-                const score = parseFloat(input.value) || 0;
+                let score = parseFloat(input.value);
+                const maxScore = parseFloat(input.getAttribute('max'));
                 const criterionIndex = input.dataset.criterionIndex;
-                total += score;
-                rubricScores[criterionIndex] = score;
+                
+                if (input.value !== '') {
+                    if (isNaN(score)) {
+                        allValid = false;
+                        input.classList.add('input-error');
+                    } else if (score > maxScore) {
+                        score = maxScore;
+                        input.value = maxScore;
+                        input.classList.add('input-error');
+                        allValid = false;
+                    } else if (score < 0) {
+                        score = 0;
+                        input.value = 0;
+                        input.classList.add('input-error');
+                        allValid = false;
+                    } else {
+                        input.classList.remove('input-error');
+                        total += score;
+                        filledScores++;
+                    }
+                    rubricScores[criterionIndex] = score;
+                } else {
+                    rubricScores[criterionIndex] = null;
+                }
             });
             
             document.getElementById(`rubric-total-${index}`).textContent = total;
             document.getElementById(`rubric-scores-json-${index}`).value = JSON.stringify(rubricScores);
             
-            // Update pass/fail indicator
+            // Update status indicator
+            const statusCell = document.getElementById(`rubric-total-${index}`).closest('td');
             const totalMax = Array.from(document.querySelectorAll(`#rubric-scores-${index} .rubric-score-input`)).reduce((sum, input) => {
                 return sum + (parseFloat(input.max) || 0);
             }, 0);
-            
-            const percentage = totalMax > 0 ? (total / totalMax) * 100 : 0;
             const passingPercentage = <?php echo $global_project_passing; ?>;
-            const statusCell = document.getElementById(`rubric-total-${index}`).closest('td');
-            const existingBadge = statusCell.querySelector('.badge-success, .badge-danger');
+            const percentage = totalMax > 0 ? (total / totalMax) * 100 : 0;
             
-            if (existingBadge) existingBadge.remove();
+            // Check if there's a submission for this trainee
+            let hasSubmission = false;
+            const submissionBox = statusCell.closest('tr').querySelector('.submission-box');
+            if (submissionBox) hasSubmission = true;
             
-            if (total > 0) {
-                const badge = document.createElement('span');
-                badge.className = percentage >= passingPercentage ? 'badge badge-success' : 'badge badge-danger';
-                badge.innerHTML = percentage >= passingPercentage ? 'PASS' : 'FAIL';
-                statusCell.querySelector('.total-display').insertAdjacentElement('afterend', badge);
+            const existingStatusSpan = statusCell.querySelector('.status-passed, .status-failed, .status-pending, .status-incomplete');
+            if (existingStatusSpan) existingStatusSpan.remove();
+            
+            let statusSpan = document.createElement('span');
+            statusSpan.style.marginTop = '5px';
+            statusSpan.style.display = 'inline-block';
+            
+            if (!hasSubmission) {
+                statusSpan.className = 'status-pending';
+                statusSpan.innerHTML = 'No submission';
+            } else if (filledScores < totalCriteria) {
+                statusSpan.className = 'status-incomplete';
+                statusSpan.innerHTML = `Incomplete (${filledScores}/${totalCriteria})`;
+            } else if (!allValid) {
+                statusSpan.className = 'status-incomplete';
+                statusSpan.innerHTML = 'Invalid scores detected';
+            } else if (percentage >= passingPercentage) {
+                statusSpan.className = 'status-passed';
+                statusSpan.innerHTML = 'PASSED';
+            } else {
+                statusSpan.className = 'status-failed';
+                statusSpan.innerHTML = 'FAILED';
+            }
+            
+            statusCell.querySelector('.total-display').insertAdjacentElement('afterend', statusSpan);
+        }
+        
+        // Validate passing percentages (must be between 65 and 100)
+        function validatePercentage(input, type) {
+            const value = parseFloat(input.value);
+            const errorElement = document.getElementById(`${type}-error`);
+            const submitBtn = document.getElementById('submitPercentagesBtn');
+            
+            // Reset styling
+            input.classList.remove('input-error');
+            
+            if (isNaN(value)) {
+                errorElement.innerHTML = '<i class="fas fa-exclamation-circle"></i> Please enter a valid number';
+                errorElement.style.display = 'block';
+                input.classList.add('input-error');
+                if (submitBtn) submitBtn.disabled = true;
+                return false;
+            }
+            
+            if (value < 65) {
+                errorElement.innerHTML = '<i class="fas fa-exclamation-circle"></i> Percentage cannot be less than 65% (minimum required)';
+                errorElement.style.display = 'block';
+                input.classList.add('input-error');
+                if (submitBtn) submitBtn.disabled = true;
+                return false;
+            } else if (value > 100) {
+                errorElement.innerHTML = '<i class="fas fa-exclamation-circle"></i> Percentage cannot exceed 100%';
+                errorElement.style.display = 'block';
+                input.classList.add('input-error');
+                if (submitBtn) submitBtn.disabled = true;
+                return false;
+            } else {
+                errorElement.innerHTML = '';
+                errorElement.style.display = 'none';
+                input.classList.remove('input-error');
+                
+                // Check both inputs before enabling submit button
+                const practicalInput = document.getElementById('practical_passing_percentage');
+                const projectInput = document.getElementById('project_passing_percentage');
+                const practicalValid = practicalInput && !practicalInput.classList.contains('input-error') && practicalInput.value !== '';
+                const projectValid = projectInput && !projectInput.classList.contains('input-error') && projectInput.value !== '';
+                
+                if (submitBtn) submitBtn.disabled = !(practicalValid && projectValid);
+                return true;
             }
         }
         
-        // Toggle visibility
+        // Validate both percentages before form submission
+        function validatePassingPercentages() {
+            const practicalInput = document.getElementById('practical_passing_percentage');
+            const projectInput = document.getElementById('project_passing_percentage');
+            let isValid = true;
+            
+            // Validate practical percentage
+            if (practicalInput) {
+                const practicalValue = parseFloat(practicalInput.value);
+                if (isNaN(practicalValue) || practicalValue < 65 || practicalValue > 100) {
+                    validatePercentage(practicalInput, 'practical');
+                    isValid = false;
+                }
+            }
+            
+            // Validate project percentage
+            if (projectInput) {
+                const projectValue = parseFloat(projectInput.value);
+                if (isNaN(projectValue) || projectValue < 65 || projectValue > 100) {
+                    validatePercentage(projectInput, 'project');
+                    isValid = false;
+                }
+            }
+            
+            if (!isValid) {
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Invalid Percentage',
+                    html: 'Passing percentages must be between <strong>65% and 100%</strong>.<br>Please correct the values before saving.',
+                    confirmButtonColor: '#dc3545'
+                });
+                return false;
+            }
+            
+            // Show confirmation with the percentages
+            const practicalVal = parseFloat(practicalInput.value);
+            const projectVal = parseFloat(projectInput.value);
+            
+            return Swal.fire({
+                title: 'Confirm Update',
+                html: `Are you sure you want to update passing percentages for ALL trainees?<br><br>
+                       <strong>Practical Skills:</strong> ${practicalVal}%<br>
+                       <strong>Project Output:</strong> ${projectVal}%<br><br>
+                       <span style="color: #ffc107;">⚠️ This will affect all ${<?php echo $total_trainees; ?>} trainees.</span>`,
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonColor: '#28a745',
+                cancelButtonColor: '#dc3545',
+                confirmButtonText: 'Yes, update',
+                cancelButtonText: 'Cancel'
+            }).then((result) => {
+                return result.isConfirmed;
+            });
+        }
+        
+        // Toggle visibility with UI update
         function toggleVisibility(type, enrollmentId, checkbox) {
             const newValue = checkbox.checked ? 1 : 0;
             const toggleType = type === 'project' ? 'toggle_project' : 'toggle_oral';
+            
+            // Show loading state
+            const toggleContainer = checkbox.closest('.visibility-toggle-container');
+            const statusSpan = toggleContainer.querySelector('.visibility-status');
+            const originalHtml = statusSpan.innerHTML;
+            statusSpan.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Updating...';
             
             fetch(`bulk_comprehensive_assessment.php?${toggleType}=1&enrollment_id=${enrollmentId}&set=${newValue}`)
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        const badge = checkbox.closest('td').querySelector('div:last-child');
-                        if (badge) {
-                            badge.innerHTML = newValue ? 'Visible' : 'Hidden';
+                        // Update status text and icon
+                        if (newValue) {
+                            statusSpan.innerHTML = '<i class="fas fa-eye"></i> Visible';
+                            statusSpan.className = 'visibility-status status-visible';
+                        } else {
+                            statusSpan.innerHTML = '<i class="fas fa-eye-slash"></i> Hidden';
+                            statusSpan.className = 'visibility-status status-hidden';
                         }
+                        
+                        // Show success message
+                        Swal.fire({
+                            icon: 'success',
+                            title: 'Updated!',
+                            text: `Project is now ${newValue ? 'visible' : 'hidden'} to trainee`,
+                            timer: 1500,
+                            showConfirmButton: false
+                        });
+                    } else {
+                        // Revert checkbox if update failed
+                        checkbox.checked = !checkbox.checked;
+                        statusSpan.innerHTML = originalHtml;
+                        Swal.fire('Error', data.message || 'Failed to update visibility', 'error');
                     }
                 })
-                .catch(error => console.error('Error:', error));
+                .catch(error => {
+                    console.error('Error:', error);
+                    checkbox.checked = !checkbox.checked;
+                    statusSpan.innerHTML = originalHtml;
+                    Swal.fire('Error', 'An error occurred while updating visibility', 'error');
+                });
         }
         
         // Helper functions
@@ -2289,8 +2637,9 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
             document.getElementById('imageModal').style.display = 'none';
         }
         
-        // Initialize totals on page load
+        // Initialize totals and validation on page load
         document.addEventListener('DOMContentLoaded', function() {
+            // Initialize practical skills totals
             <?php foreach ($enrollments as $index => $enrollment): ?>
                 if (typeof updateSkillTotal !== 'undefined') {
                     updateSkillTotal(<?php echo $index; ?>);
@@ -2299,8 +2648,21 @@ $completion_rate = $total_trainees > 0 ? round(($passed_count / $total_trainees)
                     updateRubricTraineeTotal(<?php echo $index; ?>);
                 }
             <?php endforeach; ?>
+            
+            // Initialize rubric total
             if (typeof updateRubricTotal !== 'undefined') {
                 updateRubricTotal();
+            }
+            
+            // Initialize percentage validation
+            const practicalInput = document.getElementById('practical_passing_percentage');
+            const projectInput = document.getElementById('project_passing_percentage');
+            
+            if (practicalInput) {
+                validatePercentage(practicalInput, 'practical');
+            }
+            if (projectInput) {
+                validatePercentage(projectInput, 'project');
             }
         });
         

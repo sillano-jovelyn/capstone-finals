@@ -71,7 +71,7 @@ $stmt->close();
 // GET NOTIFICATIONS (ALL, NOT JUST UNREAD)
 // ==========================================
 $notifications = [];
-$allNotifications = []; // Store all notifications for display
+$allNotifications = [];
 
 // Get ALL notifications (read + unread)
 $notifQuery = $conn->prepare("
@@ -105,6 +105,8 @@ date_default_timezone_set('Asia/Manila');
 $currentPrograms = [];
 $history = [];
 
+// FIXED: Include ALL enrollment statuses except 'pending'
+// This ensures programs with failed assessment still appear
 $query = "
     SELECT 
         e.id AS enrollment_id,
@@ -116,6 +118,7 @@ $query = "
         p.trainer,
         e.attendance,
         e.completed_at,
+        e.enrollment_status,
         COALESCE(ac.project_visible_to_trainee, 0) as project_visible_to_trainee,
         ac.project_title,
         ac.project_description,
@@ -124,14 +127,9 @@ $query = "
         ac.project_submitted_at,
         ac.project_score,
         ac.project_notes,
-        COALESCE(ac.oral_questions_visible_to_trainee, 0) as oral_questions_visible_to_trainee,
-        ac.oral_questions,
-        ac.oral_answers,
-        COALESCE(ac.oral_submitted_by_trainee, 0) as oral_submitted_by_trainee,
-        ac.oral_questions_finalized,
-        ac.oral_score,
-        ac.oral_notes,
-        ac.oral_max_score,
+        ac.project_title_override,
+        ac.project_instruction,
+        ac.project_rubrics,
         ac.overall_result,
         (SELECT COUNT(*) FROM attendance_records ar WHERE ar.enrollment_id = e.id AND ar.status = 'present') as sessions_attended,
         (SELECT COUNT(*) FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = p.id) as has_feedback,
@@ -141,11 +139,9 @@ $query = "
     LEFT JOIN assessment_components ac ON e.id = ac.enrollment_id
     LEFT JOIN feedback f ON f.user_id = e.user_id AND f.program_id = p.id
     WHERE e.user_id = ?
-    AND e.enrollment_status IN ('approved', 'completed')
     AND e.enrollment_status != 'pending'
     ORDER BY e.applied_at DESC
 ";
-
 $stmt = $conn->prepare($query);
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
@@ -172,14 +168,16 @@ while ($row = $result->fetch_assoc()) {
     
     $has_feedback = $row['has_feedback'] > 0;
     $overall_result = $row['overall_result'] ?? null;
-    $assessment_passed = ($overall_result === 'Passed');
-    $assessment_done = !empty($overall_result);
+    
+    // FIX: Only consider assessment as done if overall_result is NOT NULL and NOT empty
+    $assessment_done = !empty($overall_result) && $overall_result !== null;
+    $assessment_passed = ($assessment_done && $overall_result === 'Passed');
     $attendance_met = ($row['attendance'] >= $attendance_threshold);
     
-    // Decode oral questions
-    $oral_questions = [];
-    if (!empty($row['oral_questions'])) {
-        $oral_questions = json_decode($row['oral_questions'], true) ?: [];
+    // Handle project score properly
+    $project_score = $row['project_score'];
+    if ($project_score === null || $project_score === '') {
+        $project_score = null;
     }
   
     // ==========================================
@@ -228,8 +226,8 @@ while ($row = $result->fetch_assoc()) {
             $stmt->execute();
         } else {
             $stmt = $conn->prepare("INSERT INTO assessment_components 
-                (enrollment_id, project_title, project_description, project_photo_path, project_submitted_by_trainee, project_submitted_at, oral_max_score) 
-                VALUES (?, ?, ?, ?, 1, NOW(), 100)");
+                (enrollment_id, project_title, project_description, project_photo_path, project_submitted_by_trainee, project_submitted_at) 
+                VALUES (?, ?, ?, ?, 1, NOW())");
             $stmt->bind_param("isss", $enrollment_id, $_POST['project_title'], $_POST['project_description'], $photo_path);
             $stmt->execute();
         }
@@ -240,24 +238,18 @@ while ($row = $result->fetch_assoc()) {
     }
     
     // ==========================================
-    // SIMPLE VISIBILITY - Kapag naka-toggle ON, lalabas
+    // VISIBILITY - Kapag naka-toggle ON, lalabas
     // ==========================================
     $show_project = ($row['project_visible_to_trainee'] == 1);
-
-    $show_oral = false;
-    if ($row['oral_questions_visible_to_trainee'] == 1) {
-        if (!empty($oral_questions)) {
-            $show_oral = true;
-        }
-    }
     
     $move_to_history = $program_has_ended;
     
-    // Certificate availability logic
+    // Certificate availability logic - ONLY FOR PASSED ASSESSMENTS
     $show_feedback_button = false;
     $show_certificate_button = false;
     
     if ($program_has_started) {
+        // Only show feedback/certificate options if assessment is PASSED
         if ($assessment_done && $assessment_passed && $has_feedback) {
             $show_certificate_button = true;
         } elseif ($assessment_done && $assessment_passed && !$has_feedback) {
@@ -265,34 +257,7 @@ while ($row = $result->fetch_assoc()) {
         }
     }
     
-    // Generate session description
-    $daysOfWeek = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-    $period = new DatePeriod($start, new DateInterval('P1D'), (new DateTime($row['schedule_end']))->modify('+1 day'));
-    $sessionDays = [];
-    foreach ($period as $date) {
-        $day = $daysOfWeek[$date->format('w')];
-        if($day !== 'Sat' && $day !== 'Sun' && !in_array($day, $sessionDays)) {
-            $sessionDays[] = $day;
-        }
-    }
-    
-    $sessions = '';
-    if(count($sessionDays) === 5) {
-        $sessions = 'Monday-Friday';
-    } elseif($sessionDays === ['Mon','Wed','Fri']) {
-        $sessions = 'Monday, Wednesday, Friday';
-    } elseif($sessionDays === ['Tue','Thu']) {
-        $sessions = 'Tuesday, Thursday';
-    } else {
-        $map = ['Mon'=>'Monday','Tue'=>'Tuesday','Wed'=>'Wednesday','Thu'=>'Thursday','Fri'=>'Friday'];
-        $fullNames = [];
-        foreach($sessionDays as $d) {
-            $fullNames[] = $map[$d];
-        }
-        $sessions = implode(', ', $fullNames);
-    }
-    
-    // Status display
+    // Status display - FIXED to show Failed status properly
     $status = 'Upcoming';
     if ($program_not_started) {
         $status = 'Not Started Yet';
@@ -302,7 +267,7 @@ while ($row = $result->fetch_assoc()) {
         if ($assessment_done) {
             $status = $assessment_passed ? 'Completed' : 'Failed';
         } else {
-            $status = 'Ended';
+            $status = 'Ended - Waiting for Assessment';
         }
     }
     
@@ -318,8 +283,7 @@ while ($row = $result->fetch_assoc()) {
         "attendance_percentage" => $row['attendance'] ?? 0,
         "sessions_attended" => $row['sessions_attended'] ?? 0,
         "total_days" => $total_days,
-        "assessment" => $overall_result,
-        "sessions" => $sessions,
+        "assessment" => $assessment_done ? $overall_result : null,
         "show_feedback_button" => $show_feedback_button,
         "show_certificate_button" => $show_certificate_button,
         "has_feedback" => $has_feedback,
@@ -335,21 +299,16 @@ while ($row = $result->fetch_assoc()) {
         "overall_result" => $overall_result,
         // Project data
         "show_project" => $show_project,
+        "project_title_override" => $row['project_title_override'],  
+        "project_instruction" => $row['project_instruction'],        
+        "project_rubrics" => $row['project_rubrics'],                
         "project_title" => $row['project_title'],
         "project_description" => $row['project_description'],
         "project_photo_path" => $row['project_photo_path'],
         "project_submitted" => $row['project_submitted_by_trainee'],
         "project_submitted_at" => $row['project_submitted_at'],
-        "project_score" => $row['project_score'],
-        "project_notes" => $row['project_notes'],
-        // Oral data
-        "show_oral" => $show_oral,
-        "oral_questions" => $oral_questions,
-        "oral_submitted" => $row['oral_submitted_by_trainee'],
-        "oral_questions_finalized" => $row['oral_questions_finalized'],
-        "oral_score" => $row['oral_score'],
-        "oral_notes" => $row['oral_notes'],
-        "oral_max_score" => $row['oral_max_score']
+        "project_score" => $project_score,
+        "project_notes" => $row['project_notes']
     ];
     
     if ($move_to_history) {
@@ -849,6 +808,11 @@ function formatDateTime($dateTimeStr) {
             background-color: #dbeafe;
             border-left: 4px solid #3b82f6;
         }
+        
+        .failed-program {
+            background-color: #fee2e2;
+            border-left: 4px solid #dc2626;
+        }
 
         .history-program {
             background-color: #f9fafb;
@@ -902,13 +866,6 @@ function formatDateTime($dateTimeStr) {
             color: #991b1b;
         }
 
-        /* Sessions */
-        .sessions-section {
-            margin-top: 1rem;
-            padding-top: 1rem;
-            border-top: 1px solid #e5e7eb;
-        }
-
         /* Attendance progress bar */
         .attendance-progress-container {
             margin: 1rem 0;
@@ -954,66 +911,6 @@ function formatDateTime($dateTimeStr) {
             margin-top: 10px;
             cursor: pointer;
             border: 3px solid #e5e7eb;
-        }
-
-        /* Oral Display */
-        .oral-section {
-            margin-top: 1.5rem;
-            padding: 1.5rem;
-            background: white;
-            border-radius: 0.75rem;
-            border-left: 5px solid #8b5cf6;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        .oral-question-card {
-            background: #f9fafb;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin-bottom: 1rem;
-            border: 1px solid #e5e7eb;
-        }
-
-        .oral-answer-textarea {
-            width: 100%;
-            padding: 0.75rem;
-            border: 2px solid #e5e7eb;
-            border-radius: 0.5rem;
-            margin-top: 0.5rem;
-            font-family: inherit;
-            resize: vertical;
-        }
-
-        .oral-answer-textarea:focus {
-            border-color: #8b5cf6;
-            outline: none;
-        }
-
-        .submit-answers-btn {
-            background: linear-gradient(135deg, #8b5cf6, #6d28d9);
-            color: white;
-            border: none;
-            padding: 1rem 2rem;
-            border-radius: 0.5rem;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 1rem;
-            transition: all 0.3s;
-            width: 100%;
-        }
-
-        .submit-answers-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
-        }
-
-        .answers-submitted {
-            background: #f0fdf4;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin-top: 1rem;
-            color: #065f46;
         }
 
         /* Certificate & Feedback */
@@ -1186,7 +1083,7 @@ function formatDateTime($dateTimeStr) {
             box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
         }
 
-        /* Last updated - simple lang */
+        /* Last updated */
         .last-updated {
             font-size: 0.8rem;
             color: #6b7280;
@@ -1288,11 +1185,11 @@ function formatDateTime($dateTimeStr) {
         <button id="mobileMenuBtn" class="mobile-menu-btn"><i class="fas fa-bars"></i></button>
     </div>
     <div class="header-right">
-        <!-- Notifications - FIXED -->
+        <!-- Notifications -->
         <div class="notification-container">
             <button id="notificationBtn" class="notification-btn">
                 <i class="fas fa-bell"></i>
-                <?php if (count($notifications) > 0): // Only unread count for badge ?>
+                <?php if (count($notifications) > 0): ?>
                     <span class="notification-badge"><?php echo count($notifications); ?></span>
                 <?php endif; ?>
             </button>
@@ -1377,12 +1274,6 @@ function formatDateTime($dateTimeStr) {
                 <i class="fas fa-check-circle"></i> Project submitted successfully!
             </div>
         <?php endif; ?>
-        
-        <?php if (isset($_GET['oral_submitted'])): ?>
-            <div class="success-message" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">
-                <i class="fas fa-check-circle"></i> Oral answers submitted successfully!
-            </div>
-        <?php endif; ?>
 
         <!-- Programs Content -->
         <div id="programsContent">
@@ -1399,13 +1290,17 @@ function formatDateTime($dateTimeStr) {
                     <h2 class="section-title">Current Programs</h2>
                     
                     <?php foreach ($currentPrograms as $program): ?>
-                        <div class="program-card current-program">
+                        <div class="program-card <?php echo ($program['assessment_done'] && !$program['assessment_passed']) ? 'failed-program' : 'current-program'; ?>">
                             <h3 class="program-name">
                                 <?php echo htmlspecialchars($program['program_name']); ?>
                                 <?php if ($program['program_not_started']): ?>
                                     <span class="program-status status-upcoming">Not Started</span>
                                 <?php elseif ($program['program_is_ongoing']): ?>
                                     <span class="program-status status-ongoing">Ongoing</span>
+                                <?php elseif ($program['assessment_done'] && $program['assessment_passed']): ?>
+                                    <span class="program-status status-completed">Completed</span>
+                                <?php elseif ($program['assessment_done'] && !$program['assessment_passed']): ?>
+                                    <span class="program-status status-failed">Failed</span>
                                 <?php endif; ?>
                             </h3>
                             
@@ -1432,7 +1327,7 @@ function formatDateTime($dateTimeStr) {
                                     <div class="attendance-progress-bar">
                                         <div class="attendance-progress-fill" style="width: <?php echo $program['attendance_percentage']; ?>%"></div>
                                     </div>
-                                    
+                                </div>
                             <?php endif; ?>
                             <br>
                             <p><b>Assessment:</b> 
@@ -1445,9 +1340,7 @@ function formatDateTime($dateTimeStr) {
                                 <?php endif; ?>
                             </p>
                             
-                            <!-- ========================================== -->
-                            <!-- PROJECT OUTPUT SECTION - MAY FORM KATULAD NG ORAL -->
-                            <!-- ========================================== -->
+                            <!-- PROJECT OUTPUT SECTION -->
                             <?php if ($program['show_project']): ?>
                                 <div class="project-section">
                                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
@@ -1465,6 +1358,67 @@ function formatDateTime($dateTimeStr) {
                                         <?php endif; ?>
                                     </div>
 
+                                    <!-- PROJECT SETUP DISPLAY (Title, Instructions, Rubrics) -->
+                                    <?php if (!empty($program['project_title_override']) || !empty($program['project_instruction']) || !empty($program['project_rubrics'])): ?>
+                                        <div style="background: #f0f9ff; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #0ea5e9;">
+                                            <h5 style="color: #0ea5e9; margin-bottom: 15px;">
+                                                <i class="fas fa-info-circle"></i> Project Details from Trainer
+                                            </h5>
+                                            
+                                            <?php if (!empty($program['project_title_override'])): ?>
+                                                <div style="margin-bottom: 15px;">
+                                                    <strong style="color: #333;">Project Title:</strong>
+                                                    <p style="margin-top: 5px;"><?php echo htmlspecialchars($program['project_title_override']); ?></p>
+                                                </div>
+                                            <?php endif; ?>
+                                            
+                                            <?php if (!empty($program['project_instruction'])): ?>
+                                                <div style="margin-bottom: 15px;">
+                                                    <strong style="color: #333;">Instructions:</strong>
+                                                    <div style="margin-top: 5px; white-space: pre-wrap;">
+                                                        <?php echo nl2br(htmlspecialchars($program['project_instruction'])); ?>
+                                                    </div>
+                                                </div>
+                                            <?php endif; ?>
+                                            
+                                            <?php 
+                                            $rubrics = !empty($program['project_rubrics']) ? json_decode($program['project_rubrics'], true) : [];
+                                            if (!empty($rubrics) && is_array($rubrics)):
+                                            ?>
+                                                <div style="margin-top: 15px;">
+                                                    <strong style="color: #333;">Grading Rubric:</strong>
+                                                    <div style="overflow-x: auto; margin-top: 10px;">
+                                                        <table style="width: 100%; border-collapse: collapse; background: white; border-radius: 8px;">
+                                                            <thead>
+                                                                <tr style="background: #e3f2fd;">
+                                                                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Criterion</th>
+                                                                    <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Maximum Points</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                <?php 
+                                                                $total_max = 0;
+                                                                foreach ($rubrics as $criterion): 
+                                                                    $total_max += $criterion['max_score'];
+                                                                ?>
+                                                                    <tr>
+                                                                        <td style="padding: 8px 10px; border: 1px solid #ddd;"><?php echo htmlspecialchars($criterion['name']); ?></td>
+                                                                        <td style="padding: 8px 10px; text-align: center; border: 1px solid #ddd;"><?php echo $criterion['max_score']; ?></td>
+                                                                    </tr>
+                                                                <?php endforeach; ?>
+                                                                <tr style="background: #e3f2fd; font-weight: bold;">
+                                                                    <td style="padding: 8px 10px; border: 1px solid #ddd;">Total</td>
+                                                                    <td style="padding: 8px 10px; text-align: center; border: 1px solid #ddd;"><?php echo $total_max; ?></td>
+                                                                </tr>
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                </div>
+                                            <?php endif; ?>
+                                        </div>
+                                    <?php endif; ?>
+
+                                    <!-- SUBMISSION FORM OR DISPLAY -->
                                     <?php if ($program['project_submitted']): ?>
                                         <!-- DISPLAY SUBMITTED PROJECT -->
                                         <div style="background: #f0fdf4; padding: 20px; border-radius: 10px;">
@@ -1548,8 +1502,8 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     <?php endif; ?>
 
-                                    <!-- TRAINER'S EVALUATION (kung may score na) -->
-                                    <?php if (!empty($program['project_score'])): ?>
+                                    <!-- TRAINER'S EVALUATION - ONLY SHOW WHEN SCORE EXISTS AND > 0 -->
+                                    <?php if (!empty($program['project_score']) && $program['project_score'] !== null && $program['project_score'] > 0): ?>
                                         <div style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
                                             <h5 style="color: #0ea5e9; margin-bottom: 15px;">
                                                 <i class="fas fa-clipboard-check"></i> Trainer's Evaluation
@@ -1559,7 +1513,7 @@ function formatDateTime($dateTimeStr) {
                                                 <div style="background: white; padding: 15px 25px; border-radius: 10px; border-left: 4px solid #0ea5e9;">
                                                     <div style="font-size: 12px; color: #666;">Project Score</div>
                                                     <div style="font-size: 24px; font-weight: 700; color: #0ea5e9;">
-                                                        <?php echo $program['project_score']; ?>/100
+                                                        <?php echo number_format($program['project_score'], 2); ?>/100
                                                     </div>
                                                 </div>
                                                 
@@ -1581,105 +1535,21 @@ function formatDateTime($dateTimeStr) {
                                                 </div>
                                             <?php endif; ?>
                                         </div>
-                                    <?php endif; ?>
-                                </div>
-                            <?php endif; ?>
-                            
-                            <!-- ORAL QUESTIONS SECTION -->
-                            <?php if ($program['show_oral'] && !empty($program['oral_questions'])): ?>
-                                <div class="oral-section">
-                                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
-                                        <h4 style="color: #8b5cf6; margin: 0; display: flex; align-items: center; gap: 10px;">
-                                            <i class="fas fa-question-circle"></i> Oral Examination Questions
-                                        </h4>
-                                        <?php if ($program['oral_submitted']): ?>
-                                            <span style="background: #28a745; color: white; padding: 5px 15px; border-radius: 50px; font-size: 14px;">
-                                                <i class="fas fa-check-circle"></i> Submitted
-                                            </span>
-                                        <?php else: ?>
-                                            <span style="background: #f59e0b; color: white; padding: 5px 15px; border-radius: 50px; font-size: 14px;">
-                                                <i class="fas fa-clock"></i> Pending
-                                            </span>
-                                        <?php endif; ?>
-                                    </div>
-                                    
-                                    <?php if (!$program['oral_submitted']): ?>
-                                        <div style="background: #f5f3ff; padding: 25px; border-radius: 10px;">
-                                            <p style="font-size: 0.9rem; color: #6b7280; margin-bottom: 20px;">
-                                                <i class="fas fa-info-circle" style="color: #8b5cf6;"></i> Answer all questions below. You can only submit once.
-                                            </p>
-                                            
-                                            <form method="POST" action="submit_oral_answers.php" onsubmit="return validateOralForm()">
-                                                <input type="hidden" name="enrollment_id" value="<?php echo $program['enrollment_id']; ?>">
-                                                
-                                                <?php foreach ($program['oral_questions'] as $index => $question): ?>
-                                                    <div class="oral-question-card">
-                                                        <p style="font-weight: 600; margin-bottom: 10px;">
-                                                            Q<?php echo $index + 1; ?>: <?php echo htmlspecialchars($question['question']); ?>
-                                                            <span style="font-size: 12px; color: #8b5cf6; margin-left: 10px;">
-                                                                (<?php echo $question['max_score'] ?? 25; ?> pts)
-                                                            </span>
-                                                        </p>
-                                                        <textarea name="answers[<?php echo $index; ?>]" class="oral-answer-textarea" rows="4" placeholder="Type your answer here..." required></textarea>
-                                                    </div>
-                                                <?php endforeach; ?>
-                                                
-                                                <button type="submit" class="submit-answers-btn">
-                                                    <i class="fas fa-paper-plane"></i> Submit All Answers
-                                                </button>
-                                            </form>
-                                        </div>
-                                    <?php else: ?>
-                                        <div class="answers-submitted" style="text-align: center; padding: 30px;">
-                                            <i class="fas fa-check-circle" style="font-size: 48px; color: #28a745; margin-bottom: 15px;"></i>
-                                            <h4 style="color: #28a745;">Answers Submitted Successfully!</h4>
-                                            <p>Your oral exam answers have been submitted and are waiting for trainer evaluation.</p>
-                                        </div>
-                                    <?php endif; ?>
-
-                                    <!-- TRAINER'S ORAL EVALUATION -->
-                                    <?php if (!empty($program['oral_score'])): ?>
-                                        <div style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
-                                            <h5 style="color: #8b5cf6; margin-bottom: 15px;">
-                                                <i class="fas fa-clipboard-check"></i> Trainer's Oral Evaluation
+                                    <?php elseif ($program['project_submitted'] && (empty($program['project_score']) || $program['project_score'] == 0)): ?>
+                                        <!-- Show waiting message when project is submitted but not yet graded -->
+                                        <div style="margin-top: 20px; padding: 20px; background: #fff3cd; border-radius: 10px; border-left: 4px solid #ffc107;">
+                                            <h5 style="color: #856404; margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
+                                                <i class="fas fa-clock"></i> Awaiting Evaluation
                                             </h5>
-                                            
-                                            <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: center; margin-bottom: 15px;">
-                                                <div style="background: white; padding: 15px 25px; border-radius: 10px; border-left: 4px solid #8b5cf6;">
-                                                    <div style="font-size: 12px; color: #666;">Oral Score</div>
-                                                    <div style="font-size: 24px; font-weight: 700; color: #8b5cf6;">
-                                                        <?php echo $program['oral_score']; ?>/<?php echo $program['oral_max_score'] ?? 100; ?>
-                                                    </div>
-                                                </div>
-                                                
-                                                <?php if ($program['oral_score'] >= (($program['oral_max_score'] ?? 100) * 0.75)): ?>
-                                                    <span style="background: #28a745; color: white; padding: 8px 20px; border-radius: 50px;">
-                                                        <i class="fas fa-check-circle"></i> PASSED
-                                                    </span>
-                                                <?php else: ?>
-                                                    <span style="background: #dc3545; color: white; padding: 8px 20px; border-radius: 50px;">
-                                                        <i class="fas fa-times-circle"></i> FAILED
-                                                    </span>
-                                                <?php endif; ?>
-                                            </div>
-                                            
-                                            <?php if (!empty($program['oral_notes'])): ?>
-                                                <div style="background: white; padding: 15px; border-radius: 8px;">
-                                                    <strong>Feedback:</strong>
-                                                    <p style="margin-top: 8px;"><?php echo nl2br(htmlspecialchars($program['oral_notes'])); ?></p>
-                                                </div>
-                                            <?php endif; ?>
+                                            <p style="color: #856404; margin: 0;">
+                                                Your project has been submitted and is waiting for the trainer's evaluation. You will receive the score and feedback once evaluated.
+                                            </p>
                                         </div>
                                     <?php endif; ?>
                                 </div>
                             <?php endif; ?>
                             
-                            <!-- Sessions as text description -->
-                            <div class="sessions-section">
-                                <p><b>Sessions:</b> <?php echo htmlspecialchars($program['sessions']); ?></p>
-                            </div>
-                            
-                            <!-- Certificate/Feedback Section -->
+                            <!-- Certificate/Feedback Section - ONLY FOR PASSED ASSESSMENTS -->
                             <?php if ($program['show_certificate_button']): ?>
                                 <div class="certificate-section">
                                     <div class="certificate-title">
@@ -1711,7 +1581,7 @@ function formatDateTime($dateTimeStr) {
                                     <div class="certificate-requirements">
                                         <p><strong>Certificate Requirements:</strong></p>
                                         <div class="requirement requirement-met">
-                                            <i class="fas fa-check-circle"></i> Attendance: 80% or more
+                                            <i class="fas fa-check-circle"></i> Attendance
                                         </div>
                                         <div class="requirement requirement-met">
                                             <i class="fas fa-check-circle"></i> Assessment: Passed
@@ -1721,9 +1591,9 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     </div>
                                     <div class="certificate-buttons">
-                                      <button class="certificate-btn feedback-btn" onclick="location.href='feedback_certificate.php?program_id=<?php echo $program['program_id']; ?>&program_name=<?php echo urlencode($program['program_name']); ?>'">
-    <i class="fas fa-comment-dots"></i> Submit Feedback
-</button>
+                                        <button class="certificate-btn feedback-btn" onclick="location.href='feedback_certificate.php?program_id=<?php echo $program['program_id']; ?>&program_name=<?php echo urlencode($program['program_name']); ?>'">
+                                            <i class="fas fa-comment-dots"></i> Submit Feedback
+                                        </button>
                                     </div>
                                 </div>
                             <?php elseif ($program['attendance_met'] && !$program['assessment_done']): ?>
@@ -1731,7 +1601,6 @@ function formatDateTime($dateTimeStr) {
                                     <h5><i class="fas fa-clock"></i> Awaiting Assessment</h5>
                                     <p>Your attendance requirement is met. Waiting for trainer to assess your performance.</p>
                                 </div>
-                           
                             <?php endif; ?>
                         </div>
                     <?php endforeach; ?>
@@ -1763,7 +1632,7 @@ function formatDateTime($dateTimeStr) {
                                 <div class="attendance-progress-bar">
                                     <div class="attendance-progress-fill" style="width: <?php echo $program['attendance_percentage']; ?>%"></div>
                                 </div>
-                               
+                            </div>
                             
                             <p><b>Assessment:</b> 
                                 <?php if ($program['assessment']): ?>
@@ -1775,7 +1644,8 @@ function formatDateTime($dateTimeStr) {
                                 <?php endif; ?>
                             </p>
                             
-                            <?php if ($program['show_certificate_button']): ?>
+                            <!-- Only show certificate button if assessment is passed -->
+                            <?php if ($program['assessment_done'] && $program['assessment_passed']): ?>
                                 <div style="margin-top: 15px;">
                                     <button class="certificate-btn view-certificate-btn" onclick="location.href='feedback_certificate.php?generate_certificate=1&program_id=<?php echo $program['program_id']; ?>'">
                                         <i class="fas fa-certificate"></i> View Certificate
@@ -1793,7 +1663,7 @@ function formatDateTime($dateTimeStr) {
 
 <script>
 // ==========================================
-// NOTIFICATION FUNCTIONS - FIXED
+// NOTIFICATION FUNCTIONS
 // ==========================================
 
 // Load notifications via AJAX
@@ -2147,38 +2017,6 @@ function confirmLogout() {
     });
 }
 
-function validateOralForm() {
-    const textareas = document.querySelectorAll('.oral-answer-textarea');
-    let allFilled = true;
-    
-    textareas.forEach(textarea => {
-        if (!textarea.value.trim()) {
-            allFilled = false;
-        }
-    });
-    
-    if (!allFilled) {
-        Swal.fire({
-            title: 'Incomplete Answers',
-            text: 'Please answer all questions before submitting.',
-            icon: 'warning',
-            confirmButtonColor: '#8b5cf6'
-        });
-        return false;
-    }
-    
-    return Swal.fire({
-        title: 'Submit Answers?',
-        text: 'You can only submit once. Make sure your answers are final.',
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#8b5cf6',
-        confirmButtonText: 'Yes, submit'
-    }).then((result) => {
-        return result.isConfirmed;
-    });
-}
-
 function validateProjectForm() {
     const title = document.querySelector('input[name="project_title"]')?.value.trim();
     const description = document.querySelector('textarea[name="project_description"]')?.value.trim();
@@ -2204,7 +2042,7 @@ function validateProjectForm() {
     });
 }
 
-// MANUAL REFRESH LANG - WALANG AUTO
+// MANUAL REFRESH
 function refreshData() {
     Swal.fire({
         title: 'Refreshing...',

@@ -122,9 +122,11 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
     
     // FIXED: Filter conditions to match the status definitions
     if ($filter === 'ongoing') {
-        // Regular ongoing trainees (not passed/certified/failed)
-        $q .= " AND e.enrollment_status='approved' 
-                AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))";
+        // Regular ongoing trainees (not passed/certified/failed) + pending feedback trainees
+        $q .= " AND ((e.enrollment_status='approved' 
+                AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed')))
+                OR ((e.assessment='Passed' OR e.enrollment_status='certified') 
+                AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id)))";
     } elseif ($filter === 'certified') {
         // FIXED: Only show as certified if they have feedback AND are passed/certified
         $q .= " AND (e.assessment='Passed' OR e.enrollment_status='certified')";
@@ -135,7 +137,12 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
         $q .= " AND e.enrollment_status='rejected'";
     }
     
-    $q .= " ORDER BY t.fullname ASC";
+    $q .= " ORDER BY 
+            CASE 
+                WHEN (e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id) THEN 0
+                ELSE 1
+            END,
+            t.fullname ASC";
     
     $s = $conn->prepare($q); 
     $s->bind_param("ssi", $today, $today, $program_id); 
@@ -473,6 +480,9 @@ foreach ($trainees as $tr) {
     elseif ($tr['today_attendance_status']==='absent')  $absent_count++;
     else                                                 $unmarked_count++;
 }
+
+// Check if bulk comprehensive button should be disabled
+$bulk_comprehensive_disabled = !$program_started || $program_ended;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -653,9 +663,14 @@ tbody tr:hover{background:#f8f9fa;}
     text-decoration: none;
     font-size: 14px;
 }
-.btn-bulk:hover {
+.btn-bulk:hover:not(.disabled) {
     transform: translateY(-2px);
     box-shadow: 0 5px 15px rgba(102,126,234,0.4);
+}
+.btn-bulk.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
 }
 .btn-bulk i {
     font-size: 16px;
@@ -737,7 +752,7 @@ tbody tr:hover{background:#f8f9fa;}
     <div class="filter-container">
       <div class="filter-group">
         <span class="filter-label">Status:</span>
-        <button class="filter-btn <?= $current_filter==='ongoing'   ?'active':'' ?>" onclick="changeFilter('ongoing')"><i class="fas fa-circle"></i> Ongoing (<?= $trainee_counts['ongoing'] ?>)</button>
+        <button class="filter-btn <?= $current_filter==='ongoing'   ?'active':'' ?>" onclick="changeFilter('ongoing')"><i class="fas fa-circle"></i> Ongoing (<?= $trainee_counts['ongoing'] + $trainee_counts['pending_feedback'] ?>)</button>
         <button class="filter-btn <?= $current_filter==='certified' ?'active':'' ?>" onclick="changeFilter('certified')"><i class="fas fa-certificate"></i> Certified (<?= $trainee_counts['certified'] ?>)</button>
         <button class="filter-btn <?= $current_filter==='failed'    ?'active':'' ?>" onclick="changeFilter('failed')"><i class="fas fa-times-circle"></i> Failed (<?= $trainee_counts['failed'] ?>)</button>
         <button class="filter-btn <?= $current_filter==='dropout'   ?'active':'' ?>" onclick="changeFilter('dropout')"><i class="fas fa-user-times"></i> Dropout (<?= $trainee_counts['dropout'] ?>)</button>
@@ -749,8 +764,10 @@ tbody tr:hover{background:#f8f9fa;}
         <button class="btn btn-danger"  onclick="bulkAttendance('absent')"  <?= (!$program_started||$program_ended||!$within_schedule)?'disabled':'' ?>>
           <i class="fas fa-times-circle"></i> Mark All Absent</button>
         
-        <!-- Bulk Assessment -->
-        <a href="bulk_comprehensive_assessment.php?program_id=<?= $program_id ?>&tab=practical" class="btn-bulk">
+        <!-- Bulk Assessment - Disabled if program hasn't started -->
+        <a href="<?= $bulk_comprehensive_disabled ? 'javascript:void(0)' : 'bulk_comprehensive_assessment.php?program_id=' . $program_id . '&tab=practical' ?>" 
+           class="btn-bulk <?= $bulk_comprehensive_disabled ? 'disabled' : '' ?>"
+           onclick="<?= $bulk_comprehensive_disabled ? 'showDisabledAlert()' : '' ?>">
           <i class="fas fa-users-cog"></i> Bulk Comprehensive Assessment
         </a>
       </div>
@@ -763,12 +780,12 @@ tbody tr:hover{background:#f8f9fa;}
       </div>
       <div class="table-container">
       <?php if (count($trainees)>0): ?>
-        <table>
+         <table>
           <thead>
-            <tr>
+             <tr>
               <th>Name</th><th>Program</th><th>Attendance %</th><th>Days</th>
               <th>Assessment</th><th>Status</th><th>Today's Status</th><th>Mark Attendance</th><th>Actions</th>
-            </tr>
+             </tr>
           </thead>
           <tbody>
           <?php foreach ($trainees as $tr):
@@ -816,31 +833,31 @@ tbody tr:hover{background:#f8f9fa;}
               data-marked="<?= $is_marked?'true':'false' ?>"
               data-att-status="<?= $att_disp ?>">
 
-            <td>
+             <td>
               <strong><?= htmlspecialchars($tr['fullname']) ?></strong>
               <?php if ($needs_feedback): ?>
                 <span class="feedback-required"><i class="fas fa-exclamation-circle"></i> Feedback Required</span>
               <?php endif; ?>
-            </td>
-            <td><?= htmlspecialchars($tr['program_name']) ?></td>
-            <td>
+             </td>
+             <td><?= htmlspecialchars($tr['program_name']) ?></td>
+             <td>
               <div class="progress-bar"><div class="progress-fill" style="width:<?= $pct ?>%"></div></div>
               <div class="progress-text"><?= round($pct,1) ?>%</div>
-            </td>
-            <td><?= $days_att ?> / <?= $total_d ?></td>
-            <td>
+             </td>
+             <td><?= $days_att ?> / <?= $total_d ?></td>
+             <td>
               <span class="assessment-badge <?= $ass_cls ?>" id="ass-<?= $eid ?>"><?= htmlspecialchars($ass_display) ?></span>
               <?php if ($tr['failure_notes']): ?>
                 <div style="font-size:11px;color:#9ca3af;margin-top:3px;cursor:pointer;" onclick="showNotes('<?= htmlspecialchars(addslashes($tr['failure_notes'])) ?>')">
                   <i class="fas fa-sticky-note"></i> Notes
                 </div>
               <?php endif; ?>
-            </td>
-            <td>
+             </td>
+             <td>
               <span class="status-badge status-<?= $st ?>" id="stbadge-<?= $eid ?>">
                 <?= $status_display_text ?>
               </span>
-            </td>
+             </td>
 
             <!-- TODAY'S STATUS - Now consistent with certified filter -->
             <td>
@@ -860,7 +877,7 @@ tbody tr:hover{background:#f8f9fa;}
                   <i class="fas fa-user-check"></i> <?= htmlspecialchars($tr['today_marked_by']) ?>
                 </div>
               <?php endif; ?>
-            </td>
+             </td>
 
             <!-- MARK ATTENDANCE -->
             <td id="attcell-<?= $eid ?>">
@@ -911,7 +928,7 @@ tbody tr:hover{background:#f8f9fa;}
                   <?php endif; ?>
                 </div>
               <?php endif; ?>
-            </td>
+             </td>
 
             <!-- ACTIONS -->
             <td>
@@ -924,11 +941,11 @@ tbody tr:hover{background:#f8f9fa;}
                   <?= ($is_drop||$is_cert||$is_failed||$needs_feedback)?'disabled':'' ?>>
                   <i class="fas fa-user-times"></i> Dropout</button>
               </div>
-            </td>
-          </tr>
+             </td>
+           </tr>
           <?php endforeach; ?>
           </tbody>
-        </table>
+         </table>
       <?php else: ?>
         <div class="empty-state">
           <i class="fas fa-users-slash"></i>
@@ -1018,6 +1035,16 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
 });
+
+// Function to show disabled alert for bulk comprehensive
+function showDisabledAlert() {
+    Swal.fire({
+        icon: 'info',
+        title: 'Program Not Started',
+        text: 'Bulk comprehensive assessment is only available after the program has started.',
+        confirmButtonColor: '#4A90E2'
+    });
+}
 
 // ── helpers ─────────────────────────────────────────────────
 function changeFilter(f) { const p=new URLSearchParams(location.search); p.set('filter',f); location.href='?'+p; }
