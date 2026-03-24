@@ -686,6 +686,483 @@ tbody tr:hover{background:#f8f9fa;}
     font-weight: 600;
     margin-left: 5px;
 }
+
+/* Mobile View Styles - Add to existing CSS */
+
+/* Tablet and Mobile Breakpoints */
+@media (max-width: 1024px) {
+    .main-container {
+        flex-direction: column;
+    }
+    
+    .sidebar {
+        width: 100%;
+        min-height: auto;
+        display: flex;
+        overflow-x: auto;
+        padding: 12px;
+        gap: 8px;
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        background: #344152;
+    }
+    
+    .sidebar-btn {
+        flex: 0 0 auto;
+        width: auto;
+        margin-bottom: 0;
+        white-space: nowrap;
+        padding: 10px 16px;
+    }
+    
+    .main-content {
+        padding: 16px;
+        overflow-x: auto;
+    }
+}
+
+@media (max-width: 768px) {
+    /* Header adjustments */
+    .header {
+        padding: 0 12px;
+    }
+    
+    .system-name {
+        font-size: 13px;
+        white-space: normal;
+        line-height: 1.3;
+        max-width: 140px;
+    }
+    
+    .logo {
+        width: 32px;
+        height: 32px;
+    }
+    
+    .profile-btn span {
+        display: none;
+    }
+    
+    .profile-btn i:first-child {
+        font-size: 20px;
+    }
+    
+    .profile-btn {
+        padding: 8px 10px;
+    }
+    
+    /* Page Header */
+    .page-header {
+        padding: 12px 16px;
+        margin-bottom: 16px;
+    }
+    
+    .page-title {
+        font-size: 20px;
+    }
+    
+    .attendance-summary {
+        gap: 10px;
+        margin-top: 12px;
+    }
+    
+    .summary-item {
+        padding: 6px 10px;
+        min-width: 90px;
+    }
+    
+    .summary-value {
+        font-size: 14px;
+    }
+    
+    .summary-label {
+        font-size: 10px;
+    }
+    
+    /* Status Banners */
+    .status-banner, .today-banner {
+        padding: 10px 16px;
+        font-size: 13px;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+        text-align: center;
+    }
+    
+    .status-banner i, .today-banner i {
+        font-size: 14px;
+    }
+    
+    /* Filter Container */
+    .filter-container {
+        padding: 12px 16px;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    
+    .filter-group {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+    
+    .filter-label {
+        font-size: 12px;
+        width: 100%;
+        text-align: center;
+        margin-bottom: 6px;
+    }
+    
+    .filter-btn {
+        padding: 6px 12px;
+        font-size: 12px;
+        flex: 1;
+        text-align: center;
+    }
+    
+    /* Quick Actions */
+    .filter-group:last-child .btn,
+    .filter-group:last-child .btn-bulk {
+        font-size: 12px;
+        padding: 8px 12px;
+        width: 100%;
+        justify-content: center;
+    }
+    
+    .btn-bulk {
+        font-size: 12px;
+        padding: 8px 12px;
+    }
+    
+    /* Table Card */
+    .table-card {
+        border-radius: 12px;
+        overflow-x: auto;
+    }
+    
+    .table-header {
+        padding: 12px 16px;
+        font-size: 14px;
+    }
+    
+    .table-header span {
+        display: block;
+        margin-top: 4px;
+        margin-left: 0 !important;
+        font-size: 12px;
+    }
+    
+    .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    
+    table {
+        min-width: 700px;
+    }
+    
+    th, td {
+        padding: 10px 12px;
+        font-size: 12px;
+    }
+    
+    th {
+        font-size: 11px;
+        white-space: nowrap;
+    }
+    
+    /* Status Badges */
+    .status-badge {
+        padding: 3px 8px;
+        font-size: 10px;
+        white-space: nowrap;
+    }
+    
+    .assessment-badge {
+        padding: 3px 8px;
+        font-size: 10px;
+    }
+    
+    .att-badge {
+        padding: 4px 8px;
+        font-size: 10px;
+        white-space: nowrap;
+    }
+    
+    /* Attendance Buttons */
+    .attendance-actions {
+        flex-direction: column;
+        gap: 6px;
+    }
+    
+    .att-btn {
+        padding: 5px 10px;
+        font-size: 11px;
+        width: 100%;
+        justify-content: center;
+    }
+    
+    .lock-label {
+        font-size: 9px;
+        margin-top: 4px;
+    }
+    
+    /* Action Buttons in Table */
+    td:last-child div {
+        flex-direction: column;
+        gap: 6px;
+    }
+    
+    td:last-child .btn {
+        padding: 5px 8px;
+        font-size: 10px;
+        width: 100%;
+        justify-content: center;
+    }
+    
+    /* Progress Bar */
+    .progress-bar {
+        height: 6px;
+    }
+    
+    .progress-text {
+        font-size: 10px;
+    }
+    
+    /* Modal for Mobile */
+    .modal-content {
+        padding: 20px;
+        max-width: 95%;
+        margin: 16px;
+    }
+    
+    .modal-header h3 {
+        font-size: 18px;
+    }
+    
+    .detail-label {
+        font-size: 12px;
+    }
+    
+    .detail-value {
+        font-size: 13px;
+    }
+    
+    .detail-row {
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+    }
+    
+    /* Empty State */
+    .empty-state {
+        padding: 40px 16px;
+    }
+    
+    .empty-state i {
+        font-size: 36px;
+    }
+    
+    .empty-state h3 {
+        font-size: 16px;
+    }
+    
+    .empty-state p {
+        font-size: 13px;
+    }
+}
+
+@media (max-width: 480px) {
+    /* Extra small devices */
+    .header {
+        height: 55px;
+    }
+    
+    .system-name {
+        font-size: 11px;
+        max-width: 110px;
+    }
+    
+    .logo {
+        width: 28px;
+        height: 28px;
+    }
+    
+    .main-content {
+        padding: 12px;
+    }
+    
+    .page-header {
+        padding: 10px 12px;
+    }
+    
+    .page-title {
+        font-size: 18px;
+    }
+    
+    .attendance-summary {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    
+    .summary-item {
+        min-width: calc(50% - 8px);
+        flex: 1;
+        padding: 8px;
+    }
+    
+    .filter-btn {
+        padding: 5px 10px;
+        font-size: 11px;
+    }
+    
+    .filter-group {
+        gap: 6px;
+    }
+    
+    .table-header {
+        padding: 10px 12px;
+        font-size: 13px;
+    }
+    
+    th, td {
+        padding: 8px 10px;
+        font-size: 11px;
+    }
+    
+    .status-banner, .today-banner {
+        padding: 8px 12px;
+        font-size: 12px;
+    }
+    
+    .btn-bulk, .btn {
+        font-size: 11px;
+        padding: 6px 10px;
+    }
+    
+    .modal-content {
+        padding: 16px;
+        max-height: 85vh;
+    }
+    
+    .modal-header {
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+    }
+}
+
+/* Landscape mode on mobile */
+@media (max-width: 768px) and (orientation: landscape) {
+    .sidebar {
+        overflow-x: auto;
+        padding: 8px;
+    }
+    
+    .sidebar-btn {
+        padding: 8px 12px;
+        font-size: 12px;
+    }
+    
+    .main-content {
+        padding: 12px;
+    }
+    
+    .table-container {
+        max-height: 400px;
+    }
+}
+
+/* Touch-friendly adjustments */
+@media (hover: none) and (max-width: 768px) {
+    .sidebar-btn, 
+    .filter-btn, 
+    .btn, 
+    .att-btn,
+    .dropdown-item {
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .sidebar-btn {
+        min-height: 44px;
+    }
+    
+    .att-btn {
+        min-height: 36px;
+    }
+    
+    /* Improve tap targets */
+    button, 
+    .btn, 
+    .att-btn,
+    .filter-btn {
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+    }
+}
+
+/* Improve scrolling on tables */
+@media (max-width: 768px) {
+    .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+    }
+    
+    table {
+        width: 100%;
+        min-width: 680px;
+    }
+    
+    /* Sticky first column for better mobile UX (optional) */
+    th:first-child,
+    td:first-child {
+        position: sticky;
+        left: 0;
+        background: white;
+        z-index: 5;
+        box-shadow: 2px 0 5px -2px rgba(0,0,0,0.1);
+    }
+    
+    thead th:first-child {
+        background: #f8f9fa;
+        z-index: 10;
+    }
+    
+    tbody tr:hover td:first-child {
+        background: #f8f9fa;
+    }
+}
+
+/* Compact mode for very small screens */
+@media (max-width: 380px) {
+    .filter-btn {
+        font-size: 10px;
+        padding: 4px 8px;
+    }
+    
+    .btn, .btn-bulk {
+        font-size: 10px;
+        padding: 5px 8px;
+    }
+    
+    .summary-value {
+        font-size: 12px;
+    }
+    
+    .att-badge {
+        font-size: 9px;
+        padding: 3px 6px;
+    }
+    
+    .status-badge {
+        font-size: 9px;
+        padding: 2px 6px;
+    }
+}
+
 </style>
 </head>
 <body>
