@@ -1866,18 +1866,7 @@ if (!empty($error_output)) {
                                         <i class="fas fa-calendar-times"></i>
                                         <h3>No attendance records found</h3>
                                         <p>No attendance records found for the selected date range.</p>
-                                        <?php if ($debug_info['attendance_records'] == 0): ?>
-                                        <p style="color: #dc2626; margin-top: 10px;">
-                                            <i class="fas fa-exclamation-triangle"></i> 
-                                            Debug: No records in database for user_id <?php echo $user_id; ?>
-                                        </p>
-                                        <?php endif; ?>
-                                        <?php if (isset($attendance_data['error'])): ?>
-                                        <p style="color: #dc2626; margin-top: 10px;">
-                                            <i class="fas fa-exclamation-triangle"></i> 
-                                            Error: <?php echo htmlspecialchars($attendance_data['error']); ?>
-                                        </p>
-                                        <?php endif; ?>
+                                     
                                     </div>
                                 </td>
                             </tr>
