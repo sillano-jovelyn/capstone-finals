@@ -1914,15 +1914,13 @@ $show_auto_delete_warning = true;
                             <h4><i class="fas fa-info-circle"></i> What you need to do:</h4>
                             <ul>
                                 <li>Review the reason(s) above carefully</li>
-                                <li>Click the "Update Profile" button below to update your information</li>
+                                <li>Click the "Edit Profile" button below to update your information</li>
                                 <li>Upload or replace documents if needed</li>
-                                <li>Click "Save Changes" when done - your application will automatically return to pending status</li>
+                                <li>When done - your application will automatically return to pending status</li>
                             </ul>
                         </div>
                         
-                        <button onclick="toggleEdit()" class="btn-revision-edit">
-                            <i class="fas fa-edit"></i> Update Profile Now
-                        </button>
+                       
                     </div>
                 </div>
             <?php endif; ?>
