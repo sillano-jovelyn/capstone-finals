@@ -1,2462 +1,1842 @@
 <?php
-// ============================================
-// comprehensive updated but not enough.
-// ============================================
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
-
 session_start();
 
-// ============================================
-// AUTHENTICATION CHECK
-// ============================================
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'trainer') {
-    header('Location: /login.php');
-    exit;
+
+// LOGOUT HANDLER
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+    $_SESSION = [];
+    if (ini_get("session.use_cookies")) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000,
+            $params["path"], $params["domain"],
+            $params["secure"], $params["httponly"]
+        );
+    }
+    session_destroy();
+    header("Location: ../login.php");
+    exit();
 }
 
-$user_id = $_SESSION['user_id'];
-$fullname = $_SESSION['fullname'] ?? 'Trainer';
 
-// ============================================
 // DATABASE CONNECTION
-// ============================================
-require_once __DIR__ . '/../db.php';
-
-if (!$conn) {
-    die("Database connection failed");
+$conn = null;
+try {
+    $db_file = __DIR__ . '/../db.php';
+    if (!file_exists($db_file)) {
+        throw new Exception("db.php not found");
+    }
+    require_once $db_file;
+    if (!isset($conn) || !$conn) {
+        throw new Exception("DB connection not set");
+    }
+    if (!$conn->ping()) {
+        throw new Exception("DB connection lost");
+    }
+} catch (Exception $e) {
+    die("Database connection error. Please try again later.");
 }
 
-// ============================================
-// CREATE/UPDATE TABLES AND COLUMNS
-// ============================================
 
-// Add columns to assessment_components if they don't exist
-$conn->query("ALTER TABLE assessment_components 
-    ADD COLUMN IF NOT EXISTS project_visible_to_trainee TINYINT(1) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS oral_questions_visible_to_trainee TINYINT(1) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS practical_skills_saved TINYINT(1) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS oral_questions_saved TINYINT(1) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS practical_skills_grading TEXT,
-    ADD COLUMN IF NOT EXISTS oral_questions TEXT
-");
-
-// Add results column to enrollments table if not exists
-$conn->query("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS results VARCHAR(20) DEFAULT NULL");
-$conn->query("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS assessment VARCHAR(20) DEFAULT NULL");
-
-// ============================================
-// CREATE TRAINEE-SPECIFIC TABLES
-// ============================================
-$conn->query("CREATE TABLE IF NOT EXISTS trainee_practical_skills (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    enrollment_id INT NOT NULL,
-    skill_name VARCHAR(255) NOT NULL,
-    max_score INT DEFAULT 20,
-    score DECIMAL(5,2) DEFAULT NULL,
-    order_index INT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX (enrollment_id),
-    FOREIGN KEY (enrollment_id) REFERENCES enrollments(id) ON DELETE CASCADE
-)");
-
-$conn->query("CREATE TABLE IF NOT EXISTS trainee_oral_questions (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    enrollment_id INT NOT NULL,
-    question TEXT NOT NULL,
-    max_score INT DEFAULT 25,
-    score DECIMAL(5,2) DEFAULT NULL,
-    answer TEXT,
-    order_index INT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX (enrollment_id),
-    FOREIGN KEY (enrollment_id) REFERENCES enrollments(id) ON DELETE CASCADE
-)");
-
-// ============================================
-// TOGGLE VISIBILITY - AJAX HANDLER
-// ============================================
-if (isset($_POST['ajax_toggle'])) {
-    header('Content-Type: application/json');
-    
-    if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'trainer') {
-        echo json_encode(['success' => false, 'message' => 'Authentication failed']);
-        exit;
-    }
-    
-    $enrollment_id = intval($_POST['enrollment_id']);
-    $type = $_POST['type'] ?? '';
-    $new_value = intval($_POST['set']);
-    
-    if ($enrollment_id > 0 && in_array($type, ['project', 'oral'])) {
-        $check_enrollment = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-        if ($check_enrollment && $check_enrollment->num_rows > 0) {
-            $field = $type === 'project' ? 'project_visible_to_trainee' : 'oral_questions_visible_to_trainee';
-            $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-            
-            if ($check && $check->num_rows > 0) {
-                $update = $conn->query("UPDATE assessment_components SET $field = $new_value WHERE enrollment_id = $enrollment_id");
-                if ($update) {
-                    echo json_encode(['success' => true, 'message' => 'Visibility updated successfully']);
-                } else {
-                    echo json_encode(['success' => false, 'message' => 'Database update failed: ' . $conn->error]);
-                }
-            } else {
-                $insert = $conn->query("INSERT INTO assessment_components (enrollment_id, $field, oral_max_score) VALUES ($enrollment_id, $new_value, 100)");
-                if ($insert) {
-                    echo json_encode(['success' => true, 'message' => 'Visibility created successfully']);
-                } else {
-                    echo json_encode(['success' => false, 'message' => 'Database insert failed: ' . $conn->error]);
-                }
-            }
-            exit;
-        } else {
-            echo json_encode(['success' => false, 'message' => 'Invalid enrollment ID']);
-            exit;
-        }
-    }
-    
-    echo json_encode(['success' => false, 'message' => 'Invalid request type']);
-    exit;
+//  SESSION VALIDATION
+if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
+    header("Location: ../login.php");
+    exit();
 }
 
-// ============================================
-// HANDLE TRAINEE PROJECT SUBMISSION
-// ============================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_project_trainee'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'trainee') {
-        header('Location: /login.php');
-        exit;
-    }
-    
-    $user_id = $_SESSION['user_id'];
-    
-    $check = $conn->prepare("SELECT id FROM enrollments WHERE id = ? AND user_id = ?");
-    $check->bind_param("ii", $enrollment_id, $user_id);
-    $check->execute();
-    if ($check->get_result()->num_rows == 0) {
-        die("Invalid enrollment");
-    }
-    
-    $photo_path = '';
-    if (isset($_FILES['project_photo']) && $_FILES['project_photo']['error'] == 0) {
-        $target_dir = "../uploads/projects/";
-        if (!file_exists($target_dir)) {
-            mkdir($target_dir, 0777, true);
-        }
-        
-        $extension = pathinfo($_FILES['project_photo']['name'], PATHINFO_EXTENSION);
-        $filename = "project_" . $enrollment_id . "_" . time() . "." . $extension;
-        $target_file = $target_dir . $filename;
-        
-        if (move_uploaded_file($_FILES['project_photo']['tmp_name'], $target_file)) {
-            $photo_path = "uploads/projects/" . $filename;
-        }
-    }
-    
-    $check_ac = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-    
-    if ($check_ac->num_rows > 0) {
-        $stmt = $conn->prepare("UPDATE assessment_components SET 
-            project_title = ?,
-            project_description = ?,
-            project_photo_path = ?,
-            project_submitted_by_trainee = 1,
-            project_submitted_at = NOW()
-            WHERE enrollment_id = ?");
-        $stmt->bind_param("sssi", $_POST['project_title'], $_POST['project_description'], $photo_path, $enrollment_id);
-        $stmt->execute();
-    } else {
-        $stmt = $conn->prepare("INSERT INTO assessment_components 
-            (enrollment_id, project_title, project_description, project_photo_path, project_submitted_by_trainee, project_submitted_at, oral_max_score) 
-            VALUES (?, ?, ?, ?, 1, NOW(), 100)");
-        $stmt->bind_param("isss", $enrollment_id, $_POST['project_title'], $_POST['project_description'], $photo_path);
-        $stmt->execute();
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=project&submitted=1");
-    exit;
+$user_id   = $_SESSION['user_id'];
+$user_role = $_SESSION['role'];
+
+// Only trainees can access this page
+if ($user_role !== 'trainee') {
+    header("Location: ../login.php");
+    exit();
 }
 
-// ============================================
-// SAVE TRAINEE-SPECIFIC PRACTICAL SKILLS
-// ============================================
-if (isset($_POST['save_trainee_practical_skills'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $enrollment_check = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-    if ($enrollment_check->num_rows > 0) {
-        // DELETE old skills for this trainee
-        $conn->query("DELETE FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-        
-        // Insert new trainee skills
-        $skills_json = $_POST['trainee_skills'];
-        $skills = json_decode($skills_json, true);
-        
-        if (is_array($skills)) {
-            $stmt = $conn->prepare("INSERT INTO trainee_practical_skills 
-                (enrollment_id, skill_name, max_score, score, order_index) 
-                VALUES (?, ?, ?, ?, ?)");
-            
-            foreach ($skills as $index => $skill) {
-                $skill_name = $skill['name'];
-                $max_score = $skill['max_score'];
-                $score = isset($skill['score']) ? $skill['score'] : null;
-                
-                $stmt->bind_param("isidi", $enrollment_id, $skill_name, $max_score, $score, $index);
-                $stmt->execute();
-            }
-            $stmt->close();
-        }
-        
-        // Update assessment_components to mark as saved
-        $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        if ($check->num_rows > 0) {
-            $conn->query("UPDATE assessment_components SET 
-                practical_skills_saved = 1,
-                practical_skills_grading = '" . $conn->real_escape_string($skills_json) . "'
-                WHERE enrollment_id = $enrollment_id");
-        } else {
-            $conn->query("INSERT INTO assessment_components 
-                (enrollment_id, practical_skills_saved, practical_skills_grading, oral_max_score) 
-                VALUES ($enrollment_id, 1, '" . $conn->real_escape_string($skills_json) . "', 100)");
-        }
-        
-        // Return JSON response for AJAX
-        if (isset($_POST['ajax'])) {
-            echo json_encode(['success' => true, 'message' => 'Practical skills saved successfully']);
-            exit;
-        }
-    }
-    
-    // Redirect for form submission
-    if (!isset($_POST['ajax'])) {
-        header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=practical&skills_saved=1");
-        exit;
+// Double-check user exists in the users table
+$userCheck = $conn->prepare(
+    "SELECT id FROM users WHERE id = ? AND role = ?"
+);
+$userCheck->bind_param("is", $user_id, $user_role);
+$userCheck->execute();
+if ($userCheck->get_result()->num_rows === 0) {
+    session_destroy();
+    header("Location: ../login.php");
+    exit();
+}
+$userCheck->close();
+
+// Load the trainee's personal info
+$traineeStmt = $conn->prepare(
+    "SELECT id, firstname, lastname, email FROM trainees WHERE user_id = ?"
+);
+$traineeStmt->bind_param("i", $user_id);
+$traineeStmt->execute();
+$traineeData = $traineeStmt->get_result()->fetch_assoc();
+$traineeStmt->close();
+
+if (!$traineeData) {
+    session_destroy();
+    header("Location: ../login.php");
+    exit();
+}
+
+// Store useful variables for use throughout the page
+$username        = $traineeData['firstname'];
+$trainee_id      = $traineeData['id'];
+$trainee_fullname = $traineeData['firstname'] . ' ' . $traineeData['lastname'];
+$_SESSION['trainee_id'] = $trainee_id;
+
+
+// HELPER FUNCTIONS
+function formatDate($dateStr) {
+    if (empty($dateStr) || $dateStr === '0000-00-00') return 'N/A';
+    try {
+        return (new DateTime($dateStr))->format('F j, Y');
+    } catch (Exception $e) {
+        return $dateStr;
     }
 }
 
-// ============================================
-// SAVE TRAINEE-SPECIFIC ORAL QUESTIONS
-// ============================================
-if (isset($_POST['save_trainee_oral_questions'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $enrollment_check = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-    if ($enrollment_check->num_rows > 0) {
-        // DELETE old questions for this trainee
-        $conn->query("DELETE FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        
-        // Insert new trainee questions
-        $questions_json = $_POST['trainee_questions'];
-        $questions = json_decode($questions_json, true);
-        
-        if (is_array($questions)) {
-            $stmt = $conn->prepare("INSERT INTO trainee_oral_questions 
-                (enrollment_id, question, max_score, score, order_index) 
-                VALUES (?, ?, ?, ?, ?)");
-            
-            foreach ($questions as $index => $q) {
-                $question = $q['question'];
-                $max_score = $q['max_score'];
-                $score = isset($q['score']) ? $q['score'] : null;
-                
-                $stmt->bind_param("isidi", $enrollment_id, $question, $max_score, $score, $index);
-                $stmt->execute();
-            }
-            $stmt->close();
-        }
-        
-        // Update assessment_components to mark as saved
-        $check = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        if ($check->num_rows > 0) {
-            $conn->query("UPDATE assessment_components SET 
-                oral_questions_saved = 1,
-                oral_questions = '" . $conn->real_escape_string($questions_json) . "'
-                WHERE enrollment_id = $enrollment_id");
-        } else {
-            $conn->query("INSERT INTO assessment_components 
-                (enrollment_id, oral_questions_saved, oral_questions, oral_max_score) 
-                VALUES ($enrollment_id, 1, '" . $conn->real_escape_string($questions_json) . "', 100)");
-        }
-        
-        // Return JSON response for AJAX
-        if (isset($_POST['ajax'])) {
-            echo json_encode(['success' => true, 'message' => 'Oral questions saved successfully']);
-            exit;
-        }
-    }
-    
-    // Redirect for form submission
-    if (!isset($_POST['ajax'])) {
-        header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=oral&questions_saved=1");
-        exit;
+function formatDateTime($dateTimeStr) {
+    if (empty($dateTimeStr) || $dateTimeStr === '0000-00-00 00:00:00') return 'N/A';
+    try {
+        return (new DateTime($dateTimeStr))->format('F j, Y \a\t g:i A');
+    } catch (Exception $e) {
+        return $dateTimeStr;
     }
 }
 
-// ============================================
-// ACTUAL REMOVE TRAINEE SKILLS (PERMANENT DELETE)
-// ============================================
-if (isset($_POST['remove_trainee_skills'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $enrollment_check = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-    if ($enrollment_check->num_rows > 0) {
-        $conn->query("DELETE FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-        $conn->query("UPDATE assessment_components SET practical_skills_saved = 0, practical_skills_grading = NULL WHERE enrollment_id = $enrollment_id");
-    }
-    
-    if (isset($_POST['ajax'])) {
-        echo json_encode(['success' => true, 'message' => 'All skills removed permanently']);
-        exit;
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=practical&removed=1");
-    exit;
-}
 
-// ============================================
-// ACTUAL REMOVE TRAINEE QUESTIONS (PERMANENT DELETE)
-// ============================================
-if (isset($_POST['remove_trainee_questions'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $enrollment_check = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-    if ($enrollment_check->num_rows > 0) {
-        $conn->query("DELETE FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id");
-        $conn->query("UPDATE assessment_components SET oral_questions_saved = 0, oral_questions = NULL WHERE enrollment_id = $enrollment_id");
-    }
-    
-    if (isset($_POST['ajax'])) {
-        echo json_encode(['success' => true, 'message' => 'All questions removed permanently']);
-        exit;
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=oral&removed=1");
-    exit;
-}
-
-// ============================================
-// REMOVE SINGLE SKILL
-// ============================================
-if (isset($_POST['remove_single_skill'])) {
-    $skill_id = intval($_POST['skill_id']);
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $conn->query("DELETE FROM trainee_practical_skills WHERE id = $skill_id");
-    
-    // Check if any skills remain
-    $remaining = $conn->query("SELECT COUNT(*) as count FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id")->fetch_assoc();
-    if ($remaining['count'] == 0) {
-        $conn->query("UPDATE assessment_components SET practical_skills_saved = 0 WHERE enrollment_id = $enrollment_id");
-    }
-    
-    if (isset($_POST['ajax'])) {
-        echo json_encode(['success' => true, 'message' => 'Skill removed successfully']);
-        exit;
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=practical&skill_removed=1");
-    exit;
-}
-
-// ============================================
-// REMOVE SINGLE QUESTION
-// ============================================
-if (isset($_POST['remove_single_question'])) {
-    $question_id = intval($_POST['question_id']);
-    $enrollment_id = intval($_POST['enrollment_id']);
-    
-    $conn->query("DELETE FROM trainee_oral_questions WHERE id = $question_id");
-    
-    // Check if any questions remain
-    $remaining = $conn->query("SELECT COUNT(*) as count FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id")->fetch_assoc();
-    if ($remaining['count'] == 0) {
-        $conn->query("UPDATE assessment_components SET oral_questions_saved = 0 WHERE enrollment_id = $enrollment_id");
-    }
-    
-    if (isset($_POST['ajax'])) {
-        echo json_encode(['success' => true, 'message' => 'Question removed successfully']);
-        exit;
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=oral&question_removed=1");
-    exit;
-}
-
-// ============================================
-// HANDLE SAVE TAB DATA
-// ============================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_tab'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    $tab = $_POST['tab'];
-    
-    $enrollment_check = $conn->query("SELECT id FROM enrollments WHERE id = $enrollment_id");
-    if ($enrollment_check->num_rows > 0) {
-        $check = $conn->prepare("SELECT id FROM assessment_components WHERE enrollment_id = ?");
-        $check->bind_param("i", $enrollment_id);
-        $check->execute();
-        $exists = $check->get_result()->num_rows > 0;
-        $check->close();
-        
-        if ($tab === 'practical') {
-            $practical_notes = $conn->real_escape_string($_POST['practical_notes'] ?? '');
-            
-            // Update scores in trainee_practical_skills
-            $skill_scores = $_POST['skill_scores'] ?? '{}';
-            $skill_grades = json_decode($skill_scores, true);
-            
-            $practical_total = 0;
-            if (is_array($skill_grades)) {
-                foreach ($skill_grades as $skill_id => $grade) {
-                    if (is_array($grade) && isset($grade['score'])) {
-                        $score = floatval($grade['score']);
-                        $practical_total += $score;
-                        
-                        if (strpos($skill_id, 'custom_') === 0) {
-                            $parts = explode('|', $skill_id);
-                            if (count($parts) >= 3) {
-                                $skill_name = $parts[1];
-                                $max_score = $parts[2];
-                                
-                                $update_stmt = $conn->prepare("UPDATE trainee_practical_skills SET score = ? WHERE enrollment_id = ? AND skill_name = ? AND max_score = ?");
-                                $update_stmt->bind_param("dssi", $score, $enrollment_id, $skill_name, $max_score);
-                                $update_stmt->execute();
-                                $update_stmt->close();
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Calculate max total for pass/fail
-            $practical_max_total = 0;
-            $max_query = $conn->prepare("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = ?");
-            $max_query->bind_param("i", $enrollment_id);
-            $max_query->execute();
-            $max_result = $max_query->get_result();
-            if ($max_row = $max_result->fetch_assoc()) {
-                $practical_max_total = $max_row['total'] ?? 100;
-            }
-            $max_query->close();
-            
-            $practical_passed = ($practical_max_total > 0 && $practical_total >= ($practical_max_total * 0.75)) ? 1 : 0;
-            $practical_date = date('Y-m-d');
-            
-            if ($exists) {
-                $stmt = $conn->prepare("UPDATE assessment_components SET 
-                        practical_score = ?,
-                        practical_passed = ?,
-                        practical_date = ?,
-                        practical_notes = ?,
-                        practical_skills_saved = 1
-                        WHERE enrollment_id = ?");
-                $stmt->bind_param("iissi", $practical_total, $practical_passed, $practical_date, $practical_notes, $enrollment_id);
-            } else {
-                $stmt = $conn->prepare("INSERT INTO assessment_components 
-                        (enrollment_id, practical_score, practical_passed, practical_date, practical_notes, practical_skills_saved, oral_max_score) 
-                        VALUES (?, ?, ?, ?, ?, 1, 100)");
-                $stmt->bind_param("iiiss", $enrollment_id, $practical_total, $practical_passed, $practical_date, $practical_notes);
-            }
-            
-            if (!$stmt->execute()) {
-                error_log("Save practical failed: " . $stmt->error);
-            }
-            $stmt->close();
-            
-        } elseif ($tab === 'project') {
-            $project_score = floatval($_POST['project_score'] ?? 0);
-            $project_notes = $conn->real_escape_string($_POST['project_notes'] ?? '');
-            $project_passed = ($project_score >= 75) ? 1 : 0;
-            
-            if ($exists) {
-                $stmt = $conn->prepare("UPDATE assessment_components SET 
-                    project_score = ?,
-                    project_passed = ?,
-                    project_notes = ?
-                    WHERE enrollment_id = ?");
-                $stmt->bind_param("iisi", $project_score, $project_passed, $project_notes, $enrollment_id);
-            } else {
-                $stmt = $conn->prepare("INSERT INTO assessment_components 
-                    (enrollment_id, project_score, project_passed, project_notes, oral_max_score) 
-                    VALUES (?, ?, ?, ?, 100)");
-                $stmt->bind_param("iiis", $enrollment_id, $project_score, $project_passed, $project_notes);
-            }
-            
-            if (!$stmt->execute()) {
-                error_log("Save project failed: " . $stmt->error);
-            }
-            $stmt->close();
-            
-        } elseif ($tab === 'oral') {
-            $oral_notes = $conn->real_escape_string($_POST['oral_notes'] ?? '');
-            $oral_score = floatval($_POST['oral_score'] ?? 0);
-            
-            // Update scores in trainee_oral_questions
-            $question_scores = $_POST['question_scores'] ?? '{}';
-            $question_grades = json_decode($question_scores, true);
-            
-            if (is_array($question_grades)) {
-                foreach ($question_grades as $q_index => $score_data) {
-                    if (is_array($score_data) && isset($score_data['score'])) {
-                        $score = floatval($score_data['score']);
-                        
-                        $update_stmt = $conn->prepare("UPDATE trainee_oral_questions SET score = ? WHERE enrollment_id = ? AND order_index = ?");
-                        $update_stmt->bind_param("dii", $score, $enrollment_id, $q_index);
-                        $update_stmt->execute();
-                        $update_stmt->close();
-                    }
-                }
-            }
-            
-            // Calculate total max from trainee questions
-            $max_total = 0;
-            $max_query = $conn->prepare("SELECT SUM(max_score) as total FROM trainee_oral_questions WHERE enrollment_id = ?");
-            $max_query->bind_param("i", $enrollment_id);
-            $max_query->execute();
-            $max_result = $max_query->get_result();
-            if ($max_row = $max_result->fetch_assoc()) {
-                $max_total = $max_row['total'] ?? 100;
-            }
-            $max_query->close();
-            
-            $oral_passed = ($oral_score >= ($max_total * 0.75)) ? 1 : 0;
-            
-            if ($exists) {
-                $stmt = $conn->prepare("UPDATE assessment_components SET 
-                    oral_score = ?,
-                    oral_passed = ?,
-                    oral_notes = ?,
-                    oral_max_score = ?,
-                    oral_questions_saved = 1
-                    WHERE enrollment_id = ?");
-                $stmt->bind_param("iisii", $oral_score, $oral_passed, $oral_notes, $max_total, $enrollment_id);
-            } else {
-                $stmt = $conn->prepare("INSERT INTO assessment_components 
-                    (enrollment_id, oral_score, oral_passed, oral_notes, oral_max_score, oral_questions_saved) 
-                    VALUES (?, ?, ?, ?, ?, 1)");
-                $stmt->bind_param("iiisi", $enrollment_id, $oral_score, $oral_passed, $oral_notes, $max_total);
-            }
-            
-            if (!$stmt->execute()) {
-                error_log("Save oral failed: " . $stmt->error);
-            }
-            $stmt->close();
-        }
-        
-        // Calculate overall result after saving
-        $assessment_result = $conn->query("SELECT * FROM assessment_components WHERE enrollment_id = $enrollment_id");
-        if ($assessment_result && $assessment = $assessment_result->fetch_assoc()) {
-            $practical = $assessment['practical_score'] ?? 0;
-            $project = $assessment['project_score'] ?? 0;
-            $oral = $assessment['oral_score'] ?? 0;
-            
-            // Get practical max from trainee skills
-            $practical_max = 100; // Default
-            $practical_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-            if ($practical_max_query && $practical_max_row = $practical_max_query->fetch_assoc()) {
-                $practical_max = $practical_max_row['total'] ?? 100;
-            }
-            
-            // Get oral max
-            $oral_max = $assessment['oral_max_score'] ?? 100;
-            
-            $total = $practical + $project + $oral;
-            $max_total = $practical_max + 100 + $oral_max;
-            $percentage = $max_total > 0 ? ($total / $max_total) * 100 : 0;
-            $overall_result = ($percentage >= 75) ? 'Passed' : 'Failed';
-            
-            $update_stmt = $conn->prepare("UPDATE assessment_components SET 
-                overall_total_score = ?,
-                overall_result = ?,
-                assessed_by = ?,
-                assessed_at = NOW()
-                WHERE enrollment_id = ?");
-            $update_stmt->bind_param("issi", $total, $overall_result, $fullname, $enrollment_id);
-            $update_stmt->execute();
-            $update_stmt->close();
-        }
-    }
-    
-    header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=" . urlencode($tab) . "&saved=1");
-    exit;
-}
-
-// ============================================
-// HANDLE SAVE ASSESSMENT (from summary tab)
-// ============================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_assessment'])) {
-    $enrollment_id = intval($_POST['enrollment_id']);
-    $updated = 0;
-    
-    $enrollment_data = $conn->query("SELECT user_id, program_id FROM enrollments WHERE id = $enrollment_id")->fetch_assoc();
-    if ($enrollment_data) {
-        $user_id = $enrollment_data['user_id'];
-        $program_id = $enrollment_data['program_id'];
-    } else {
-        header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=summary&error=1");
-        exit;
-    }
-    
-    $assessment = $conn->query("SELECT * FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
-    
-    if ($assessment) {
-        $practical = $assessment['practical_score'] ?? 0;
-        $project = $assessment['project_score'] ?? 0;
-        $oral = $assessment['oral_score'] ?? 0;
-        
-        // Get practical max from trainee skills
-        $practical_max = 100; // Default
-        $practical_max_query = $conn->query("SELECT SUM(max_score) as total FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id");
-        if ($practical_max_query && $practical_max_row = $practical_max_query->fetch_assoc()) {
-            $practical_max = $practical_max_row['total'] ?? 100;
-        }
-        
-        // Get oral max
-        $oral_max = $assessment['oral_max_score'] ?? 100;
-        
-        $total = $practical + $project + $oral;
-        $max_total = $practical_max + 100 + $oral_max;
-        $percentage = $max_total > 0 ? ($total / $max_total) * 100 : 0;
-        $overall_result = ($percentage >= 75) ? 'Passed' : 'Failed';
-        
-        $update_assessment = $conn->prepare("UPDATE assessment_components SET 
-            overall_total_score = ?,
-            overall_result = ?,
-            assessed_by = ?,
-            assessed_at = NOW()
-            WHERE enrollment_id = ?");
-        $update_assessment->bind_param("dssi", $total, $overall_result, $fullname, $enrollment_id);
-        
-        if (!$update_assessment->execute()) {
-            error_log("Failed to update assessment: " . $update_assessment->error);
-        }
-        $update_assessment->close();
-
-        $enrollment_status = ($overall_result == 'Passed') ? 'completed' : 'failed';
-        $update_enrollment = $conn->prepare("UPDATE enrollments SET 
-            enrollment_status = ?,
-            results = ?,
-            assessment = ?,
-            completion_date = NOW()
-            WHERE id = ?");
-        $update_enrollment->bind_param("sssi", $enrollment_status, $overall_result, $overall_result, $enrollment_id);
-        
-        $update_archive = $conn->prepare("UPDATE archived_history SET 
-            enrollment_completed_at = NOW(),
-            enrollment_status = ?,
-            enrollment_assessment = ?,
-            updated_at = NOW()
-            WHERE user_id = ? AND enrollment_id = ? AND archive_trigger = 'enrollment_completed'");
-        $update_archive->bind_param("ssii", $enrollment_status, $overall_result, $user_id, $enrollment_id);
-
-        $enrollment_updated = $update_enrollment->execute();
-        
-        if ($update_archive) {
-            $archive_updated = $update_archive->execute();
-            if (!$archive_updated && $update_archive->affected_rows === 0) {
-                $insert_archive = $conn->prepare("INSERT INTO archived_history 
-                    (user_id, original_program_id, enrollment_id, enrollment_status, 
-                     enrollment_assessment, enrollment_completed_at, archive_trigger, 
-                     archive_source, program_name, program_duration, program_duration_unit)
-                    SELECT ?, ?, id, ?, ?, NOW(), 'enrollment_completed', 'direct_from_programs',
-                           program_name, program_duration, program_duration_unit
-                    FROM enrollments WHERE id = ?");
-                $insert_archive->bind_param("iissi", $user_id, $program_id, $enrollment_status, 
-                                           $overall_result, $enrollment_id);
-                $insert_archive->execute();
-                $insert_archive->close();
-            }
-            $update_archive->close();
-        }
-        
-        if ($enrollment_updated) {
-            $updated = 1;
-        } else {
-            error_log("Failed to update enrollment: " . $update_enrollment->error);
-        }
-        
-        $update_enrollment->close();
-    }
-    
-    if ($updated) {
-        header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=summary&saved=1");
-    } else {
-        header("Location: comprehensive_assessment.php?enrollment_id=$enrollment_id&tab=summary&error=1");
-    }
-    exit;
-}
-
-// ============================================
-// GET ENROLLMENT ID
-// ============================================
-$enrollment_id = isset($_GET['enrollment_id']) ? intval($_GET['enrollment_id']) : 0;
-
-if (!$enrollment_id) {
-    header('Location: trainer_participants.php');
-    exit;
-}
-
-// ============================================
-// GET ENROLLMENT AND ASSESSMENT DATA
-// ============================================
-$enrollment = $conn->query("
-    SELECT e.*, t.fullname, t.firstname, t.lastname, t.email, t.contact_number, 
-           p.name as program_name, p.scheduleStart, p.scheduleEnd, p.id as program_id
+// ENROLLMENT STATUS FLAGS
+$activeCheck = $conn->prepare("
+    SELECT COUNT(*) as cnt
     FROM enrollments e
-    JOIN trainees t ON e.user_id = t.user_id
+    WHERE e.user_id = ?
+      AND (
+          e.enrollment_status = 'approved'
+          OR (
+              e.enrollment_status = 'completed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM feedback f
+                  WHERE f.user_id = e.user_id AND f.program_id = e.program_id
+              )
+          )
+      )
+");
+$activeCheck->bind_param("i", $user_id);
+$activeCheck->execute();
+$hasActiveProgram = ($activeCheck->get_result()->fetch_assoc()['cnt'] > 0);
+$activeCheck->close();
+
+// Does the trainee have a pending application?
+$pendingCheck = $conn->prepare(
+    "SELECT COUNT(*) as cnt FROM enrollments WHERE user_id = ? AND enrollment_status = 'pending'"
+);
+$pendingCheck->bind_param("i", $user_id);
+$pendingCheck->execute();
+$hasPendingApplications = ($pendingCheck->get_result()->fetch_assoc()['cnt'] > 0);
+$pendingCheck->close();
+
+// Does the trainee have any completed enrollment?
+$completedCheck = $conn->prepare(
+    "SELECT COUNT(*) as cnt FROM enrollments WHERE user_id = ? AND enrollment_status = 'completed'"
+);
+$completedCheck->bind_param("i", $user_id);
+$completedCheck->execute();
+$hasCompletedProgram = ($completedCheck->get_result()->fetch_assoc()['cnt'] > 0);
+$completedCheck->close();
+
+// Is the trainee enrolled or have a pending app? (Used to lock available programs)
+$anyApprovedEnrolled = $hasActiveProgram;
+
+// Lock the "Available Programs" section if trainee is active or pending
+$disableAvailablePrograms = ($hasActiveProgram || $hasPendingApplications);
+
+
+// LOAD ENROLLED PROGRAMS
+$enrolledPrograms = [];
+
+$enrolledQuery = "
+    SELECT 
+        p.id, p.name, p.duration, p.scheduleStart, p.scheduleEnd,
+        p.trainer, p.total_slots, p.slotsAvailable,
+        pc.name AS category_name,
+        e.enrollment_status, e.attendance, e.assessment,
+        e.completed_at, e.applied_at AS application_date,
+        (
+            SELECT COUNT(*) FROM enrollments e2
+            WHERE e2.program_id = p.id
+              AND e2.enrollment_status IN ('approved','completed')
+        ) AS enrolled_count,
+        (
+            SELECT COUNT(*) FROM feedback f
+            WHERE f.user_id = e.user_id AND f.program_id = p.id
+        ) AS has_feedback
+    FROM enrollments e
     JOIN programs p ON e.program_id = p.id
-    WHERE e.id = $enrollment_id
-")->fetch_assoc();
+    LEFT JOIN program_categories pc ON p.category_id = pc.id
+    WHERE e.user_id = ?
+      AND e.enrollment_status IN ('approved','completed','pending')
+    ORDER BY
+        CASE
+            WHEN e.enrollment_status = 'completed' THEN 3
+            WHEN e.enrollment_status = 'pending'   THEN 2
+            ELSE 1
+        END,
+        p.created_at DESC
+";
 
-if (!$enrollment) {
-    header('Location: trainer_participants.php?error=no_enrollment');
-    exit;
+$stmt = $conn->prepare($enrolledQuery);
+$stmt->bind_param("i", $user_id);
+$stmt->execute();
+$enrolledRes = $stmt->get_result();
+
+while ($row = $enrolledRes->fetch_assoc()) {
+    // --- Slot calculations ---
+    $total_slots    = $row['total_slots'] ?? $row['slotsAvailable'] ?? 0;
+    $enrolled_count = $row['enrolled_count'] ?? 0;
+    $available_slots = max(0, $total_slots - $enrolled_count);
+
+    // --- Status booleans ---
+    $enrollment_status  = $row['enrollment_status'] ?? null;
+    $is_enrolled        = in_array($enrollment_status, ['approved', 'completed']);
+    $is_pending         = ($enrollment_status === 'pending');
+    $is_completed_status = ($enrollment_status === 'completed');
+
+    // --- FIX #1: Determine if the program is truly "completed" visually ---
+    // Even if enrollment_status = 'completed', if feedback has NOT been
+    // submitted yet, we treat the card as still ACTIVE/ONGOING.
+    // The trainee must fill out feedback before seeing "completed" state.
+    $has_feedback = ($row['has_feedback'] > 0);
+
+    $is_completed    = false;
+    $show_certificate = false;
+    $is_from_history = false;
+    $is_past_end_date = false;
+
+    if ($is_enrolled) {
+        // Check if the program's end date has already passed
+        $end_date_raw = $row['scheduleEnd'] ?? null;
+        if ($end_date_raw && $end_date_raw !== '0000-00-00') {
+            try {
+                $end_obj   = (new DateTime($end_date_raw))->setTime(0,0,0);
+                $today_obj = (new DateTime())->setTime(0,0,0);
+                $is_past_end_date = ($end_obj < $today_obj);
+            } catch (Exception $e) {
+                $is_past_end_date = false;
+            }
+        }
+
+        // FIX #1 core: even if enrollment_status = 'completed',
+        // without feedback → still show as active/ongoing
+        if ($is_completed_status && $has_feedback) {
+            // Feedback done → truly completed
+            $is_completed    = true;
+            $is_from_history = true;
+            $show_certificate = true;
+        } elseif ($is_completed_status && !$has_feedback) {
+            // Admin marked complete but trainee hasn't filled feedback yet
+            // → treat as still active/ongoing
+            $is_completed    = false;
+            $is_from_history = false;
+            $show_certificate = false;
+        } elseif ($enrollment_status === 'approved' && $is_past_end_date && $has_feedback) {
+            // Edge case: approved, end date passed, feedback submitted
+            $is_completed    = true;
+            $is_from_history = true;
+            $show_certificate = true;
+        }
+        // All other approved cases = active/ongoing
+    }
+
+    // Build the full program row for use in templates 
+    $row['available_slots']      = $available_slots;
+    $row['total_slots']          = $total_slots;
+    $row['enrolled_count']       = $enrolled_count;
+    $row['is_enrolled']          = $is_enrolled;
+    $row['is_pending']           = $is_pending;
+    $row['is_completed_status']  = $is_completed_status;
+    $row['has_enrollment']       = ($is_enrolled || $is_pending);
+    $row['is_completed']         = $is_completed;
+    $row['is_past_end_date']     = $is_past_end_date;
+    $row['show_certificate']     = $show_certificate;
+    $row['is_from_history']      = $is_from_history;
+    $row['has_feedback_value']   = $has_feedback;
+    $row['is_full']              = ($available_slots <= 0);
+    $row['enrolled_user_id']     = $user_id;
+    $row['is_archived']          = false;
+    $row['archive_id']           = null;
+    $row['enrollment_percentage'] = ($total_slots > 0)
+        ? round(($enrolled_count / $total_slots) * 100, 1)
+        : 0;
+
+    $enrolledPrograms[] = $row;
 }
+$stmt->close();
 
-$program_id = $enrollment['program_id'] ?? 0;
 
-// Get existing assessment
-$existing_assessment = $conn->query("SELECT * FROM assessment_components WHERE enrollment_id = $enrollment_id")->fetch_assoc();
+// LOAD ARCHIVED HISTORY
+$archivedPrograms = [];
 
-if (!$existing_assessment) {
-    $existing_assessment = [
-        'project_visible_to_trainee' => 0,
-        'oral_questions_visible_to_trainee' => 0,
-        'practical_skills_saved' => 0,
-        'oral_questions_saved' => 0,
-        'project_submitted_by_trainee' => 0,
-        'project_score' => null,
-        'oral_score' => null,
-        'practical_score' => 0,
-        'practical_notes' => '',
-        'practical_date' => date('Y-m-d'),
-        'practical_passed' => 0,
-        'project_notes' => '',
-        'oral_notes' => '',
-        'oral_max_score' => 100,
-        'project_title' => '',
-        'project_description' => '',
-        'project_photo_path' => '',
-        'overall_result' => null,
-        'overall_total_score' => 0
+$archivedQuery = "
+    SELECT
+        ah.id AS archive_id,
+        ah.original_program_id AS program_id,
+        ah.program_name,
+        ah.program_duration,
+        ah.program_duration_unit,
+        ah.program_schedule_start,
+        ah.program_schedule_end,
+        ah.program_trainer_name AS trainer,
+        ah.program_category_id,
+        pc.name AS category_name,
+        ah.enrollment_status,
+        ah.enrollment_attendance AS attendance,
+        ah.enrollment_assessment AS assessment,
+        ah.enrollment_completed_at AS completion_date,
+        ah.archived_at,
+        ah.archive_trigger,
+        -- All feedback rating fields
+        ah.trainer_expertise_rating,
+        ah.trainer_communication_rating,
+        ah.trainer_methods_rating,
+        ah.trainer_requests_rating,
+        ah.trainer_questions_rating,
+        ah.trainer_instructions_rating,
+        ah.trainer_prioritization_rating,
+        ah.trainer_fairness_rating,
+        ah.program_knowledge_rating,
+        ah.program_process_rating,
+        ah.program_environment_rating,
+        ah.program_algorithms_rating,
+        ah.program_preparation_rating,
+        ah.system_technology_rating,
+        ah.system_workflow_rating,
+        ah.system_instructions_rating,
+        ah.system_answers_rating,
+        ah.system_performance_rating,
+        ah.feedback_comments,
+        ah.feedback_submitted_at
+    FROM archived_history ah
+    LEFT JOIN program_categories pc ON ah.program_category_id = pc.id
+    WHERE ah.user_id = ?
+    ORDER BY ah.archived_at DESC
+";
+
+$archivedStmt = $conn->prepare($archivedQuery);
+$archivedStmt->bind_param("i", $user_id);
+$archivedStmt->execute();
+$archivedResult = $archivedStmt->get_result();
+
+while ($archiveRow = $archivedResult->fetch_assoc()) {
+    // --- Calculate if feedback was submitted and average rating ---
+    $ratingFields = [
+        'trainer_expertise_rating','trainer_communication_rating',
+        'trainer_methods_rating','trainer_requests_rating',
+        'trainer_questions_rating','trainer_instructions_rating',
+        'trainer_prioritization_rating','trainer_fairness_rating',
+        'program_knowledge_rating','program_process_rating',
+        'program_environment_rating','program_algorithms_rating',
+        'program_preparation_rating','system_technology_rating',
+        'system_workflow_rating','system_instructions_rating',
+        'system_answers_rating','system_performance_rating',
+    ];
+
+    $ratings    = [];
+    $hasFeedback = false;
+    foreach ($ratingFields as $field) {
+        if (!empty($archiveRow[$field]) && is_numeric($archiveRow[$field])) {
+            $ratings[]   = (int)$archiveRow[$field];
+            $hasFeedback = true;
+        }
+    }
+    if (!empty($archiveRow['feedback_comments'])) {
+        $hasFeedback = true;
+    }
+    $avgRating = !empty($ratings)
+        ? round(array_sum($ratings) / count($ratings), 1)
+        : null;
+
+    // A certificate is shown if the record is completed AND assessment = Passed
+    $certificateIssued = (
+        $archiveRow['enrollment_status'] === 'completed' &&
+        strtolower($archiveRow['assessment'] ?? '') === 'passed'
+    );
+
+    // Build the archived program row in the same shape as enrolled programs
+    $archivedPrograms[] = [
+        'id'              => $archiveRow['program_id'] ?? $archiveRow['archive_id'],
+        'archive_id'      => $archiveRow['archive_id'],
+        'name'            => $archiveRow['program_name'] ?: 'Unknown Program',
+        'duration'        => $archiveRow['program_duration'],
+        'duration_unit'   => $archiveRow['program_duration_unit'] ?? 'Days',
+        'scheduleStart'   => $archiveRow['program_schedule_start'],
+        'scheduleEnd'     => $archiveRow['program_schedule_end'],
+        'trainer'         => $archiveRow['trainer'] ?? 'Unknown Trainer',
+        'category_name'   => $archiveRow['category_name'] ?? 'General',
+        'enrollment_status' => $archiveRow['enrollment_status'] ?? 'archived',
+        'attendance'      => $archiveRow['attendance'] ?? 0,
+        'assessment'      => $archiveRow['assessment'],
+        'completed_at'    => $archiveRow['completion_date'] ?? $archiveRow['archived_at'],
+        'archived_at'     => $archiveRow['archived_at'],
+        'archive_trigger' => $archiveRow['archive_trigger'],
+
+        'has_feedback'         => $hasFeedback,
+        'feedback_rating'      => $avgRating,
+        'feedback_comments'    => $archiveRow['feedback_comments'],
+        'feedback_submitted_at'=> $archiveRow['feedback_submitted_at'],
+        'feedback_details'     => $archiveRow,
+
+        // These are set so the template/JS logic stays consistent
+        'is_enrolled'          => false,
+        'is_pending'           => false,
+        'is_completed_status'  => ($archiveRow['enrollment_status'] === 'completed'),
+        'has_enrollment'       => false,
+        'is_completed'         => true,
+        'is_past_end_date'     => true,
+        'show_certificate'     => $certificateIssued,
+        'is_from_history'      => true,
+        'is_archived'          => true,   // KEY FLAG: marks this as archive record
+        'has_feedback_value'   => $hasFeedback,
+        'enrolled_user_id'     => $user_id,
+
+        'total_slots'          => 0,
+        'available_slots'      => 0,
+        'enrolled_count'       => 0,
+        'enrollment_percentage'=> 0,
+        'is_full'              => false,
     ];
 }
+$archivedStmt->close();
 
-// Get trainee-specific practical skills
-$trainee_skills = [];
-$trainee_skills_result = $conn->query("SELECT * FROM trainee_practical_skills WHERE enrollment_id = $enrollment_id ORDER BY order_index");
-if ($trainee_skills_result && $trainee_skills_result->num_rows > 0) {
-    $trainee_skills = $trainee_skills_result->fetch_all(MYSQLI_ASSOC);
-}
+// LOAD AVAILABLE PROGRAMS
+$availablePrograms = [];
+$today = new DateTime();
+$today->setTime(0, 0, 0);
 
-// Get trainee-specific oral questions
-$trainee_questions = [];
-$trainee_questions_result = $conn->query("SELECT * FROM trainee_oral_questions WHERE enrollment_id = $enrollment_id ORDER BY order_index");
-if ($trainee_questions_result && $trainee_questions_result->num_rows > 0) {
-    $trainee_questions = $trainee_questions_result->fetch_all(MYSQLI_ASSOC);
-}
+$availableQuery = "
+    SELECT
+        p.id, p.name, p.duration, p.scheduleStart, p.scheduleEnd,
+        p.trainer, p.total_slots, p.slotsAvailable,
+        pc.name AS category_name,
+        (
+            SELECT COUNT(*) FROM enrollments e2
+            WHERE e2.program_id = p.id
+              AND e2.enrollment_status IN ('approved','completed')
+        ) AS enrolled_count
+    FROM programs p
+    LEFT JOIN program_categories pc ON p.category_id = pc.id
+    WHERE p.id NOT IN (
+        SELECT program_id FROM enrollments WHERE user_id = ?
+    )
+    AND p.status  = 'active'
+    AND p.show_on_index = 1
+    ORDER BY p.created_at DESC
+";
 
-// Calculate practical total and max from trainee skills
-$practical_total = 0;
-$practical_max_total = 0;
-$practical_has_all_scores = true;
-if (!empty($trainee_skills)) {
-    foreach ($trainee_skills as $skill) {
-        $practical_max_total += intval($skill['max_score'] ?? 0);
-        if ($skill['score'] === null) {
-            $practical_has_all_scores = false;
-        } else {
-            $practical_total += floatval($skill['score']);
+$stmtAvailable = $conn->prepare($availableQuery);
+$stmtAvailable->bind_param("i", $user_id);
+$stmtAvailable->execute();
+$availableRes = $stmtAvailable->get_result();
+
+while ($availableRow = $availableRes->fetch_assoc()) {
+    // Hide programs whose start date was BEFORE today
+    // (strictly yesterday or earlier). Programs starting TODAY
+    // are still shown — we apply the 1-day grace for the defense.
+    $hideProgram = false;
+    if (!empty($availableRow['scheduleStart']) && $availableRow['scheduleStart'] !== '0000-00-00') {
+        try {
+            $schedStart = (new DateTime($availableRow['scheduleStart']))->setTime(0, 0, 0);
+            // Only hide if start date is STRICTLY before today
+            // (today's programs are still visible)
+            if ($schedStart < $today) {
+                $hideProgram = true;
+            }
+        } catch (Exception $e) {
+            $hideProgram = false;
         }
     }
-} else {
-    $practical_has_all_scores = false;
-}
+    if ($hideProgram) continue;
 
-// If no scores yet, use existing assessment practical_score
-if ($practical_total == 0 && isset($existing_assessment['practical_score']) && $existing_assessment['practical_score'] > 0) {
-    $practical_total = $existing_assessment['practical_score'];
-}
+    $total_slots    = $availableRow['total_slots'] ?? $availableRow['slotsAvailable'] ?? 0;
+    $enrolled_count = $availableRow['enrolled_count'] ?? 0;
+    $available_slots = max(0, $total_slots - $enrolled_count);
 
-// Ensure practical_max_total is at least 100 for display consistency
-if ($practical_max_total == 0) {
-    $practical_max_total = 100;
-}
+    $availableRow['available_slots']      = $available_slots;
+    $availableRow['total_slots']          = $total_slots;
+    $availableRow['enrolled_count']       = $enrolled_count;
+    $availableRow['is_enrolled']          = false;
+    $availableRow['is_pending']           = false;
+    $availableRow['is_completed_status']  = false;
+    $availableRow['has_enrollment']       = false;
+    $availableRow['is_completed']         = false;
+    $availableRow['is_past_end_date']     = false;
+    $availableRow['show_certificate']     = false;
+    $availableRow['is_from_history']      = false;
+    $availableRow['is_archived']          = false;
+    $availableRow['archive_id']           = null;
+    $availableRow['has_feedback_value']   = false;
+    $availableRow['is_full']              = ($available_slots <= 0);
+    $availableRow['enrolled_user_id']     = null;
+    $availableRow['enrollment_percentage'] = ($total_slots > 0)
+        ? round(($enrolled_count / $total_slots) * 100, 1)
+        : 0;
 
-// Calculate oral max total from trainee questions
-$oral_max_from_trainee = 0;
-$oral_has_all_scores = true;
-$oral_calculated_score = 0;
-if (!empty($trainee_questions)) {
-    foreach ($trainee_questions as $q) {
-        $oral_max_from_trainee += intval($q['max_score'] ?? 0);
-        if ($q['score'] === null) {
-            $oral_has_all_scores = false;
-        } else {
-            $oral_calculated_score += floatval($q['score']);
+    $availablePrograms[] = $availableRow;
+}
+$stmtAvailable->close();
+
+
+// MERGE ALL PROGRAMS
+$programs = array_merge($enrolledPrograms, $archivedPrograms, $availablePrograms);
+
+// Split for template use
+$myPrograms            = array_filter($programs, fn($p) => isset($p['enrolled_user_id']) && $p['enrolled_user_id'] == $user_id);
+$availableOnlyPrograms = array_filter($programs, fn($p) => !isset($p['enrolled_user_id']) || $p['enrolled_user_id'] != $user_id);
+
+
+// FILTER TAB COUNTS
+$filter_counts = ['active' => 0, 'pending' => 0, 'completed' => 0];
+
+foreach ($programs as $program) {
+    if ($program['is_archived'] === true) {
+        // Completed tab = ONLY archived_history records
+        // AND only if feedback was actually submitted
+        // (no feedback = trainee never finished = don't count as completed)
+        if (!empty($program['has_feedback_value'])) {
+            $filter_counts['completed']++;
+        }
+    } elseif ($program['is_pending'] === true) {
+        $filter_counts['pending']++;
+    } elseif ($program['is_enrolled'] === true) {
+        // — Count as ACTIVE if:
+        //   a) enrollment_status = 'approved' (normal active), OR
+        //   b) enrollment_status = 'completed' BUT feedback not yet submitted
+        if ($program['is_completed'] === false && $program['is_archived'] !== true) {
+            $filter_counts['active']++;
         }
     }
 }
 
-$oral_max = $oral_max_from_trainee > 0 ? $oral_max_from_trainee : ($existing_assessment['oral_max_score'] ?? 100);
-$oral_score = $oral_calculated_score > 0 ? $oral_calculated_score : ($existing_assessment['oral_score'] ?? 0);
+// Default active filter tab: first non-zero tab
+$defaultFilter = 'active';
+if ($filter_counts['active'] > 0)         $defaultFilter = 'active';
+elseif ($filter_counts['pending'] > 0)    $defaultFilter = 'pending';
+elseif ($filter_counts['completed'] > 0)  $defaultFilter = 'completed';
 
-// Calculate totals for summary
-$project_score = $existing_assessment['project_score'] ?? 0;
+// NOTIFICATIONS
+$notifications    = [];
+$allNotifications = [];
 
-$total_score = $practical_total + $project_score + $oral_score;
-$total_max = $practical_max_total + 100 + $oral_max;
-$overall_percent = $total_max > 0 ? round(($total_score / $total_max) * 100, 1) : 0;
-$overall_result = $overall_percent >= 75 ? 'PASSED' : 'FAILED';
+$notifStmt = $conn->prepare("
+    SELECT id, title, message, is_read,
+           DATE_FORMAT(created_at, '%M %d, %Y at %h:%i %p') AS created_at
+    FROM notifications
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 50
+");
+$notifStmt->bind_param("i", $user_id);
+$notifStmt->execute();
+$notifResult = $notifStmt->get_result();
+while ($row = $notifResult->fetch_assoc()) {
+    $allNotifications[] = $row;
+    if (!$row['is_read']) {
+        $notifications[] = $row;
+    }
+}
+$notifStmt->close();
 
-// Get current tab from URL
-$current_tab = isset($_GET['tab']) ? $_GET['tab'] : 'practical';
-$removed_message = isset($_GET['removed']) ? 'All items removed permanently!' : '';
-$skill_removed_message = isset($_GET['skill_removed']) ? 'Skill removed successfully!' : '';
-$question_removed_message = isset($_GET['question_removed']) ? 'Question removed successfully!' : '';
-$saved_message = isset($_GET['saved']) ? 'Assessment saved successfully!' : '';
-$skills_saved_message = isset($_GET['skills_saved']) ? 'Trainee skills saved successfully!' : '';
-$questions_saved_message = isset($_GET['questions_saved']) ? 'Trainee questions saved successfully!' : '';
-$error_message = isset($_GET['error']) ? 'Error finalizing assessment. Please try again.' : '';
+// Debug helper (visible only in server error log)
+error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filter_counts['pending']}, Completed: {$filter_counts['completed']}");
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Comprehensive Assessment - <?php echo htmlspecialchars($enrollment['fullname'] ?? ''); ?></title>
+    <title>Trainee Dashboard - Livelihood Enrollment and Monitoring System</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 15px; margin-bottom: 30px; }
-        .header h1 { font-size: 28px; margin-bottom: 10px; }
-        
-        .alert-success { background: #d4edda; color: #155724; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        .alert-info { background: #cce5ff; color: #004085; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        .alert-warning { background: #fff3cd; color: #856404; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        .alert-danger { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        
-        .assessment-card { background: white; border-radius: 15px; padding: 25px; margin-bottom: 30px; border: 1px solid #e0e0e0; }
-        .card-title { font-size: 20px; font-weight: 600; color: #333; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #667eea; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-        
-        /* Toggle Switch */
-        .toggle-container { margin-left: auto; display: flex; align-items: center; gap: 10px; }
-        .toggle-switch { position: relative; display: inline-block; width: 60px; height: 30px; }
-        .toggle-switch input { opacity: 0; width: 0; height: 0; }
-        .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
-        .toggle-slider:before { position: absolute; content: ""; height: 22px; width: 22px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
-        input:checked + .toggle-slider { background-color: #28a745; }
-        input:checked + .toggle-slider:before { transform: translateX(30px); }
-        .toggle-label { font-size: 14px; color: #666; }
-        
-        /* Form Styles */
-        .form-group { margin-bottom: 20px; }
-        .form-label { display: block; margin-bottom: 8px; font-weight: 600; color: #555; }
-        .form-control { width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; }
-        .form-control:focus { border-color: #667eea; outline: none; }
-        .form-control[readonly] { background-color: #e9ecef; opacity: 1; }
-        
-        .row { display: flex; gap: 20px; flex-wrap: wrap; }
-        .col { flex: 1; min-width: 200px; }
-        
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .tab { padding: 12px 25px; background: white; border: 2px solid #e0e0e0; border-radius: 50px; cursor: pointer; font-weight: 600; }
-        .tab.active { background: #667eea; color: white; border-color: #667eea; }
-        
-        /* Buttons */
-        .add-btn { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 50px; cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
-        .add-btn:hover { background: #218838; }
-        .remove-btn { background: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
-        .remove-btn:hover { background: #c82333; }
-        .delete-btn { background: #dc3545; color: white; border: none; padding: 10px 20px; border-radius: 50px; cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
-        .delete-btn:hover { background: #c82333; }
-        .save-trainee-skills-btn { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 50px; cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
-        .save-trainee-skills-btn:hover { background: #218838; }
-        .save-trainee-questions-btn { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 50px; cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
-        .save-trainee-questions-btn:hover { background: #218838; }
-        .save-tab-btn { background: linear-gradient(135deg, #28a745, #20c997); color: white; border: none; padding: 12px 30px; border-radius: 50px; font-size: 16px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 10px; }
-        .submit-btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 15px 40px; font-size: 18px; font-weight: 600; border-radius: 50px; cursor: pointer; }
-        .print-btn { border-color: #6c757d; color: #6c757d; padding: 8px 20px; border-radius: 50px; font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.3s; }
-        .print-btn:hover { background: #6c757d; color: white; }
-        
-        /* Custom Skill Row */
-        .custom-skill-row { background: #f8f9fa; margin-bottom: 15px; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745; position: relative; }
-        .skill-id { display: none; }
-        
-        /* Input Labels */
-        .input-label { font-size: 12px; color: #666; margin-top: 4px; display: block; }
-        
-        /* Summary Cards */
-        .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .summary-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; text-align: center; }
-        .summary-card h3 { font-size: 16px; margin-bottom: 10px; opacity: 0.9; }
-        .summary-card .score { font-size: 36px; font-weight: 700; }
-        .summary-card .max-score { font-size: 14px; opacity: 0.8; }
-        .summary-card.passed { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); }
-        .summary-card.failed { background: linear-gradient(135deg, #dc3545 0%, #c82333 100%); }
-        
-        .back-btn { display: inline-block; padding: 10px 20px; background: white; color: #667eea; border: 2px solid #667eea; border-radius: 50px; text-decoration: none; font-weight: 600; margin-bottom: 20px; }
-        
-        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; background: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-        .info-item { display: flex; flex-direction: column; }
-        .info-label { font-size: 12px; color: #666; text-transform: uppercase; }
-        .info-value { font-size: 18px; font-weight: 600; color: #333; }
-        
-        .waiting-message { text-align: center; padding: 40px; background: #f8f9fa; border-radius: 10px; }
-        
-        .button-group { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
-        
-        .total-display { font-size: 24px; font-weight: 700; color: #667eea; text-align: right; margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 10px; }
-        
-        .trainee-section { background: #fff; padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 2px solid #28a745; }
-        .trainee-section h4 { color: #28a745; margin-bottom: 15px; }
-        
-        /* Visibility Status */
-        .visibility-status { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-left: 10px; }
-        .status-visible { background: #d4edda; color: #155724; }
-        .status-hidden { background: #f8d7da; color: #721c24; }
-        
-        /* Saved Status */
-        .saved-status { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-left: 10px; }
-        .status-saved { background: #d4edda; color: #155724; }
-        .status-unsaved { background: #fff3cd; color: #856404; }
-        
-        /* Oral answers display */
-        .oral-answer-card { background: #f3e8ff; padding: 15px; margin-bottom: 10px; border-left: 5px solid #8b5cf6; border-radius: 5px; }
-        
-        /* Modal */
-        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
-        .modal-content { background-color: white; margin: 10% auto; padding: 30px; border-radius: 15px; width: 80%; max-width: 500px; }
-        .close { float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
-        
-        /* Print Styles */
-        @media print {
-            .header, .tabs, .back-btn, .toggle-container, .submit-btn, 
-            .save-tab-btn, .print-btn, .modal, .add-btn, .remove-btn, .delete-btn, .button-group,
-            .save-trainee-skills-btn, .save-trainee-questions-btn {
-                display: none !important;
-            }
-            .assessment-card { box-shadow: none; border: 1px solid #ddd; }
-            .summary-card { break-inside: avoid; }
-        }
+    /* ---- Base Reset ---- */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Poppins', sans-serif; background-color: #f3f4f6; overflow-x: hidden; }
+    .flex { display: flex; } .flex-col { flex-direction: column; } .min-h-screen { min-height: 100vh; } .bg-gray-100 { background-color: #f3f4f6; }
+
+    /* ---- Header ---- */
+    .header-bar { background: #1c2a3a; color: white; display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; position: sticky; top: 0; z-index: 100; flex-wrap: nowrap; min-height: 60px; }
+    .header-left { display: flex; align-items: center; gap: 0.75rem; flex: 1; min-width: 0; }
+    .logo { width: 2.5rem; height: 2.5rem; background: #fff; border-radius: 5px; flex-shrink: 0; }
+    .system-name-container { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+    .system-name-full { font-weight: 600; font-size: 1.125rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .system-name-abbr { font-weight: 600; font-size: 1rem; display: none; white-space: nowrap; }
+    .mobile-menu-btn { display: none; background: none; border: none; color: white; font-size: 1.25rem; cursor: pointer; padding: 0.5rem; z-index: 1000; flex-shrink: 0; }
+    .header-right { display: flex; align-items: center; gap: 1rem; flex-shrink: 0; }
+
+    /* ---- Notifications ---- */
+    .notification-container { position: relative; }
+    .notification-btn { background: none; border: none; color: white; font-size: 1.25rem; cursor: pointer; position: relative; padding: 0.5rem; flex-shrink: 0; }
+    .notification-badge { position: absolute; top: 0; right: 0; background: #ef4444; color: white; border-radius: 50%; width: 1.25rem; height: 1.25rem; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; }
+    .notification-dropdown { position: absolute; right: 0; top: 100%; margin-top: 0.5rem; width: 20rem; background: white; color: black; border-radius: 0.5rem; box-shadow: 0 10px 25px rgba(0,0,0,.15); z-index: 50; max-height: 24rem; overflow: auto; display: none; }
+    .notification-header { padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb; font-weight: 600; position: relative; }
+    .notification-list { list-style: none; }
+    .notification-item { padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6; cursor: pointer; transition: 0.2s; position: relative; padding-right: 30px; }
+    .notification-item:hover { background: #f9fafb; }
+    .notification-item.unread { background: #f0f9ff; border-left: 3px solid #3b82f6; }
+    .notification-title { font-weight: 500; font-size: 0.875rem; margin-bottom: 0.25rem; }
+    .notification-message { font-size: 0.75rem; color: #6b7280; margin-bottom: 0.25rem; line-height: 1.4; }
+    .notification-time { font-size: 0.75rem; color: #9ca3af; }
+    .no-notifications { padding: 2rem 1rem; text-align: center; color: #6b7280; }
+    .mark-all-btn { position: absolute; right: 10px; top: 10px; background: #3b82f6; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+
+    /* ---- Profile Dropdown ---- */
+    .profile-container { position: relative; }
+    .profile-btn { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none; padding: 0.5rem; border-radius: 0.25rem; transition: 0.2s; flex-shrink: 0; max-width: 200px; }
+    .profile-btn:hover { background: rgba(255,255,255,.1); }
+    .profile-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+    .profile-dropdown { position: absolute; right: 0; top: 100%; margin-top: 0.5rem; width: 12rem; background: white; color: black; border-radius: 0.375rem; box-shadow: 0 4px 6px rgba(0,0,0,.1); z-index: 50; display: none; }
+    .profile-dropdown ul { list-style: none; }
+    .dropdown-item { width: 100%; text-align: left; padding: 0.5rem 1rem; background: none; border: none; cursor: pointer; transition: 0.2s; font-size: 0.875rem; }
+    .dropdown-item:hover { background: #e5e7eb; }
+    .logout-btn { color: #dc2626; }
+
+    /* ---- Layout ---- */
+    .body-container { display: flex; flex: 1; position: relative; }
+    .sidebar { width: 16rem; background: #1c2a3a; color: white; display: flex; flex-direction: column; padding: 1rem; gap: 0.5rem; transition: 0.3s; }
+    .sidebar-btn { padding: 0.75rem 1rem; border-radius: 0.25rem; border: none; text-align: left; background: #2b3b4c; color: white; cursor: pointer; transition: 0.3s; font-size: 0.875rem; }
+    .sidebar-btn:hover { background: #35485b; }
+    .sidebar-btn.active { background: #059669; }
+    .main-content { flex: 1; padding: 1.5rem; transition: 0.3s; }
+    .welcome-text { font-size: 1.5rem; font-weight: 600; margin-bottom: 1.5rem; }
+
+    /* ---- Search ---- */
+    .search-container { margin-bottom: 1.5rem; max-width: 500px; position: relative; }
+    .search-input { padding: 0.75rem 1rem; border-radius: 0.5rem; border: 1px solid #d1d5db; background: white; color: black; width: 100%; font-size: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .search-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(59,130,246,0.3); border-color: #3b82f6; }
+    .clear-search-btn { position: absolute; right: 0.75rem; top: 50%; transform: translateY(-50%); background: none; border: none; color: #6b7280; cursor: pointer; font-size: 1.125rem; }
+
+    /* ---- Filter Tabs ---- */
+    .filter-container { margin: 1.5rem 0; padding: 1rem; background: white; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .filter-label { font-weight: 600; color: #374151; margin-bottom: 0.75rem; font-size: 1rem; }
+    .filter-buttons { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .filter-btn { padding: 0.625rem 1.25rem; border-radius: 0.375rem; border: 2px solid #e5e7eb; background: white; color: #374151; font-size: 0.875rem; cursor: pointer; transition: all 0.3s ease; display: flex; align-items: center; gap: 0.25rem; font-weight: 500; min-height: 44px; }
+    .filter-btn:hover:not(:disabled) { background: #f3f4f6; border-color: #9ca3af; transform: translateY(-1px); }
+    .filter-btn.active { background: #3b82f6; color: white; border-color: #3b82f6; font-weight: 600; box-shadow: 0 2px 4px rgba(59,130,246,0.3); }
+    .filter-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ---- Program Sections ---- */
+    .programs-sections-wrapper { display: flex; flex-direction: column; gap: 2.5rem; }
+    .programs-section { background: white; border-radius: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow: hidden; }
+    .section-header { display: flex; align-items: center; justify-content: space-between; padding: 1.25rem 1.5rem; border-bottom: 2px solid #f3f4f6; gap: 1rem; flex-wrap: wrap; }
+    .section-header-left { display: flex; align-items: center; gap: 0.75rem; }
+    .section-icon { width: 2.5rem; height: 2.5rem; border-radius: 0.5rem; display: flex; align-items: center; justify-content: center; font-size: 1.125rem; color: white; flex-shrink: 0; }
+    .section-icon.available-icon { background: linear-gradient(135deg, #0ea5e9, #0284c7); }
+    .section-icon.available-icon.locked { background: linear-gradient(135deg, #9ca3af, #6b7280); }
+    .section-icon.my-programs-icon { background: linear-gradient(135deg, #10b981, #059669); }
+    .section-title { font-size: 1.125rem; font-weight: 700; color: #1c2a3a; }
+    .section-subtitle { font-size: 0.8rem; color: #6b7280; margin-top: 0.1rem; }
+    .section-count-badge { padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; flex-shrink: 0; }
+    .section-count-badge.available-badge { background: #e0f2fe; color: #0369a1; }
+    .section-count-badge.my-programs-badge { background: #d1fae5; color: #065f46; }
+    .section-body { padding: 1.25rem 1.5rem; }
+    .active-lock-banner { display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.875rem 1rem; background: #fef2f2; border: 1px solid #fecaca; border-radius: 0.5rem; margin-bottom: 1.25rem; color: #991b1b; font-size: 0.875rem; }
+
+    /* ---- Program Cards ---- */
+    .programs-list { display: flex; flex-direction: column; gap: 1rem; }
+    .program-card { border-radius: 0.75rem; padding: 1.25rem; transition: all 0.3s ease; background: #ffffff; border: 1px solid #e5e7eb; display: block; cursor: pointer; text-decoration: none; color: inherit; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 0.5rem; }
+    .program-card.enrolled-active { background: linear-gradient(to right, #dbeafe, #eff6ff); border-left: 6px solid #3b82f6; }
+    .program-card.pending { background: linear-gradient(to right, #fef3c7, #fffbeb); border-left: 6px solid #f59e0b; }
+    .program-card.completed { background: linear-gradient(to right, #d1fae5, #ecfdf5); border-left: 6px solid #10b981; }
+    .program-card.available { background: linear-gradient(to right, #f0f9ff, #ffffff); border-left: 6px solid #0ea5e9; }
+    .program-card.available.locked-card { background: #f3f4f6 !important; border-left: 6px solid #9ca3af !important; opacity: 0.6; cursor: not-allowed; pointer-events: none; }
+    .program-card.archived { background: linear-gradient(to right, #ede9fe, #f5f3ff); border-left: 6px solid #8b5cf6; }
+    .program-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem; }
+    .program-name { font-weight: 700; font-size: 1.125rem; color: #1c2a3a; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .full-badge { background: #ef4444; color: white; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; }
+    .new-badge { background: #0ea5e9; color: white; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; }
+    .status-badge { padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; font-weight: 600; }
+    .status-approved { background: #3b82f6; color: white; }
+    .status-pending { background: #f59e0b; color: white; }
+    .status-completed { background: #10b981; color: white; }
+    .status-available { background: #0ea5e9; color: white; }
+    .status-archived { background: #8b5cf6; color: white; }
+    .status-needs-feedback { background: #f97316; color: white; }
+    .needs-feedback-banner { background: #fff7ed; border-left: 4px solid #f97316; }
+    .program-card.enrolled-active.needs-feedback-card { border-left-color: #f97316; background: linear-gradient(to right, #fff7ed, #fffbf5); }
+    .program-details { font-size: 0.875rem; color: #4b5563; }
+    .program-details p { margin-bottom: 0.35rem; display: flex; flex-wrap: wrap; }
+    .program-details p b { min-width: 100px; color: #374151; }
+    .no-programs { text-align: center; color: #6b7280; font-size: 1rem; padding: 2.5rem 1.5rem; background: #f9fafb; border-radius: 0.75rem; border: 2px dashed #e5e7eb; }
+
+    /* ---- Enrollment Status Banners ---- */
+    .enrollment-status { margin-top: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 0.375rem; background: #f8fafc; border-left: 4px solid #3b82f6; }
+    .status-message { font-size: 0.875rem; color: #4b5563; font-weight: 500; display: flex; align-items: center; gap: 0.5rem; }
+    .completed-status { background: #d1fae5; border-left: 4px solid #10b981; }
+    .available-status { background: #e0f2fe; border-left: 4px solid #0ea5e9; }
+    .active-enrolled-status { background: #dbeafe; border-left: 4px solid #3b82f6; }
+    .pending-status { background: #fef3c7; border-left: 4px solid #f59e0b; }
+    .archived-status { background: #ede9fe; border-left: 4px solid #8b5cf6; }
+    .archive-badge { background: #8b5cf6; color: white; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; margin-left: 0.5rem; }
+    .feedback-rating { display: inline-flex; align-items: center; gap: 0.25rem; background: #fbbf24; color: #92400e; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+
+    /* ---- Modals ---- */
+    .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; overflow-y: auto; padding: 1rem; }
+    .modal-overlay.active { display: flex; }
+    .modal-container { background: white; border-radius: 1rem; max-width: 1000px; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25); }
+    .modal-header { background: linear-gradient(135deg, #8b5cf6, #6d28d9); color: white; padding: 1.5rem; border-top-left-radius: 1rem; border-top-right-radius: 1rem; display: flex; align-items: center; justify-content: space-between; }
+    .modal-header h2 { font-size: 1.5rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }
+    .modal-close { background: rgba(255,255,255,0.2); border: none; color: white; font-size: 1.5rem; cursor: pointer; width: 2.5rem; height: 2.5rem; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+    .modal-body { padding: 1.5rem; }
+    .modal-section { background: #f9fafb; border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1.5rem; border-left: 4px solid #8b5cf6; }
+    .modal-section h3 { font-size: 1.1rem; font-weight: 600; color: #1c2a3a; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+    .modal-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+    .modal-info-item { padding: 0.5rem; background: white; border-radius: 0.5rem; border: 1px solid #e5e7eb; }
+    .modal-info-item strong { display: block; font-size: 0.75rem; color: #6b7280; margin-bottom: 0.25rem; }
+    .modal-info-item span { font-size: 1rem; font-weight: 500; color: #1c2a3a; }
+    .rating-badge-large { display: inline-block; background: #fbbf24; color: #92400e; padding: 0.5rem 1rem; border-radius: 2rem; font-weight: 600; font-size: 1.125rem; }
+    .feedback-detail { background: white; border: 1px solid #e5e7eb; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; }
+    .feedback-rating-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+    .rating-category { text-align: center; padding: 0.75rem; background: #f3f4f6; border-radius: 0.5rem; }
+    .rating-stars { color: #fbbf24; margin-left: 0.25rem; }
+    .certificate-actions { display: flex; gap: 1rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap; }
+    .btn { padding: 0.75rem 1.5rem; border-radius: 0.5rem; border: none; font-weight: 500; cursor: pointer; transition: all 0.3s; display: inline-flex; align-items: center; gap: 0.5rem; }
+    .btn-primary { background: #0ea5e9; color: white; }
+    .btn-secondary { background: #8b5cf6; color: white; }
+
+    /* ---- Mobile ---- */
+    @media (max-width: 768px) {
+        .mobile-menu-btn { display: block !important; }
+        .system-name-full { display: none; }
+        .system-name-abbr { display: block; }
+        .sidebar { position: fixed; top: 0; left: -100%; width: 280px; height: 100vh; z-index: 999; transition: left 0.3s ease-in-out; }
+        .sidebar.mobile-open { left: 0; }
+        .main-content { width: 100%; padding: 1rem; }
+        .program-card { padding: 1rem; }
+        .program-details p b { min-width: 80px; }
+        .welcome-text { font-size: 1.25rem; }
+        .filter-container { padding: 0.75rem; }
+        .filter-buttons { width: 100%; }
+        .filter-btn { flex: 1; text-align: center; justify-content: center; }
+        .notification-dropdown { width: 280px; right: -30px; }
+        .profile-dropdown { width: 180px; }
+        .modal-grid { grid-template-columns: 1fr; }
+        .feedback-rating-grid { grid-template-columns: 1fr; }
+    }
     </style>
 </head>
 <body>
-    <div class="container">
-        <a href="trainer_participants.php" class="back-btn">
-            <i class="fas fa-arrow-left"></i> Back to Participants
-        </a>
-        
-        <div class="header">
-            <h1><i class="fas fa-clipboard-check"></i> Comprehensive Assessment</h1>
-            <div class="subtitle">
-                <strong>Trainee:</strong> <?php echo htmlspecialchars($enrollment['fullname'] ?? ''); ?> | 
-                <strong>Program:</strong> <?php echo htmlspecialchars($enrollment['program_name'] ?? ''); ?>
-            </div>
+<div class="flex flex-col min-h-screen bg-gray-100">
+
+<!--  HEADER: Logo, system name, notifications, profile -->
+<header class="header-bar">
+    <div class="header-left">
+        <img src="../css/logo2.jpg" class="logo" alt="Logo" draggable="false">
+        <div class="system-name-container">
+            <span class="system-name-full">Livelihood Enrollment &amp; Monitoring System</span>
+            <span class="system-name-abbr">LEMS</span>
         </div>
-        
-        <?php if ($removed_message): ?>
-            <div class="alert-danger"><?php echo $removed_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($skill_removed_message): ?>
-            <div class="alert-danger"><?php echo $skill_removed_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($question_removed_message): ?>
-            <div class="alert-danger"><?php echo $question_removed_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($saved_message): ?>
-            <div class="alert-success"><?php echo $saved_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($skills_saved_message): ?>
-            <div class="alert-success"><?php echo $skills_saved_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($questions_saved_message): ?>
-            <div class="alert-success"><?php echo $questions_saved_message; ?></div>
-        <?php endif; ?>
-        
-        <?php if ($error_message): ?>
-            <div class="alert-danger"><?php echo $error_message; ?></div>
-        <?php endif; ?>
-        
-        <div class="info-grid">
-            <div class="info-item"><span class="info-label">Full Name</span><span class="info-value"><?php echo htmlspecialchars($enrollment['fullname'] ?? ''); ?></span></div>
-            <div class="info-item"><span class="info-label">Contact</span><span class="info-value"><?php echo htmlspecialchars($enrollment['contact_number'] ?? ''); ?></span></div>
-            <div class="info-item"><span class="info-label">Email</span><span class="info-value"><?php echo htmlspecialchars($enrollment['email'] ?? ''); ?></span></div>
-            <div class="info-item">
-                <span class="info-label">Program</span>
-                <span class="info-value"><?php echo htmlspecialchars($enrollment['program_name'] ?? ''); ?></span>
-            </div>
-        </div>
-        
-        <!-- Tabs -->
-        <div class="tabs" id="tabs">
-            <div class="tab <?php echo $current_tab == 'practical' ? 'active' : ''; ?>" onclick="switchTab('practical')">1. Practical Skills</div>
-            <div class="tab <?php echo $current_tab == 'project' ? 'active' : ''; ?>" onclick="switchTab('project')">2. Project Output</div>
-            <div class="tab <?php echo $current_tab == 'oral' ? 'active' : ''; ?>" onclick="switchTab('oral')">3. Oral Assessment</div>
-            <div class="tab <?php echo $current_tab == 'summary' ? 'active' : ''; ?>" onclick="switchTab('summary')">4. Summary & Result</div>
-        </div>
-        
-        <!-- Hidden form for tab switching -->
-        <form id="switchTabForm" method="GET" style="display:none;">
-            <input type="hidden" name="enrollment_id" value="<?php echo $enrollment_id; ?>">
-            <input type="hidden" name="tab" id="tabInput" value="">
-        </form>
-        
-        <!-- Delete Confirmation Modal -->
-        <div id="deleteModal" class="modal">
-            <div class="modal-content">
-                <span class="close" onclick="closeDeleteModal()">&times;</span>
-                <h3>Confirm Permanent Deletion</h3>
-                <p id="deleteModalMessage"></p>
-                <input type="hidden" id="deleteType">
-                <input type="hidden" id="deleteEnrollmentId" value="<?php echo $enrollment_id; ?>">
-                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
-                    <button class="reset-btn" onclick="closeDeleteModal()">Cancel</button>
-                    <button class="delete-btn" onclick="confirmDelete()">Yes, Delete Permanently</button>
-                </div>
-            </div>
-        </div>
-        
-        <!-- TAB 1: PRACTICAL SKILLS -->
-        <div class="assessment-card" id="tab-practical" style="display: <?php echo $current_tab == 'practical' ? 'block' : 'none'; ?>;">
-            <div class="card-title">
-                <i class="fas fa-utensils"></i> Practical Skills Assessment (Trainee-Selective)
-                <span style="margin-left: auto; background: #667eea; color: white; padding: 5px 15px; border-radius: 20px;">
-                    Total: <span id="practicalTotal"><?php echo $practical_total; ?></span>/<span id="practicalMaxTotal"><?php echo $practical_max_total; ?></span>
-                </span>
-                <?php if ($existing_assessment['practical_skills_saved'] ?? 0): ?>
-                    <span class="saved-status status-saved"><i class="fas fa-check-circle"></i> Skills Saved</span>
-                <?php else: ?>
-                    <span class="saved-status status-unsaved"><i class="fas fa-exclamation-triangle"></i> Skills Not Saved</span>
+        <button id="mobileMenuBtn" class="mobile-menu-btn"><i class="fas fa-bars"></i></button>
+    </div>
+    <div class="header-right">
+        <!-- Notification Bell -->
+        <div class="notification-container">
+            <button id="notificationBtn" class="notification-btn">
+                <i class="fas fa-bell"></i>
+                <?php if (count($notifications) > 0): ?>
+                    <span class="notification-badge"><?php echo count($notifications); ?></span>
                 <?php endif; ?>
-            </div>
-            
-            <div class="alert-info">
-                <i class="fas fa-info-circle"></i> Create selective practical skills for this specific trainee. Add, remove, or modify skills as needed.
-            </div>
-            
-            <!-- Trainee's Selective Skills Section -->
-            <div class="trainee-section">
-                <h4><i class="fas fa-user"></i> This Trainee's Selective Skills</h4>
-                
-                <div class="button-group">
-                    <button type="button" class="delete-btn" onclick="openDeleteModal('practical')">
-                        <i class="fas fa-trash"></i> Delete All Skills Permanently
-                    </button>
+            </button>
+            <div id="notificationDropdown" class="notification-dropdown">
+                <div class="notification-header">
+                    Notifications
+                    <?php if (count($notifications) > 0): ?>
+                        <button class="mark-all-btn" onclick="markAllAsRead()">
+                            <i class="fas fa-check-double"></i> Mark all read
+                        </button>
+                    <?php endif; ?>
                 </div>
-                
-                <p style="margin-bottom: 15px; color: #28a745;"><i class="fas fa-info-circle"></i> Create and manage selective skills for this trainee. These skills are specific to this trainee only.</p>
-                
-                <!-- Trainee's Skills Container -->
-                <div id="trainee-skills-container">
-                    <?php if (!empty($trainee_skills)): ?>
-                        <?php foreach ($trainee_skills as $index => $skill): ?>
-                        <div class="custom-skill-row" data-skill-id="<?php echo $skill['id']; ?>">
-                            <div style="display: flex; gap: 20px; align-items: center;">
-                                <div style="flex: 2;">
-                                    <input type="text" class="form-control trainee-skill-name" value="<?php echo htmlspecialchars($skill['skill_name']); ?>">
-                                    <span class="input-label">Skill name</span>
-                                </div>
-                                <div style="flex: 1;">
-                                    <input type="number" class="form-control trainee-skill-max" value="<?php echo $skill['max_score']; ?>" min="1" max="100">
-                                    <span class="input-label">Max score</span>
-                                </div>
-                                <div style="flex: 1;">
-                                    <input type="number" class="form-control trainee-skill-score" value="<?php echo $skill['score'] !== null ? $skill['score'] : ''; ?>" min="0" max="<?php echo $skill['max_score']; ?>" placeholder="Enter score" onchange="updatePracticalTotal()">
-                                    <span class="input-label">Score obtained</span>
-                                </div>
-                                <div style="flex: 0.5;">
-                                    <?php if ($skill['score'] !== null): ?>
-                                        <?php if ($skill['score'] >= ($skill['max_score'] * 0.75)): ?>
-                                            <span style="color: #28a745;"><i class="fas fa-check-circle"></i> Pass</span>
-                                        <?php else: ?>
-                                            <span style="color: #dc3545;"><i class="fas fa-times-circle"></i> Fail</span>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
+                <ul class="notification-list" id="notificationList">
+                    <?php if (count($allNotifications) > 0): ?>
+                        <?php foreach ($allNotifications as $notif): ?>
+                            <li class="notification-item <?php echo !$notif['is_read'] ? 'unread' : ''; ?>"
+                                data-id="<?php echo $notif['id']; ?>"
+                                data-read="<?php echo $notif['is_read'] ? 'true' : 'false'; ?>">
+                                <div class="notification-title">
+                                    <?php echo htmlspecialchars($notif['title']); ?>
+                                    <?php if (!$notif['is_read']): ?>
+                                        <span class="new-badge">NEW</span>
                                     <?php endif; ?>
                                 </div>
-                                <div style="flex: 0.3;">
-                                    <button type="button" class="remove-btn" onclick="removeSingleSkill(<?php echo $skill['id']; ?>)">
-                                        <i class="fas fa-trash"></i>
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
+                                <div class="notification-message"><?php echo htmlspecialchars($notif['message']); ?></div>
+                                <div class="notification-time"><?php echo $notif['created_at']; ?></div>
+                            </li>
                         <?php endforeach; ?>
                     <?php else: ?>
-                    <div class="waiting-message">
-                        <i class="fas fa-info-circle"></i> No skills created for this trainee yet. Add new skills below to create a selective assessment for this trainee.
-                    </div>
+                        <li class="no-notifications">No notifications</li>
                     <?php endif; ?>
-                </div>
-                
-                <div style="margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button type="button" class="add-btn" onclick="addTraineeSkill()">
-                        <i class="fas fa-plus"></i> Add Skill for This Trainee
-                    </button>
-                    <button type="button" class="save-trainee-skills-btn" onclick="saveTraineeSkills()">
-                        <i class="fas fa-save"></i> Save Trainee's Skills
-                    </button>
-                </div>
-                
-                <div class="form-group" style="margin-top: 20px;">
-                    <label class="form-label">Notes / Observations:</label>
-                    <textarea id="practical_notes" class="form-control" rows="3" placeholder="Add any observations..."><?php echo htmlspecialchars($existing_assessment['practical_notes'] ?? ''); ?></textarea>
-                </div>
-                
-                <div class="total-display" id="practicalTotalDisplay">
-                    <?php if (!empty($trainee_skills)): ?>
-                        <?php if ($practical_has_all_scores): ?>
-                            <?php 
-                            $practical_pass_threshold = $practical_max_total * 0.75;
-                            if ($practical_total >= $practical_pass_threshold): 
-                            ?>
-                                Total Practical Score: <span id="practicalTotalValue"><?php echo $practical_total; ?></span>/<span id="practicalMaxTotalValue"><?php echo $practical_max_total; ?></span> 
-                                <span style="color: #28a745; margin-left: 10px;"><i class="fas fa-check-circle"></i> PASSED</span>
-                            <?php else: ?>
-                                Total Practical Score: <span id="practicalTotalValue"><?php echo $practical_total; ?></span>/<span id="practicalMaxTotalValue"><?php echo $practical_max_total; ?></span> 
-                                <span style="color: #dc3545; margin-left: 10px;"><i class="fas fa-times-circle"></i> FAILED</span>
-                            <?php endif; ?>
-                        <?php else: ?>
-                            Total Practical Score: <span id="practicalTotalValue"><?php echo $practical_total; ?></span>/<span id="practicalMaxTotalValue"><?php echo $practical_max_total; ?></span> 
-                            <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> INCOMPLETE</span>
-                        <?php endif; ?>
-                    <?php else: ?>
-                        Total Practical Score: <span id="practicalTotalValue">0</span>/<span id="practicalMaxTotalValue">100</span> 
-                        <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> NO SKILLS</span>
-                    <?php endif; ?>
-                </div>
-            </div>
-            
-            <div style="text-align: center; margin-top: 30px;">
-                <button type="button" class="save-tab-btn" onclick="savePracticalTab()">
-                    <i class="fas fa-save"></i> Save Scores & Finalize Practical
-                </button>
+                </ul>
             </div>
         </div>
-        
-        <!-- TAB 2: PROJECT OUTPUT -->
-        <div class="assessment-card" id="tab-project" style="display: <?php echo $current_tab == 'project' ? 'block' : 'none'; ?>;">
-            <div class="card-title">
-                <i class="fas fa-project-diagram"></i> Project Output (100 pts)
-                <div class="toggle-container">
-                    <span class="toggle-label">Show to Trainee:</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" 
-                               onchange="toggleVisibility('project', <?php echo $enrollment_id; ?>, this)"
-                               <?php echo ($existing_assessment['project_visible_to_trainee'] ?? 0) ? 'checked' : ''; ?>>
-                        <span class="toggle-slider"></span>
-                    </label>
-                    <?php if ($existing_assessment['project_visible_to_trainee'] ?? 0): ?>
-                        <span class="visibility-status status-visible"><i class="fas fa-eye"></i> Visible to trainee</span>
-                    <?php else: ?>
-                        <span class="visibility-status status-hidden"><i class="fas fa-eye-slash"></i> Hidden from trainee</span>
-                    <?php endif; ?>
-                </div>
+
+        <!-- Profile Dropdown -->
+        <div class="profile-container">
+            <div id="profileBtn" class="profile-btn">
+                <i class="fas fa-user-circle"></i>
+                <span class="profile-text"><?php echo htmlspecialchars($username); ?> ▾</span>
             </div>
-            
-            <?php if (!empty($existing_assessment['project_submitted_by_trainee'])): ?>
-                <div style="background: #e8f5e9; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-                    <h4><i class="fas fa-check-circle" style="color: #28a745;"></i> Trainee's Submission</h4>
-                    <p><strong>Title:</strong> <?php echo htmlspecialchars($existing_assessment['project_title'] ?? ''); ?></p>
-                    <p><strong>Description:</strong> <?php echo nl2br(htmlspecialchars($existing_assessment['project_description'] ?? '')); ?></p>
-                    <?php if (!empty($existing_assessment['project_photo_path'])): ?>
-                        <img src="/<?php echo $existing_assessment['project_photo_path']; ?>" style="max-width: 100%; max-height: 300px; border-radius: 8px;">
-                    <?php endif; ?>
-                </div>
-            <?php else: ?>
-                <div class="waiting-message">
-                    <i class="fas fa-clock"></i>
-                    <h3>Waiting for Trainee Submission</h3>
-                </div>
-            <?php endif; ?>
-            
-            <div style="margin-top: 20px;">
-                <h4>Trainer's Evaluation</h4>
-                <div class="row">
-                    <div class="col">
-                        <label class="form-label">Project Score (0-100):</label>
-                        <input type="number" id="project_score" class="form-control" value="<?php echo $existing_assessment['project_score'] ?? ''; ?>">
-                        <span class="input-label">Score obtained by trainee</span>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Feedback:</label>
-                    <textarea id="project_notes" class="form-control" rows="3" placeholder="Add feedback..."><?php echo htmlspecialchars($existing_assessment['project_notes'] ?? ''); ?></textarea>
-                </div>
-            </div>
-            
-            <div class="total-display">
-                Project Score: <?php echo $project_score; ?>/100
-                <?php if ($project_score >= 75): ?>
-                    <span style="color: #28a745; margin-left: 10px;"><i class="fas fa-check-circle"></i> PASSED</span>
-                <?php else: ?>
-                    <span style="color: #dc3545; margin-left: 10px;"><i class="fas fa-times-circle"></i> FAILED</span>
-                <?php endif; ?>
-            </div>
-            
-            <div style="text-align: center; margin-top: 30px;">
-                <button type="button" class="save-tab-btn" onclick="saveProjectTab()">
-                    <i class="fas fa-save"></i> Save Project Evaluation
-                </button>
-            </div>
-        </div>
-        
-        <!-- TAB 3: ORAL ASSESSMENT -->
-        <div class="assessment-card" id="tab-oral" style="display: <?php echo $current_tab == 'oral' ? 'block' : 'none'; ?>;">
-            <div class="card-title">
-                <i class="fas fa-question-circle"></i> Oral Assessment (Trainee-Selective)
-                <?php if ($existing_assessment['oral_questions_saved'] ?? 0): ?>
-                    <span class="saved-status status-saved"><i class="fas fa-check-circle"></i> Questions Saved</span>
-                <?php else: ?>
-                    <span class="saved-status status-unsaved"><i class="fas fa-exclamation-triangle"></i> Questions Not Saved</span>
-                <?php endif; ?>
-                <div class="toggle-container">
-                    <span class="toggle-label">Show to Trainee:</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" 
-                               onchange="toggleVisibility('oral', <?php echo $enrollment_id; ?>, this)"
-                               <?php echo ($existing_assessment['oral_questions_visible_to_trainee'] ?? 0) ? 'checked' : ''; ?>>
-                        <span class="toggle-slider"></span>
-                    </label>
-                    <?php if ($existing_assessment['oral_questions_visible_to_trainee'] ?? 0): ?>
-                        <span class="visibility-status status-visible"><i class="fas fa-eye"></i> Visible to trainee</span>
-                    <?php else: ?>
-                        <span class="visibility-status status-hidden"><i class="fas fa-eye-slash"></i> Hidden from trainee</span>
-                    <?php endif; ?>
-                </div>
-            </div>
-            
-            <div class="alert-info">
-                <i class="fas fa-info-circle"></i> Create selective oral questions for this specific trainee. Add, remove, or modify questions as needed.
-            </div>
-            
-            <!-- Trainee's Selective Questions Section -->
-            <div class="trainee-section">
-                <h4><i class="fas fa-user"></i> This Trainee's Selective Questions</h4>
-                
-                <div class="button-group">
-                    <button type="button" class="delete-btn" onclick="openDeleteModal('oral')">
-                        <i class="fas fa-trash"></i> Delete All Questions Permanently
-                    </button>
-                </div>
-                
-                <p style="margin-bottom: 15px; color: #28a745;"><i class="fas fa-info-circle"></i> Create and manage selective questions for this trainee. These questions are specific to this trainee only.</p>
-                
-                <div class="form-group">
-                    <label class="form-label">Total Oral Maximum Score: <span id="oralMaxTotal"><?php echo $oral_max; ?></span></label>
-                    <input type="hidden" id="oral_max_score" value="<?php echo $oral_max; ?>">
-                </div>
-                
-                <!-- Trainee's Questions Container -->
-                <div id="trainee-questions-container">
-                    <?php if (!empty($trainee_questions)): ?>
-                        <?php foreach ($trainee_questions as $index => $q): ?>
-                        <div class="custom-skill-row" data-question-id="<?php echo $q['id']; ?>">
-                            <div style="display: flex; gap: 20px; align-items: center;">
-                                <div style="flex: 2;">
-                                    <input type="text" class="form-control trainee-question" value="<?php echo htmlspecialchars($q['question']); ?>">
-                                    <span class="input-label">Question</span>
-                                </div>
-                                <div style="flex: 1;">
-                                    <input type="number" class="form-control trainee-question-max" value="<?php echo $q['max_score']; ?>" min="1" max="100" onchange="updateOralTotal()">
-                                    <span class="input-label">Max score</span>
-                                </div>
-                                <div style="flex: 1;">
-                                    <input type="number" class="form-control trainee-question-score" value="<?php echo $q['score'] !== null ? $q['score'] : ''; ?>" min="0" max="<?php echo $q['max_score']; ?>" placeholder="Enter score" onchange="updateOralTotal()">
-                                    <span class="input-label">Score obtained</span>
-                                </div>
-                                <div style="flex: 0.5;">
-                                    <?php if ($q['score'] !== null): ?>
-                                        <?php if ($q['score'] >= ($q['max_score'] * 0.75)): ?>
-                                            <span style="color: #28a745;"><i class="fas fa-check-circle"></i> Pass</span>
-                                        <?php else: ?>
-                                            <span style="color: #dc3545;"><i class="fas fa-times-circle"></i> Fail</span>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
-                                    <?php endif; ?>
-                                </div>
-                                <div style="flex: 0.3;">
-                                    <button type="button" class="remove-btn" onclick="removeSingleQuestion(<?php echo $q['id']; ?>)">
-                                        <i class="fas fa-trash"></i>
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                        <?php endforeach; ?>
-                    <?php else: ?>
-                    <div class="waiting-message">
-                        <i class="fas fa-info-circle"></i> No questions created for this trainee yet. Add new questions below to create a selective oral assessment for this trainee.
-                    </div>
-                    <?php endif; ?>
-                </div>
-                
-                <div style="margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button type="button" class="add-btn" onclick="addTraineeQuestion()">
-                        <i class="fas fa-plus"></i> Add Question for This Trainee
-                    </button>
-                    <button type="button" class="save-trainee-questions-btn" onclick="saveTraineeQuestions()">
-                        <i class="fas fa-save"></i> Save Trainee's Questions
-                    </button>
-                </div>
-            </div>
-            
-            <!-- Trainee's Answers Section -->
-            <?php 
-            $trainee_answers = [];
-            if (!empty($trainee_questions)) {
-                foreach ($trainee_questions as $q) {
-                    if (!empty($q['answer'])) {
-                        $trainee_answers[] = $q['answer'];
-                    }
-                }
-            }
-            ?>
-            
-            <?php if (!empty($trainee_answers)): ?>
-            <div style="margin-top: 30px;">
-                <h4><i class="fas fa-comment"></i> Trainee's Answers</h4>
-                <?php foreach ($trainee_questions as $index => $q): ?>
-                    <?php if (!empty($q['answer'])): ?>
-                    <div class="oral-answer-card">
-                        <h5>Q<?php echo $index + 1; ?>: <?php echo htmlspecialchars($q['question']); ?> (<?php echo $q['max_score']; ?> pts)</h5>
-                        <p><strong>Answer:</strong> <?php echo nl2br(htmlspecialchars($q['answer'])); ?></p>
-                    </div>
-                    <?php endif; ?>
-                <?php endforeach; ?>
-            </div>
-            <?php endif; ?>
-            
-            <!-- Trainer's Evaluation -->
-            <div style="margin-top: 20px;">
-                <h4>Trainer's Evaluation</h4>
-                <div class="row">
-                    <div class="col">
-                        <label class="form-label">Oral Score (0-<?php echo $oral_max; ?>):</label>
-                        <input type="number" id="oral_score" class="form-control" value="<?php echo $oral_score; ?>" onchange="updateOralTotal()">
-                        <span class="input-label">Total score for all answers</span>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Feedback:</label>
-                    <textarea id="oral_notes" class="form-control" rows="3" placeholder="Add feedback..."><?php echo htmlspecialchars($existing_assessment['oral_notes'] ?? ''); ?></textarea>
-                </div>
-            </div>
-            
-            <div class="total-display" id="oralTotalDisplay">
-                <?php if (!empty($trainee_questions)): ?>
-                    Oral Score: <span id="oralScoreValue"><?php echo $oral_score; ?></span>/<?php echo $oral_max; ?>
-                    <?php if ($oral_has_all_scores): ?>
-                        <?php if ($oral_score >= ($oral_max * 0.75)): ?>
-                            <span style="color: #28a745; margin-left: 10px;"><i class="fas fa-check-circle"></i> PASSED</span>
-                        <?php else: ?>
-                            <span style="color: #dc3545; margin-left: 10px;"><i class="fas fa-times-circle"></i> FAILED</span>
-                        <?php endif; ?>
-                    <?php else: ?>
-                        <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> INCOMPLETE</span>
-                    <?php endif; ?>
-                <?php else: ?>
-                    Oral Score: <span id="oralScoreValue">0</span>/<?php echo $oral_max; ?>
-                    <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> NO QUESTIONS</span>
-                <?php endif; ?>
-            </div>
-            
-            <div style="text-align: center; margin-top: 30px;">
-                <button type="button" class="save-tab-btn" onclick="saveOralTab()">
-                    <i class="fas fa-save"></i> Save Scores & Finalize Oral
-                </button>
-            </div>
-        </div>
-        
-        <!-- TAB 4: SUMMARY -->
-        <div class="assessment-card" id="tab-summary" style="display: <?php echo $current_tab == 'summary' ? 'block' : 'none'; ?>;">
-            <div class="card-title">
-                <i class="fas fa-table"></i> Assessment Summary - <?php echo htmlspecialchars($enrollment['fullname'] ?? ''); ?>
-                <div style="margin-left: auto; display: flex; gap: 10px;">
-                    <button class="print-btn" onclick="window.print()">
-                        <i class="fas fa-print"></i> Print
-                    </button>
-                </div>
-            </div>
-            
-            <!-- Summary Cards -->
-            <div class="summary-cards">
-                <div class="summary-card">
-                    <h3>Practical Skills</h3>
-                    <div class="score"><?php echo $practical_total; ?></div>
-                    <div class="max-score">out of <?php echo $practical_max_total; ?></div>
-                    <?php if (empty($trainee_skills)): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">NO SKILLS</div>
-                    <?php elseif (!$practical_has_all_scores): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">INCOMPLETE</div>
-                    <?php elseif ($practical_total >= ($practical_max_total * 0.75)): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">PASSED</div>
-                    <?php else: ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">FAILED</div>
-                    <?php endif; ?>
-                </div>
-                
-                <div class="summary-card">
-                    <h3>Project Output</h3>
-                    <div class="score"><?php echo $project_score; ?></div>
-                    <div class="max-score">out of 100</div>
-                    <?php if ($project_score >= 75): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">PASSED</div>
-                    <?php else: ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">FAILED</div>
-                    <?php endif; ?>
-                </div>
-                
-                <div class="summary-card">
-                    <h3>Oral Examination</h3>
-                    <div class="score"><?php echo $oral_score; ?></div>
-                    <div class="max-score">out of <?php echo $oral_max; ?></div>
-                    <?php if (empty($trainee_questions)): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">NO QUESTIONS</div>
-                    <?php elseif (!$oral_has_all_scores): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">INCOMPLETE</div>
-                    <?php elseif ($oral_score >= ($oral_max * 0.75)): ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">PASSED</div>
-                    <?php else: ?>
-                        <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px;">FAILED</div>
-                    <?php endif; ?>
-                </div>
-                
-                <div class="summary-card <?php echo $overall_result == 'PASSED' ? 'passed' : 'failed'; ?>">
-                    <h3>Overall Result</h3>
-                    <div class="score"><?php echo $overall_percent; ?>%</div>
-                    <div class="max-score">Total: <?php echo $total_score; ?>/<?php echo $total_max; ?></div>
-                    <div style="margin-top: 10px; background: rgba(255,255,255,0.2); padding: 5px; border-radius: 20px; font-size: 20px;"><?php echo $overall_result; ?></div>
-                </div>
-            </div>
-            
-            <!-- Detailed Assessment Breakdown -->
-            <div style="margin-top: 30px;">
-                <h3><i class="fas fa-clipboard-list"></i> Detailed Assessment Breakdown</h3>
-                
-                <!-- Practical Skills Breakdown -->
-                <?php if (!empty($trainee_skills)): ?>
-                <div style="margin-top: 20px; background: #f8f9fa; padding: 20px; border-radius: 10px;">
-                    <h4 style="color: #667eea; margin-bottom: 15px;">Practical Skills (Trainee-Selective)</h4>
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <thead>
-                            <tr style="background: #e9ecef;">
-                                <th style="padding: 10px; text-align: left; border: 1px solid #dee2e6;">Skill</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Max Score</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Score Obtained</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php 
-                            $practical_details_total = 0;
-                            $practical_details_max = 0;
-                            foreach ($trainee_skills as $skill):
-                                $practical_details_total += $skill['score'] ?? 0;
-                                $practical_details_max += $skill['max_score'];
-                                
-                                $passed = ($skill['score'] ?? 0) >= ($skill['max_score'] * 0.75);
-                            ?>
-                            <tr>
-                                <td style="padding: 8px 10px; border: 1px solid #dee2e6;"><?php echo htmlspecialchars($skill['skill_name']); ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $skill['max_score']; ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $skill['score'] ?? '—'; ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;">
-                                    <?php if ($skill['score'] === null): ?>
-                                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
-                                    <?php elseif ($passed): ?>
-                                        <span style="color: #28a745;"><i class="fas fa-check-circle"></i> Pass</span>
-                                    <?php else: ?>
-                                        <span style="color: #dc3545;"><i class="fas fa-times-circle"></i> Fail</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                            <?php endforeach; ?>
-                            <tr style="background: #e9ecef; font-weight: bold;">
-                                <td style="padding: 10px; border: 1px solid #dee2e6;" colspan="2">Total</td>
-                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $practical_details_total; ?>/<?php echo $practical_details_max; ?></td>
-                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                    <?php if ($practical_has_all_scores): ?>
-                                        <?php if ($practical_details_total >= ($practical_details_max * 0.75)): ?>
-                                            <span style="color: #28a745;">PASSED</span>
-                                        <?php else: ?>
-                                            <span style="color: #dc3545;">FAILED</span>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color: #ffc107;">INCOMPLETE</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                    <?php if (!empty($existing_assessment['practical_notes'])): ?>
-                        <div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; border-radius: 5px;">
-                            <strong>Notes:</strong> <?php echo nl2br(htmlspecialchars($existing_assessment['practical_notes'])); ?>
-                        </div>
-                    <?php endif; ?>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Project Breakdown -->
-                <?php if (!empty($existing_assessment['project_submitted_by_trainee'])): ?>
-                <div style="margin-top: 20px; background: #f8f9fa; padding: 20px; border-radius: 10px;">
-                    <h4 style="color: #28a745; margin-bottom: 15px;">Project Output</h4>
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <tr>
-                            <th style="padding: 10px; text-align: left; background: #e9ecef; border: 1px solid #dee2e6; width: 30%;">Project Title</th>
-                            <td style="padding: 10px; border: 1px solid #dee2e6;"><?php echo htmlspecialchars($existing_assessment['project_title'] ?? ''); ?></td>
-                        </tr>
-                        <tr>
-                            <th style="padding: 10px; text-align: left; background: #e9ecef; border: 1px solid #dee2e6;">Description</th>
-                            <td style="padding: 10px; border: 1px solid #dee2e6;"><?php echo nl2br(htmlspecialchars($existing_assessment['project_description'] ?? '')); ?></td>
-                        </tr>
-                        <tr>
-                            <th style="padding: 10px; text-align: left; background: #e9ecef; border: 1px solid #dee2e6;">Score</th>
-                            <td style="padding: 10px; border: 1px solid #dee2e6;">
-                                <strong><?php echo $project_score; ?>/100</strong>
-                                <?php if ($project_score >= 75): ?>
-                                    <span style="color: #28a745; margin-left: 10px;">(PASSED)</span>
-                                <?php else: ?>
-                                    <span style="color: #dc3545; margin-left: 10px;">(FAILED)</span>
-                                <?php endif; ?>
-                            </td>
-                        </tr>
-                        <?php if (!empty($existing_assessment['project_notes'])): ?>
-                        <tr>
-                            <th style="padding: 10px; text-align: left; background: #e9ecef; border: 1px solid #dee2e6;">Feedback</th>
-                            <td style="padding: 10px; border: 1px solid #dee2e6;"><?php echo nl2br(htmlspecialchars($existing_assessment['project_notes'])); ?></td>
-                        </tr>
-                        <?php endif; ?>
-                    </table>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Oral Assessment Breakdown -->
-                <?php if (!empty($trainee_questions)): ?>
-                <div style="margin-top: 20px; background: #f8f9fa; padding: 20px; border-radius: 10px;">
-                    <h4 style="color: #8b5cf6; margin-bottom: 15px;">Oral Assessment (Trainee-Selective)</h4>
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <thead>
-                            <tr style="background: #e9ecef;">
-                                <th style="padding: 10px; text-align: left; border: 1px solid #dee2e6;">#</th>
-                                <th style="padding: 10px; text-align: left; border: 1px solid #dee2e6;">Question</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Max Score</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Score</th>
-                                <th style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php 
-                            $oral_details_total = 0;
-                            $oral_details_max = 0;
-                            foreach ($trainee_questions as $index => $q):
-                                $oral_details_max += $q['max_score'];
-                                $oral_details_total += $q['score'] ?? 0;
-                                $passed = ($q['score'] ?? 0) >= ($q['max_score'] * 0.75);
-                            ?>
-                            <tr>
-                                <td style="padding: 8px 10px; border: 1px solid #dee2e6;"><?php echo $index + 1; ?></td>
-                                <td style="padding: 8px 10px; border: 1px solid #dee2e6;"><?php echo htmlspecialchars($q['question']); ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $q['max_score']; ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $q['score'] ?? '—'; ?></td>
-                                <td style="padding: 8px 10px; text-align: center; border: 1px solid #dee2e6;">
-                                    <?php if ($q['score'] === null): ?>
-                                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
-                                    <?php elseif ($passed): ?>
-                                        <span style="color: #28a745;"><i class="fas fa-check-circle"></i> Pass</span>
-                                    <?php else: ?>
-                                        <span style="color: #dc3545;"><i class="fas fa-times-circle"></i> Fail</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                            <?php if (!empty($q['answer'])): ?>
-                            <tr style="background: #f3e8ff;">
-                                <td colspan="5" style="padding: 8px 10px; border: 1px solid #dee2e6;">
-                                    <strong>Answer:</strong> <?php echo nl2br(htmlspecialchars($q['answer'])); ?>
-                                </td>
-                            </tr>
-                            <?php endif; ?>
-                            <?php endforeach; ?>
-                            <tr style="background: #e9ecef; font-weight: bold;">
-                                <td style="padding: 10px; border: 1px solid #dee2e6;" colspan="3">Total</td>
-                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;"><?php echo $oral_details_total; ?>/<?php echo $oral_details_max; ?></td>
-                                <td style="padding: 10px; text-align: center; border: 1px solid #dee2e6;">
-                                    <?php if ($oral_has_all_scores): ?>
-                                        <?php if ($oral_details_total >= ($oral_details_max * 0.75)): ?>
-                                            <span style="color: #28a745;">PASSED</span>
-                                        <?php else: ?>
-                                            <span style="color: #dc3545;">FAILED</span>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color: #ffc107;">INCOMPLETE</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                    
-                    <?php if (!empty($existing_assessment['oral_notes'])): ?>
-                        <div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; border-radius: 5px;">
-                            <strong>Feedback:</strong> <?php echo nl2br(htmlspecialchars($existing_assessment['oral_notes'])); ?>
-                        </div>
-                    <?php endif; ?>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Assessment Summary -->
-                <div style="margin-top: 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 25px; border-radius: 15px;">
-                    <h3 style="margin-bottom: 20px;">Assessment Summary</h3>
-                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px;">
-                        <div>
-                            <strong>Trainee:</strong> <?php echo htmlspecialchars($enrollment['fullname'] ?? ''); ?>
-                        </div>
-                        <div>
-                            <strong>Program:</strong> <?php echo htmlspecialchars($enrollment['program_name'] ?? ''); ?>
-                        </div>
-                        <div>
-                            <strong>Date Assessed:</strong> <?php echo date('F d, Y'); ?>
-                        </div>
-                        <div>
-                            <strong>Assessed By:</strong> <?php echo htmlspecialchars($fullname); ?>
-                        </div>
-                    </div>
-                    <div style="margin-top: 20px; padding-top: 20px; border-top: 2px solid rgba(255,255,255,0.3); text-align: center;">
-                        <div style="font-size: 48px; font-weight: bold;"><?php echo $overall_percent; ?>%</div>
-                        <div style="font-size: 24px; margin-top: 10px;"><?php echo $overall_result; ?></div>
-                    </div>
-                </div>
-            </div>
-            
-            <div style="text-align: center; margin-top: 30px;">
-                <form method="POST" style="display: inline;" onsubmit="return confirmFinalize();">
-                    <input type="hidden" name="save_assessment" value="1">
-                    <input type="hidden" name="enrollment_id" value="<?php echo $enrollment_id; ?>">
-                    <button type="submit" class="submit-btn" id="finalizeBtn">
-                        <i class="fas fa-save"></i> FINALIZE ASSESSMENT
-                    </button>
-                </form>
+            <div id="profileDropdown" class="profile-dropdown">
+                <ul>
+                    <li><button class="dropdown-item" onclick="goToProfile()">View/Edit Profile</button></li>
+                    <li><button class="dropdown-item logout-btn" onclick="confirmLogout()">Logout</button></li>
+                </ul>
             </div>
         </div>
     </div>
-    
-    <script>
-        const enrollmentId = <?php echo $enrollment_id; ?>;
-        let traineeSkillCount = <?php echo count($trainee_skills); ?>;
-        let traineeQuestionCount = <?php echo count($trainee_questions); ?>;
-        
-        // Tab switching
-        function switchTab(tabName) {
-            document.getElementById('tabInput').value = tabName;
-            document.getElementById('switchTabForm').submit();
-        }
-        
-        // Toggle visibility using AJAX
-        function toggleVisibility(type, enrollmentId, checkbox) {
-            const newValue = checkbox.checked ? 1 : 0;
-            
-            // Show loading state
-            Swal.fire({
-                title: 'Updating...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                }
-            });
-            
-            // Create form data
-            const formData = new FormData();
-            formData.append('ajax_toggle', '1');
-            formData.append('type', type);
-            formData.append('enrollment_id', enrollmentId);
-            formData.append('set', newValue);
-            
-            // Send AJAX request
-            fetch(window.location.href, {
-                method: 'POST',
-                body: formData,
-                credentials: 'same-origin'
-            })
-            .then(response => response.json())
-            .then(data => {
-                Swal.close();
-                if (data.success) {
-                    Swal.fire({
-                        icon: 'success',
-                        title: 'Updated!',
-                        text: 'Visibility setting has been updated.',
-                        timer: 1500,
-                        showConfirmButton: false
-                    });
-                    
-                    // Update the status label
-                    const container = checkbox.closest('.toggle-container');
-                    const statusSpan = container.querySelector('.visibility-status');
-                    if (statusSpan) {
-                        if (checkbox.checked) {
-                            statusSpan.className = 'visibility-status status-visible';
-                            statusSpan.innerHTML = '<i class="fas fa-eye"></i> Visible to trainee';
-                        } else {
-                            statusSpan.className = 'visibility-status status-hidden';
-                            statusSpan.innerHTML = '<i class="fas fa-eye-slash"></i> Hidden from trainee';
-                        }
-                    }
-                } else {
-                    Swal.fire({
-                        icon: 'error',
-                        title: 'Error',
-                        text: data.message || 'Failed to update visibility'
-                    });
-                    // Revert checkbox
-                    checkbox.checked = !checkbox.checked;
-                }
-            })
-            .catch(error => {
-                console.error('AJAX Error:', error);
-                Swal.close();
-                Swal.fire({
-                    icon: 'error',
-                    title: 'Error',
-                    text: 'An error occurred. Please try again.'
-                });
-                // Revert checkbox
-                checkbox.checked = !checkbox.checked;
-            });
-        }
-        
-        // ========== DELETE MODAL FUNCTIONS ==========
-        function openDeleteModal(type) {
-            document.getElementById('deleteType').value = type;
-            document.getElementById('deleteModalMessage').innerHTML = 
-                type === 'practical' ? 
-                'Are you sure you want to permanently delete ALL practical skills for this trainee? This action CANNOT be undone.' :
-                'Are you sure you want to permanently delete ALL oral questions for this trainee? This action CANNOT be undone.';
-            document.getElementById('deleteModal').style.display = 'block';
-        }
-        
-        function closeDeleteModal() {
-            document.getElementById('deleteModal').style.display = 'none';
-        }
-        
-        function confirmDelete() {
-            const type = document.getElementById('deleteType').value;
-            const enrollmentId = document.getElementById('deleteEnrollmentId').value;
-            
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = 'comprehensive_assessment.php';
-            
-            if (type === 'practical') {
-                addField(form, 'remove_trainee_skills', '1');
-            } else if (type === 'oral') {
-                addField(form, 'remove_trainee_questions', '1');
-            }
-            
-            addField(form, 'enrollment_id', enrollmentId);
-            
-            document.body.appendChild(form);
-            form.submit();
-        }
-        
-        // ========== SINGLE ITEM DELETE ==========
-        function removeSingleSkill(skillId) {
-            Swal.fire({
-                title: 'Delete Skill?',
-                text: 'Are you sure you want to permanently delete this skill?',
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#dc3545',
-                cancelButtonColor: '#6c757d',
-                confirmButtonText: 'Yes, delete it!'
-            }).then((result) => {
-                if (result.isConfirmed) {
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'comprehensive_assessment.php';
-                    
-                    addField(form, 'remove_single_skill', '1');
-                    addField(form, 'skill_id', skillId);
-                    addField(form, 'enrollment_id', enrollmentId);
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }
-            });
-        }
-        
-        function removeSingleQuestion(questionId) {
-            Swal.fire({
-                title: 'Delete Question?',
-                text: 'Are you sure you want to permanently delete this question?',
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#dc3545',
-                cancelButtonColor: '#6c757d',
-                confirmButtonText: 'Yes, delete it!'
-            }).then((result) => {
-                if (result.isConfirmed) {
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'comprehensive_assessment.php';
-                    
-                    addField(form, 'remove_single_question', '1');
-                    addField(form, 'question_id', questionId);
-                    addField(form, 'enrollment_id', enrollmentId);
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }
-            });
-        }
-        
-        // ========== TRAINEE SKILLS FUNCTIONS ==========
-        function addTraineeSkill() {
-            traineeSkillCount++;
-            const container = document.getElementById('trainee-skills-container');
-            
-            // Remove waiting message if present
-            const waitingMsg = container.querySelector('.waiting-message');
-            if (waitingMsg) {
-                waitingMsg.remove();
-            }
-            
-            const newRow = document.createElement('div');
-            newRow.className = 'custom-skill-row';
-            newRow.setAttribute('data-temp', 'true');
-            newRow.innerHTML = `
-                <div style="display: flex; gap: 20px; align-items: center;">
-                    <div style="flex: 2;">
-                        <input type="text" class="form-control trainee-skill-name" value="New Skill ${traineeSkillCount}" placeholder="Enter skill name">
-                        <span class="input-label">Skill name</span>
-                    </div>
-                    <div style="flex: 1;">
-                        <input type="number" class="form-control trainee-skill-max" value="20" min="1" max="100">
-                        <span class="input-label">Max score</span>
-                    </div>
-                    <div style="flex: 1;">
-                        <input type="number" class="form-control trainee-skill-score" value="" min="0" max="20" placeholder="Enter score" onchange="updatePracticalTotal()">
-                        <span class="input-label">Score obtained</span>
-                    </div>
-                    <div style="flex: 0.5;">
-                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
-                    </div>
-                    <div style="flex: 0.3;">
-                        <button type="button" class="remove-btn" onclick="this.closest('.custom-skill-row').remove(); updatePracticalTotal();">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
+</header>
+
+<div class="body-container">
+
+    <!--  SIDEBAR: Navigation links-->
+    <aside id="sidebar" class="sidebar">
+        <button class="sidebar-btn active" onclick="location.href='dashboard.php'">Dashboard</button>
+        <button class="sidebar-btn" onclick="location.href='training_progress.php'">My Training Progress</button>
+    </aside>
+
+    <!-- MAIN CONTENT-->
+    <main class="main-content">
+        <p class="welcome-text">
+            Welcome, <?php echo htmlspecialchars($username); ?>
+            <span class="role-badge" style="font-size:.875rem;">TRAINEE</span>
+        </p>
+
+        <div id="dashboardView">
+            <!-- Page title & search -->
+            <div class="view-header">
+                <h1 style="font-size:1.25rem;font-weight:700;margin-bottom:1rem;">Programs</h1>
+                <div class="search-container">
+                    <input type="text" id="searchQuery" placeholder="Search programs..." class="search-input">
+                    <button id="clearSearch" class="clear-search-btn" style="display:none;">×</button>
                 </div>
-            `;
-            container.appendChild(newRow);
-            updatePracticalTotal();
-        }
-        
-        function saveTraineeSkills() {
-            const skills = [];
-            let hasValidSkills = false;
-            
-            document.querySelectorAll('#trainee-skills-container .custom-skill-row').forEach(row => {
-                const nameInput = row.querySelector('.trainee-skill-name');
-                const maxInput = row.querySelector('.trainee-skill-max');
-                
-                if (nameInput && maxInput && nameInput.value.trim() !== '') {
-                    hasValidSkills = true;
-                    
-                    // Get existing score if any
-                    const scoreInput = row.querySelector('.trainee-skill-score');
-                    const score = scoreInput ? (scoreInput.value || null) : null;
-                    
-                    skills.push({
-                        name: nameInput.value.trim(),
-                        max_score: parseInt(maxInput.value) || 20,
-                        score: score
-                    });
-                }
-            });
-            
-            if (!hasValidSkills) {
-                Swal.fire('No Skills', 'Please add at least one skill with a name for this trainee.', 'warning');
-                return;
-            }
-            
-            // Show loading
-            Swal.fire({
-                title: 'Saving...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                    
-                    // Create form data
-                    const formData = new FormData();
-                    formData.append('save_trainee_practical_skills', '1');
-                    formData.append('enrollment_id', enrollmentId);
-                    formData.append('trainee_skills', JSON.stringify(skills));
-                    formData.append('ajax', '1'); // Add ajax flag
-                    
-                    // Send AJAX request
-                    fetch(window.location.href, {
-                        method: 'POST',
-                        body: formData
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        Swal.close();
-                        if (data.success) {
-                            Swal.fire({
-                                icon: 'success',
-                                title: 'Saved!',
-                                text: 'Practical skills saved successfully',
-                                timer: 1500,
-                                showConfirmButton: false
-                            }).then(() => {
-                                // Reload to show updated data
-                                window.location.reload();
-                            });
-                        } else {
-                            Swal.fire({
-                                icon: 'error',
-                                title: 'Error',
-                                text: data.message || 'Failed to save skills'
-                            });
-                        }
-                    })
-                    .catch(error => {
-                        Swal.close();
-                        Swal.fire({
-                            icon: 'error',
-                            title: 'Error',
-                            text: 'An error occurred. Please try again.'
-                        });
-                        console.error('Error:', error);
-                    });
-                }
-            });
-        }
-        
-        // ========== TRAINEE QUESTIONS FUNCTIONS ==========
-        function addTraineeQuestion() {
-            traineeQuestionCount++;
-            const container = document.getElementById('trainee-questions-container');
-            
-            // Remove waiting message if present
-            const waitingMsg = container.querySelector('.waiting-message');
-            if (waitingMsg) {
-                waitingMsg.remove();
-            }
-            
-            const newRow = document.createElement('div');
-            newRow.className = 'custom-skill-row';
-            newRow.setAttribute('data-temp', 'true');
-            newRow.innerHTML = `
-                <div style="display: flex; gap: 20px; align-items: center;">
-                    <div style="flex: 2;">
-                        <input type="text" class="form-control trainee-question" value="New Question ${traineeQuestionCount}" placeholder="Enter question">
-                        <span class="input-label">Question</span>
-                    </div>
-                    <div style="flex: 1;">
-                        <input type="number" class="form-control trainee-question-max" value="25" min="1" max="100" onchange="updateOralTotal()">
-                        <span class="input-label">Max score</span>
-                    </div>
-                    <div style="flex: 1;">
-                        <input type="number" class="form-control trainee-question-score" value="" min="0" max="25" placeholder="Enter score" onchange="updateOralTotal()">
-                        <span class="input-label">Score obtained</span>
-                    </div>
-                    <div style="flex: 0.5;">
-                        <span style="color: #ffc107;"><i class="fas fa-clock"></i> Pending</span>
-                    </div>
-                    <div style="flex: 0.3;">
-                        <button type="button" class="remove-btn" onclick="this.closest('.custom-skill-row').remove(); updateOralTotal();">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
+                <p id="searchResults" style="display:none;color:#6b7280;font-size:0.875rem;margin-bottom:1rem;"></p>
+            </div>
+
+            <!-- Top status banner depending on enrollment state -->
+            <?php if ($hasActiveProgram): ?>
+                <div class="enrollment-status active-enrolled-status" style="margin-bottom:2rem;">
+                    <p class="status-message"><i class="fas fa-info-circle"></i> You are currently enrolled in an active program. Complete it before applying to a new one.</p>
                 </div>
-            `;
-            container.appendChild(newRow);
-            updateOralTotal();
-        }
-        
-        function saveTraineeQuestions() {
-            const questions = [];
-            let hasValidQuestions = false;
-            
-            document.querySelectorAll('#trainee-questions-container .custom-skill-row').forEach(row => {
-                const questionInput = row.querySelector('.trainee-question');
-                const maxInput = row.querySelector('.trainee-question-max');
-                
-                if (questionInput && maxInput && questionInput.value.trim() !== '') {
-                    hasValidQuestions = true;
-                    
-                    // Get existing score if any
-                    const scoreInput = row.querySelector('.trainee-question-score');
-                    const score = scoreInput ? (scoreInput.value || null) : null;
-                    
-                    questions.push({
-                        question: questionInput.value.trim(),
-                        max_score: parseInt(maxInput.value) || 25,
-                        score: score
-                    });
-                }
-            });
-            
-            if (!hasValidQuestions) {
-                Swal.fire('No Questions', 'Please add at least one question with text for this trainee.', 'warning');
-                return;
-            }
-            
-            // Show loading
-            Swal.fire({
-                title: 'Saving...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                    
-                    // Create form data
-                    const formData = new FormData();
-                    formData.append('save_trainee_oral_questions', '1');
-                    formData.append('enrollment_id', enrollmentId);
-                    formData.append('trainee_questions', JSON.stringify(questions));
-                    formData.append('ajax', '1'); // Add ajax flag
-                    
-                    // Send AJAX request
-                    fetch(window.location.href, {
-                        method: 'POST',
-                        body: formData
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        Swal.close();
-                        if (data.success) {
-                            Swal.fire({
-                                icon: 'success',
-                                title: 'Saved!',
-                                text: 'Oral questions saved successfully',
-                                timer: 1500,
-                                showConfirmButton: false
-                            }).then(() => {
-                                // Reload to show updated data
-                                window.location.reload();
-                            });
-                        } else {
-                            Swal.fire({
-                                icon: 'error',
-                                title: 'Error',
-                                text: data.message || 'Failed to save questions'
-                            });
-                        }
-                    })
-                    .catch(error => {
-                        Swal.close();
-                        Swal.fire({
-                            icon: 'error',
-                            title: 'Error',
-                            text: 'An error occurred. Please try again.'
-                        });
-                        console.error('Error:', error);
-                    });
-                }
-            });
-        }
-        
-        // ========== UPDATE TOTALS ==========
-        function updatePracticalTotal() {
-            let total = 0;
-            let maxTotal = 0;
-            let allFilled = true;
-            
-            document.querySelectorAll('#trainee-skills-container .custom-skill-row').forEach(row => {
-                const scoreInput = row.querySelector('.trainee-skill-score');
-                const maxInput = row.querySelector('.trainee-skill-max');
-                
-                if (maxInput) {
-                    maxTotal += parseFloat(maxInput.value) || 0;
-                }
-                
-                if (scoreInput && maxInput) {
-                    const val = scoreInput.value;
-                    if (val === null || val === '') {
-                        allFilled = false;
-                    } else {
-                        total += parseFloat(val) || 0;
-                    }
-                }
-            });
-            
-            // Ensure maxTotal is at least 100 for display
-            if (maxTotal === 0) maxTotal = 100;
-            
-            document.getElementById('practicalTotal').textContent = total;
-            const practicalMaxSpan = document.getElementById('practicalMaxTotal');
-            if (practicalMaxSpan) practicalMaxSpan.textContent = maxTotal;
-            
-            const totalDisplay = document.getElementById('practicalTotalDisplay');
-            if (totalDisplay) {
-                if (!allFilled) {
-                    totalDisplay.innerHTML = `Total Practical Score: ${total}/${maxTotal} <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> INCOMPLETE</span>`;
-                } else if (total >= (maxTotal * 0.75)) {
-                    totalDisplay.innerHTML = `Total Practical Score: ${total}/${maxTotal} <span style="color: #28a745; margin-left: 10px;"><i class="fas fa-check-circle"></i> PASSED</span>`;
-                } else {
-                    totalDisplay.innerHTML = `Total Practical Score: ${total}/${maxTotal} <span style="color: #dc3545; margin-left: 10px;"><i class="fas fa-times-circle"></i> FAILED</span>`;
-                }
-            }
-        }
-        
-        function updateOralTotal() {
-            let totalMax = 0;
-            let totalScore = 0;
-            let allFilled = true;
-            
-            document.querySelectorAll('#trainee-questions-container .custom-skill-row').forEach(row => {
-                const maxInput = row.querySelector('.trainee-question-max');
-                const scoreInput = row.querySelector('.trainee-question-score');
-                
-                if (maxInput) {
-                    const maxVal = parseInt(maxInput.value) || 0;
-                    totalMax += maxVal;
-                    
-                    if (scoreInput) {
-                        const scoreVal = scoreInput.value;
-                        if (scoreVal === null || scoreVal === '') {
-                            allFilled = false;
-                        } else {
-                            totalScore += parseFloat(scoreVal) || 0;
-                        }
-                    }
-                }
-            });
-            
-            document.getElementById('oralMaxTotal').textContent = totalMax;
-            document.getElementById('oral_max_score').value = totalMax;
-            
-            const scoreInput = document.getElementById('oral_score');
-            if (scoreInput) {
-                scoreInput.value = totalScore;
-            }
-            
-            const totalDisplay = document.getElementById('oralTotalDisplay');
-            if (totalDisplay) {
-                if (!allFilled) {
-                    totalDisplay.innerHTML = `Oral Score: <span id="oralScoreValue">${totalScore}</span>/${totalMax} <span style="color: #ffc107; margin-left: 10px;"><i class="fas fa-clock"></i> INCOMPLETE</span>`;
-                } else if (totalScore >= (totalMax * 0.75)) {
-                    totalDisplay.innerHTML = `Oral Score: <span id="oralScoreValue">${totalScore}</span>/${totalMax} <span style="color: #28a745; margin-left: 10px;"><i class="fas fa-check-circle"></i> PASSED</span>`;
-                } else {
-                    totalDisplay.innerHTML = `Oral Score: <span id="oralScoreValue">${totalScore}</span>/${totalMax} <span style="color: #dc3545; margin-left: 10px;"><i class="fas fa-times-circle"></i> FAILED</span>`;
-                }
-            }
-        }
-        
-        // ========== SAVE FUNCTIONS ==========
-        function savePracticalTab() {
-            // Check if there are any skills
-            const skillsExist = document.querySelectorAll('#trainee-skills-container .custom-skill-row').length > 0;
-            
-            if (!skillsExist) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'No Skills',
-                    text: 'Please add skills for this trainee before saving.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return;
-            }
-            
-            // Check if all scores are filled
-            let allFilled = true;
-            
-            document.querySelectorAll('#trainee-skills-container .custom-skill-row').forEach(row => {
-                const nameInput = row.querySelector('.trainee-skill-name');
-                if (nameInput && nameInput.value.trim() !== '') {
-                    const scoreInput = row.querySelector('.trainee-skill-score');
-                    if (scoreInput && (scoreInput.value === null || scoreInput.value === '')) {
-                        allFilled = false;
-                    }
-                }
-            });
-            
-            if (!allFilled) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'Incomplete Scores',
-                    text: 'Please enter scores for all skills before saving.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return;
-            }
-            
-            Swal.fire({
-                title: 'Saving...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                    
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'comprehensive_assessment.php';
-                    
-                    addField(form, 'save_tab', '1');
-                    addField(form, 'enrollment_id', enrollmentId);
-                    addField(form, 'tab', 'practical');
-                    addField(form, 'practical_notes', document.getElementById('practical_notes')?.value || '');
-                    
-                    const skillScores = {};
-                    
-                    document.querySelectorAll('#trainee-skills-container .custom-skill-row').forEach((row, index) => {
-                        const nameInput = row.querySelector('.trainee-skill-name');
-                        if (nameInput && nameInput.value.trim() !== '') {
-                            const maxInput = row.querySelector('.trainee-skill-max');
-                            const scoreInput = row.querySelector('.trainee-skill-score');
-                            
-                            if (maxInput && scoreInput) {
-                                const skillName = nameInput.value;
-                                const maxScore = parseFloat(maxInput.value) || 20;
-                                let score = parseFloat(scoreInput.value) || 0;
-                                
-                                if (score > maxScore) score = maxScore;
-                                if (score < 0) score = 0;
-                                
-                                const skillId = 'custom_' + index + '|' + skillName + '|' + maxScore;
-                                skillScores[skillId] = { score: score };
-                            }
-                        }
-                    });
-                    
-                    addField(form, 'skill_scores', JSON.stringify(skillScores));
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }
-            });
-        }
-        
-        function saveProjectTab() {
-            Swal.fire({
-                title: 'Saving...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                    
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'comprehensive_assessment.php';
-                    
-                    addField(form, 'save_tab', '1');
-                    addField(form, 'enrollment_id', enrollmentId);
-                    addField(form, 'tab', 'project');
-                    
-                    const score = document.getElementById('project_score')?.value || 0;
-                    addField(form, 'project_score', score);
-                    addField(form, 'project_notes', document.getElementById('project_notes')?.value || '');
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }
-            });
-        }
-        
-        function saveOralTab() {
-            // Check if there are any questions
-            const questionsExist = document.querySelectorAll('#trainee-questions-container .custom-skill-row').length > 0;
-            
-            if (!questionsExist) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'No Questions',
-                    text: 'Please add questions for this trainee before saving.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return;
-            }
-            
-            // Check if all scores are filled
-            let allFilled = true;
-            
-            document.querySelectorAll('#trainee-questions-container .custom-skill-row').forEach(row => {
-                const questionInput = row.querySelector('.trainee-question');
-                if (questionInput && questionInput.value.trim() !== '') {
-                    const scoreInput = row.querySelector('.trainee-question-score');
-                    if (scoreInput && (scoreInput.value === null || scoreInput.value === '')) {
-                        allFilled = false;
-                    }
-                }
-            });
-            
-            if (!allFilled) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'Incomplete Scores',
-                    text: 'Please enter scores for all questions before saving.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return;
-            }
-            
-            Swal.fire({
-                title: 'Saving...',
-                text: 'Please wait',
-                allowOutsideClick: false,
-                allowEscapeKey: false,
-                showConfirmButton: false,
-                didOpen: () => {
-                    Swal.showLoading();
-                    
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'comprehensive_assessment.php';
-                    
-                    addField(form, 'save_tab', '1');
-                    addField(form, 'enrollment_id', enrollmentId);
-                    addField(form, 'tab', 'oral');
-                    
-                    const questionScores = {};
-                    
-                    document.querySelectorAll('#trainee-questions-container .custom-skill-row').forEach((row, index) => {
-                        const questionInput = row.querySelector('.trainee-question');
-                        if (questionInput && questionInput.value.trim() !== '') {
-                            const scoreInput = row.querySelector('.trainee-question-score');
-                            
-                            if (scoreInput) {
-                                let score = parseFloat(scoreInput.value) || 0;
-                                questionScores[index] = { score: score };
-                            }
-                        }
-                    });
-                    
-                    addField(form, 'question_scores', JSON.stringify(questionScores));
-                    addField(form, 'oral_notes', document.getElementById('oral_notes')?.value || '');
-                    
-                    const oralScore = document.getElementById('oral_score')?.value || 0;
-                    addField(form, 'oral_score', oralScore);
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }
-            });
-        }
-        
-        function confirmFinalize() {
-            // Check if practical skills exist and are complete
-            let practicalSkillsExist = document.querySelectorAll('#trainee-skills-container .custom-skill-row').length > 0;
-            let practicalComplete = true;
-            
-            if (practicalSkillsExist) {
-                document.querySelectorAll('#trainee-skills-container .trainee-skill-score').forEach(input => {
-                    if (input.value === null || input.value === '') {
-                        practicalComplete = false;
-                    }
-                });
-            }
-            
-            // Check if oral questions exist and are complete
-            let oralQuestionsExist = document.querySelectorAll('#trainee-questions-container .custom-skill-row').length > 0;
-            let oralComplete = true;
-            
-            if (oralQuestionsExist) {
-                document.querySelectorAll('#trainee-questions-container .trainee-question-score').forEach(input => {
-                    if (input.value === null || input.value === '') {
-                        oralComplete = false;
-                    }
-                });
-            }
-            
-            // Check if project has score
-            let projectScore = document.getElementById('project_score')?.value;
-            let projectComplete = projectScore && projectScore !== '';
-            
-            if (practicalSkillsExist && !practicalComplete) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'Incomplete Assessment',
-                    text: 'Please complete all practical skills scores before finalizing.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return false;
-            }
-            
-            if (!projectComplete) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'Incomplete Assessment',
-                    text: 'Please enter project score before finalizing.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return false;
-            }
-            
-            if (oralQuestionsExist && !oralComplete) {
-                Swal.fire({
-                    icon: 'warning',
-                    title: 'Incomplete Assessment',
-                    text: 'Please complete all oral assessment scores before finalizing.',
-                    confirmButtonColor: '#3085d6'
-                });
-                return false;
-            }
-            
-            return Swal.fire({
-                title: 'Finalize Assessment?',
-                text: 'This will update the trainee\'s status and cannot be undone easily.',
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#3085d6',
-                cancelButtonColor: '#d33',
-                confirmButtonText: 'Yes, finalize it!'
-            }).then((result) => {
-                return result.isConfirmed;
-            });
-        }
-        
-        function addField(form, name, value) {
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = name;
-            input.value = value;
-            form.appendChild(input);
-        }
-        
-        // Close modal when clicking outside
-        window.onclick = function(event) {
-            const deleteModal = document.getElementById('deleteModal');
-            if (event.target == deleteModal) {
-                deleteModal.style.display = 'none';
-            }
-        }
-        
-        // Initialize on load
-        document.addEventListener('DOMContentLoaded', function() {
-            updatePracticalTotal();
-            updateOralTotal();
+            <?php elseif ($hasPendingApplications): ?>
+                <div class="enrollment-status pending-status" style="margin-bottom:2rem;">
+                    <p class="status-message"><i class="fas fa-clock"></i> You have a pending application. Wait for admin approval before applying to new programs.</p>
+                </div>
+            <?php elseif ($hasCompletedProgram && !$hasActiveProgram): ?>
+                <div class="enrollment-status completed-status" style="margin-bottom:2rem;">
+                    <p class="status-message"><i class="fas fa-check-circle"></i> You have completed your training. You can apply for new programs.</p>
+                </div>
+            <?php elseif (!$anyApprovedEnrolled && !$hasPendingApplications): ?>
+                <div class="enrollment-status" style="margin-bottom:2rem;background:#fef3c7;border-left:4px solid #f59e0b;">
+                    <p class="status-message" style="color:#92400e;"><i class="fas fa-info-circle"></i> You are not enrolled in any program yet. Browse available programs below.</p>
+                </div>
+            <?php endif; ?>
+
+            <?php if (count($programs) === 0): ?>
+                <!-- Empty state when no programs exist at all -->
+                <div style="text-align:center;padding:3rem;">
+                    <i class="fas fa-graduation-cap" style="font-size:3rem;color:#d1d5db;margin-bottom:1rem;display:block;"></i>
+                    <h2>No Programs Yet</h2>
+                    <p>You haven't applied to any programs yet.</p>
+                </div>
+            <?php else: ?>
+
+            <div id="programsContainer" class="programs-sections-wrapper">
+
+                <!-- AVAILABLE PROGRAMS -->
+                <div class="programs-section" id="availableSection">
+                    <div class="section-header">
+                        <div class="section-header-left">
+                            <div class="section-icon available-icon <?php echo $disableAvailablePrograms ? 'locked' : ''; ?>">
+                                <i class="fas fa-<?php echo $disableAvailablePrograms ? 'lock' : 'list-alt'; ?>"></i>
+                            </div>
+                            <div>
+                                <div class="section-title">
+                                    Available Programs
+                                    <?php if ($disableAvailablePrograms): ?>
+                                        <span style="font-size:0.75rem;color:#6b7280;">(Locked)</span>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="section-subtitle">
+                                    <?php if ($disableAvailablePrograms): ?>
+                                        <?php echo $hasActiveProgram
+                                            ? 'Complete your active program to apply for new ones'
+                                            : 'Wait for pending application approval to apply for new ones'; ?>
+                                    <?php else: ?>
+                                        Programs you can apply to
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </div>
+                        <span class="section-count-badge available-badge" id="availableCount">
+                            <?php $availCount = count($availableOnlyPrograms); echo "$availCount program" . ($availCount !== 1 ? 's' : ''); ?>
+                        </span>
+                    </div>
+
+                    <div class="section-body">
+                        <?php if ($disableAvailablePrograms): ?>
+                            <div class="active-lock-banner">
+                                <i class="fas fa-lock"></i>
+                                <div>
+                                    <strong>Applications are currently locked.</strong>
+                                    <?php if ($hasActiveProgram): ?>
+                                        You are already enrolled in an active program.
+                                    <?php elseif ($hasPendingApplications): ?>
+                                        You have a pending application. Wait for admin approval.
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+
+                        <?php if (count($availableOnlyPrograms) === 0): ?>
+                            <div class="no-programs">
+                                <i class="fas fa-check-circle" style="font-size:2rem;color:#10b981;margin-bottom:0.5rem;display:block;"></i>
+                                <p>You're enrolled in all available programs, or no new programs are currently open.</p>
+                            </div>
+                        <?php else: ?>
+                            <div class="programs-list" id="availableProgramsList">
+                                <?php foreach ($availableOnlyPrograms as $program):
+                                    $isFull     = $program['is_full'];
+                                    $isBlocked  = $disableAvailablePrograms || $isFull;
+                                    $programName = htmlspecialchars($program['name']);
+                                ?>
+                                    <?php if ($isBlocked): ?>
+                                        <div class="program-card available locked-card"
+                                             data-program-id="<?php echo $program['id']; ?>"
+                                             title="<?php echo $isFull ? 'Full' : 'Locked'; ?>">
+                                    <?php else: ?>
+                                        <div class="program-card available"
+                                             data-program-id="<?php echo $program['id']; ?>"
+                                             onclick="applyForProgram(<?php echo $program['id']; ?>, '<?php echo addslashes($programName); ?>')"
+                                             style="cursor:pointer;">
+                                    <?php endif; ?>
+                                        <div class="program-header">
+                                            <h2 class="program-name">
+                                                <?php echo htmlspecialchars($program['name']); ?>
+                                                <?php if ($isBlocked): ?>
+                                                    <span class="status-badge status-locked"><?php echo $isFull ? 'FULL' : 'LOCKED'; ?></span>
+                                                <?php else: ?>
+                                                    <span class="status-badge status-available">AVAILABLE</span>
+                                                    <span class="new-badge">NEW</span>
+                                                <?php endif; ?>
+                                                <?php if ($isFull): ?><span class="full-badge">FULL</span><?php endif; ?>
+                                            </h2>
+                                        </div>
+                                        <div class="program-details">
+                                            <p><b>Category:</b> <?php echo htmlspecialchars($program['category_name'] ?? 'General'); ?></p>
+                                            <p><b>Duration:</b> <?php echo htmlspecialchars($program['duration']); ?> days</p>
+                                            <p><b>Schedule:</b> <?php echo formatDate($program['scheduleStart']); ?> – <?php echo formatDate($program['scheduleEnd']); ?></p>
+                                            <p><b>Trainer:</b> <?php echo htmlspecialchars($program['trainer'] ?? 'To be assigned'); ?></p>
+                                            <p><b>Available Slots:</b> <?php echo $program['available_slots']; ?> / <?php echo $program['total_slots']; ?> (<?php echo $program['enrollment_percentage']; ?>% filled)</p>
+                                            <?php if ($isBlocked): ?>
+                                                <div class="enrollment-status" style="background:#fef2f2;border-left:4px solid #ef4444;">
+                                                    <p class="status-message"><i class="fas fa-lock"></i>
+                                                        <?php
+                                                        if ($isFull) echo "This program is full.";
+                                                        elseif ($hasActiveProgram) echo "You cannot apply while enrolled in an active program.";
+                                                        elseif ($hasPendingApplications) echo "You cannot apply while you have a pending application.";
+                                                        ?>
+                                                    </p>
+                                                </div>
+                                            <?php else: ?>
+                                                <div class="enrollment-status available-status">
+                                                    <span class="status-message"><i class="fas fa-info-circle"></i> Click to apply for this program</span>
+                                                </div>
+                                            <?php endif; ?>
+                                        </div>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div><!-- end #availableSection -->
+
+
+                <!--  MY PROGRAMS -->
+                <div class="programs-section" id="myProgramsSection">
+
+                    <!-- Filter Tabs -->
+                    <div class="filter-container">
+                        <div class="filter-label">Filter My Programs by:</div>
+                        <div class="filter-buttons">
+                            <button class="filter-btn <?php echo ($filter_counts['active'] > 0) ? 'active' : ''; ?>"
+                                    data-filter="active">
+                                Active Programs
+                                <?php if ($filter_counts['active'] > 0): ?>(<?php echo $filter_counts['active']; ?>)<?php endif; ?>
+                            </button>
+                            <button class="filter-btn"
+                                    data-filter="pending"
+                                    <?php echo ($filter_counts['pending'] === 0) ? 'disabled' : ''; ?>>
+                                Pending Applications
+                                <?php if ($filter_counts['pending'] > 0): ?>(<?php echo $filter_counts['pending']; ?>)<?php endif; ?>
+                            </button>
+                            <button class="filter-btn"
+                                    data-filter="completed"
+                                    <?php echo ($filter_counts['completed'] === 0) ? 'disabled' : ''; ?>>
+                                Completed Programs
+                                <?php if ($filter_counts['completed'] > 0): ?>(<?php echo $filter_counts['completed']; ?>)<?php endif; ?>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="section-header">
+                        <div class="section-header-left">
+                            <div class="section-icon my-programs-icon"><i class="fas fa-user-graduate"></i></div>
+                            <div><div class="section-title">My Programs</div></div>
+                        </div>
+                        <span class="section-count-badge my-programs-badge" id="myProgramsCount">
+                            <?php $myCount = count($myPrograms); echo "$myCount program" . ($myCount !== 1 ? 's' : ''); ?>
+                        </span>
+                    </div>
+
+                    <div class="section-body">
+                        <?php if (count($myPrograms) === 0): ?>
+                            <div class="no-programs">
+                                <i class="fas fa-graduation-cap" style="font-size:2rem;color:#d1d5db;margin-bottom:0.5rem;display:block;"></i>
+                                <p>You haven't enrolled in any programs yet.</p>
+                            </div>
+                        <?php else: ?>
+                            <div id="myProgramsList">
+                                <div class="programs-list">
+                                <?php foreach ($myPrograms as $program):
+                                    $isEnrolled       = $program['is_enrolled'] ?? false;
+                                    $isPending        = $program['is_pending'] ?? false;
+                                    $isCompletedStatus = $program['is_completed_status'] ?? false;
+                                    $isCompleted      = $program['is_completed'] ?? false;
+                                    $showCertificate  = $program['show_certificate'] ?? false;
+                                    $hasFeedback      = $program['has_feedback_value'] ?? false;
+                                    $isArchived       = $program['is_archived'] ?? false;
+                                    $feedbackRating   = $program['feedback_rating'] ?? null;
+                                    $archiveId        = $program['archive_id'] ?? null;
+
+                                    // Determine card color class and badge text.
+                                    // IMPORTANT: $isCompletedStatus=true means admin set enrollment_status='completed'.
+                                    // But if $hasFeedback=false, the trainee hasn't finished — show as ACTIVE (blue),
+                                    // not green completed. Only use green 'completed' card when feedback is done.
+                                    $cardClass   = 'enrolled-active';
+                                    $statusBadge = 'ENROLLED';
+                                    if ($isArchived) {
+                                        $cardClass   = 'archived';
+                                        $statusBadge = 'COMPLETED';
+                                    } elseif ($isPending) {
+                                        $cardClass   = 'pending';
+                                        $statusBadge = 'PENDING';
+                                    } elseif ($isEnrolled && $isCompleted && $hasFeedback) {
+                                        // Truly completed: feedback submitted
+                                        $cardClass   = 'completed';
+                                        $statusBadge = 'COMPLETED';
+                                    } elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback) {
+                                        // Admin marked complete but awaiting feedback — keep as active/blue
+                                        // Add a special badge to signal the trainee they need to answer feedback
+                                        $cardClass   = 'enrolled-active';
+                                        $statusBadge = 'NEEDS FEEDBACK';
+                                    }
+                                ?>
+                                    <?php if ($isArchived): ?>
+                                        <div class="program-card <?php echo $cardClass; ?>"
+                                             data-program-id="<?php echo $program['id']; ?>"
+                                             data-archive-id="<?php echo $archiveId; ?>"
+                                             onclick="showArchivedModal(this)">
+                                    <?php elseif ($isPending): ?>
+                                        <div class="program-card <?php echo $cardClass; ?>"
+                                             data-program-id="<?php echo $program['id']; ?>"
+                                             onclick="showPendingModal(this)">
+                                    <?php elseif ($isEnrolled): ?>
+                                        <a href="<?php
+                                            // Routing logic for enrolled program cards:
+                                            // 1. Truly completed with cert  → generate certificate page
+                                            // 2. Admin marked complete, no feedback yet → go to feedback page so they can submit
+                                            // 3. Normal active program → go to training progress
+                                            if ($isCompleted && $showCertificate) {
+                                                echo 'feedback_certificate.php?generate_certificate=1&program_id=' . $program['id'];
+                                            } elseif ($isCompletedStatus && !$hasFeedback) {
+                                                echo 'feedback_certificate.php?program_id=' . $program['id'];
+                                            } else {
+                                                echo 'training_progress.php?program_id=' . $program['id'];
+                                            }
+                                        ?>"
+                                           class="program-card <?php echo $cardClass; ?> <?php echo ($isCompletedStatus && !$hasFeedback) ? 'needs-feedback-card' : ''; ?>"
+                                           data-program-id="<?php echo $program['id']; ?>">
+                                    <?php else: ?>
+                                        <div class="program-card <?php echo $cardClass; ?>"
+                                             data-program-id="<?php echo $program['id']; ?>">
+                                    <?php endif; ?>
+
+                                        <div class="program-header">
+                                            <h2 class="program-name">
+                                                <?php echo htmlspecialchars($program['name']); ?>
+                                                <?php if ($statusBadge): ?>
+                                                    <span class="status-badge <?php echo match($statusBadge) {
+                                                        'COMPLETED'      => 'status-completed',
+                                                        'ENROLLED'       => 'status-approved',
+                                                        'PENDING'        => 'status-pending',
+                                                        'NEEDS FEEDBACK' => 'status-needs-feedback',
+                                                        default          => 'status-archived'
+                                                    }; ?>"><?php echo $statusBadge; ?></span>
+                                                <?php endif; ?>
+                                                <?php if ($isArchived): ?>
+                                                    <span class="archive-badge">ARCHIVED</span>
+                                                <?php endif; ?>
+                                            </h2>
+                                            <?php if ($feedbackRating): ?>
+                                                <span class="feedback-rating"><i class="fas fa-star"></i> <?php echo $feedbackRating; ?>/5</span>
+                                            <?php endif; ?>
+                                        </div>
+
+                                        <div class="program-details">
+                                            <p><b>Category:</b> <?php echo htmlspecialchars($program['category_name'] ?? 'General'); ?></p>
+                                            <p><b>Duration:</b> <?php echo htmlspecialchars($program['duration']); ?> <?php echo $isArchived ? ($program['duration_unit'] ?? 'days') : 'days'; ?></p>
+                                            <p><b>Schedule:</b> <?php echo formatDate($program['scheduleStart']); ?> – <?php echo formatDate($program['scheduleEnd']); ?></p>
+                                            <p><b>Trainer:</b> <?php echo htmlspecialchars($program['trainer'] ?? 'To be assigned'); ?></p>
+
+                                            <?php if ($isArchived): ?>
+                                                <p><b>Attendance:</b> <?php echo $program['attendance'] ?? 0; ?>%</p>
+                                                <p><b>Assessment:</b> <?php echo !empty($program['assessment']) ? htmlspecialchars($program['assessment']) : 'N/A'; ?></p>
+                                                <p><b>Completed:</b> <?php echo formatDate($program['completed_at']); ?></p>
+                                                <?php if ($hasFeedback): // $hasFeedback is the bool computed from feedback_details ?>
+                                                    <p><b>Feedback:</b> Submitted <?php echo !empty($program['feedback_submitted_at']) ? 'on ' . formatDateTime($program['feedback_submitted_at']) : ''; ?></p>
+                                                <?php endif; ?>
+                                            <?php elseif ($isPending): ?>
+                                                <p><b>Available Slots:</b> <?php echo $program['available_slots']; ?> / <?php echo $program['total_slots']; ?></p>
+                                            <?php elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback): ?>
+                                                <!-- Admin marked complete, feedback still needed -->
+                                                <p><b>Attendance:</b> <?php echo $program['attendance'] ?? 0; ?>%</p>
+                                                <p><b>Assessment:</b> <?php echo !empty($program['assessment']) ? htmlspecialchars($program['assessment']) : 'Not yet assessed'; ?></p>
+                                                <p><b>Status:</b> <span style="color:#f97316;font-weight:600;">Awaiting Feedback</span></p>
+                                            <?php else: ?>
+                                                <p><b>Attendance:</b> <?php echo $program['attendance'] ?? 0; ?>%</p>
+                                                <p><b>Assessment:</b> <?php echo !empty($program['assessment']) ? htmlspecialchars($program['assessment']) : 'Not yet assessed'; ?></p>
+                                                <p><b>Status:</b> <?php echo htmlspecialchars($program['enrollment_status'] ?? 'N/A'); ?></p>
+                                            <?php endif; ?>
+
+                                            <!-- Status hint banner at the bottom of each card -->
+                                            <div class="enrollment-status <?php
+                                                // Pick the banner colour class:
+                                                // - needs-feedback-banner (orange) when admin completed but trainee hasn't answered feedback
+                                                // - archived/pending/completed/active as normal
+                                                if ($isArchived) echo 'archived-status';
+                                                elseif ($isPending) echo 'pending-status';
+                                                elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback) echo 'needs-feedback-banner';
+                                                elseif ($isEnrolled && ($isCompleted || $showCertificate)) echo 'completed-status';
+                                                elseif ($isEnrolled) echo 'active-enrolled-status';
+                                            ?>">
+                                                <p class="status-message">
+                                                    <i class="fas fa-<?php
+                                                        if ($isArchived) echo 'archive';
+                                                        elseif ($isPending) echo 'clock';
+                                                        elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback) echo 'exclamation-circle';
+                                                        else echo 'info-circle';
+                                                    ?>"></i>
+                                                    <?php if ($isArchived): ?>
+                                                        This program has been archived. Click to view full record.
+                                                    <?php elseif ($isPending): ?>
+                                                        Your application is pending admin approval. Click to view details.
+                                                    <?php elseif ($isEnrolled): ?>
+                                                        <?php if ($isCompletedStatus && !$hasFeedback): ?>
+                                                            <strong>Action Required:</strong> Your training is complete. Please submit your feedback to receive your certificate.
+                                                        <?php elseif ($isCompleted && $showCertificate): ?>
+                                                            Program completed. Your certificate is ready.
+                                                        <?php elseif ($isCompleted && !$showCertificate): ?>
+                                                            Program completed. Submit feedback to get your certificate.
+                                                        <?php else: ?>
+                                                            You are currently enrolled and actively training.
+                                                        <?php endif; ?>
+                                                    <?php endif; ?>
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                    <?php if ($isEnrolled && !$isArchived && !$isPending): ?></a>
+                                    <?php else: ?></div><?php endif; ?>
+
+                                <?php endforeach; ?>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div><!-- end #myProgramsSection -->
+
+            </div><!-- end #programsContainer -->
+            <?php endif; // end if programs exist ?>
+        </div><!-- end #dashboardView -->
+    </main>
+</div>
+</div>
+
+
+<!-- MODAL: Pending Application Details -->
+<div id="pendingApplicationModal" class="modal-overlay">
+    <div class="modal-container" style="max-width:600px;">
+        <div class="modal-header" style="background:linear-gradient(135deg,#f59e0b,#d97706);">
+            <h2><i class="fas fa-clock"></i> <span id="pendingModalTitle">Pending Application</span></h2>
+            <button class="modal-close" onclick="closePendingModal()"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body" id="pendingModalBodyContent">
+            <div style="text-align:center;padding:2rem;"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
+        </div>
+    </div>
+</div>
+
+
+<!--  MODAL: Archived Program Details -->
+<div id="archivedProgramModal" class="modal-overlay">
+    <div class="modal-container">
+        <div class="modal-header">
+            <h2><i class="fas fa-archive"></i> <span id="modalProgramName">Archived Program Details</span></h2>
+            <button class="modal-close" onclick="closeArchivedModal()"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body" id="modalBodyContent">
+            <div style="text-align:center;padding:2rem;"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
+        </div>
+    </div>
+</div>
+
+
+
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<script>
+
+// DATA FROM PHP
+const allProgramsData      = <?php echo json_encode(array_values($programs)); ?>;
+const myProgramsData       = allProgramsData.filter(p => p.enrolled_user_id == <?php echo $user_id; ?>);
+const availableProgramsData = allProgramsData.filter(p => !p.enrolled_user_id || p.enrolled_user_id != <?php echo $user_id; ?>);
+
+// Flags passed from PHP
+const hasActiveProgram      = <?php echo $hasActiveProgram ? 'true' : 'false'; ?>;
+const hasPendingApplications = <?php echo $hasPendingApplications ? 'true' : 'false'; ?>;
+const disableAvailablePrograms = <?php echo $disableAvailablePrograms ? 'true' : 'false'; ?>;
+
+// Track the currently active filter tab
+let currentFilter = '<?php echo $defaultFilter; ?>';
+
+
+
+// UTILITY HELPERS, Small reusable functions used across the page.
+
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+
+function formatDate(dateStr) {
+    if (!dateStr || dateStr === '0000-00-00') return 'N/A';
+    try {
+        return new Date(dateStr).toLocaleDateString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric'
         });
-    </script>
+    } catch { return dateStr; }
+}
+
+
+function formatDateTime(dateTimeStr) {
+    if (!dateTimeStr || dateTimeStr === '0000-00-00 00:00:00') return 'N/A';
+    try {
+        return new Date(dateTimeStr).toLocaleDateString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        });
+    } catch { return dateTimeStr; }
+}
+
+
+
+function loadNotifications() {
+    fetch('notification.php?load=notifications')
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                updateNotificationBadge(data.count);
+                updateNotificationDropdown(data.notifications, data.count);
+            }
+        })
+        .catch(err => console.error('Notification error:', err));
+}
+
+
+function updateNotificationBadge(count) {
+    const btn = document.querySelector('.notification-btn');
+    if (!btn) return;
+    const existing = btn.querySelector('.notification-badge');
+    if (existing) existing.remove();
+    if (count > 0) {
+        const badge = document.createElement('span');
+        badge.className = 'notification-badge';
+        badge.textContent = count;
+        btn.appendChild(badge);
+    }
+}
+
+
+function updateNotificationDropdown(notifications, count) {
+    const dropdown = document.getElementById('notificationDropdown');
+    if (!dropdown) return;
+
+    dropdown.innerHTML = `
+        <div class="notification-header">
+            Notifications
+            ${count > 0 ? '<button class="mark-all-btn" onclick="markAllAsRead()"><i class="fas fa-check-double"></i> Mark all read</button>' : ''}
+        </div>
+        <ul class="notification-list" id="notificationList"></ul>`;
+
+    const list = document.getElementById('notificationList');
+    if (!notifications.length) {
+        list.innerHTML = '<li class="no-notifications">No notifications</li>';
+        return;
+    }
+    notifications.forEach(n => {
+        const unread = !n.is_read;
+        const li = document.createElement('li');
+        li.className = 'notification-item' + (unread ? ' unread' : '');
+        li.setAttribute('data-id', n.id);
+        li.setAttribute('data-read', n.is_read ? 'true' : 'false');
+        li.innerHTML = `
+            <div class="notification-title">
+                ${escapeHtml(n.title)}
+                ${unread ? '<span class="new-badge" style="background:#3b82f6;color:white;padding:2px 6px;border-radius:3px;font-size:0.7rem;margin-left:5px;">NEW</span>' : ''}
+            </div>
+            <div class="notification-message">${escapeHtml(n.message)}</div>
+            <div class="notification-time">${escapeHtml(n.created_at)}</div>`;
+        li.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (this.getAttribute('data-read') !== 'true') {
+                markAsRead(this.getAttribute('data-id'), this);
+            }
+        });
+        list.appendChild(li);
+    });
+}
+
+
+function markAsRead(notificationId, element) {
+    const fd = new FormData();
+    fd.append('action', 'mark_read');
+    fd.append('notification_id', notificationId);
+    fetch('notification.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                element.classList.remove('unread');
+                element.setAttribute('data-read', 'true');
+                const badge = element.querySelector('.new-badge');
+                if (badge) badge.remove();
+                updateBadgeCountAfterRead();
+            }
+        })
+        .catch(err => console.error('markAsRead error:', err));
+}
+
+
+function markAllAsRead() {
+    const fd = new FormData();
+    fd.append('action', 'mark_all_read');
+    fetch('notification.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                document.querySelectorAll('.notification-item').forEach(item => {
+                    item.classList.remove('unread');
+                    item.setAttribute('data-read', 'true');
+                    const b = item.querySelector('.new-badge');
+                    if (b) b.remove();
+                });
+                const badge = document.querySelector('.notification-badge');
+                if (badge) badge.remove();
+                const markBtn = document.querySelector('.mark-all-btn');
+                if (markBtn) markBtn.style.display = 'none';
+            }
+        })
+        .catch(err => console.error('markAllAsRead error:', err));
+}
+
+
+function updateBadgeCountAfterRead() {
+    const badge = document.querySelector('.notification-badge');
+    if (badge) {
+        const n = parseInt(badge.textContent) - 1;
+        if (n > 0) badge.textContent = n;
+        else {
+            badge.remove();
+            const btn = document.querySelector('.mark-all-btn');
+            if (btn) btn.style.display = 'none';
+        }
+    }
+}
+
+
+window.applyForProgram = function(programId, programName) {
+    // Guard: prevent applying if locked (also enforced server-side)
+    if (hasActiveProgram || hasPendingApplications) {
+        Swal.fire({
+            title: 'Cannot Apply',
+            html: hasActiveProgram
+                ? 'You are currently enrolled in an active program. Complete it first.'
+                : 'You have a pending application. Wait for admin approval.',
+            icon: 'warning',
+            confirmButtonColor: '#f59e0b',
+            confirmButtonText: 'OK'
+        });
+        return;
+    }
+
+    Swal.fire({
+        title: 'Apply for Program',
+        html: `Are you sure you want to apply for <strong>${escapeHtml(programName)}</strong>?`,
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Yes, Apply',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#0ea5e9',
+        cancelButtonColor: '#6b7280'
+    }).then(result => {
+        if (!result.isConfirmed) return;
+
+        Swal.fire({
+            title: 'Submitting...',
+            text: 'Please wait',
+            allowOutsideClick: false,
+            allowEscapeKey: false,
+            showConfirmButton: false,
+            didOpen: () => {
+                Swal.showLoading();
+                const fd = new FormData();
+                fd.append('ajax', '1');
+                fd.append('program_id', programId);
+                fetch('apply_program.php', { method: 'POST', body: fd })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            Swal.fire({
+                                title: 'Success!',
+                                text: data.message,
+                                icon: 'success',
+                                confirmButtonColor: '#0ea5e9'
+                            }).then(() => location.reload());
+                        } else {
+                            Swal.fire({ title: 'Error', text: data.message, icon: 'error', confirmButtonColor: '#ef4444' });
+                        }
+                    })
+                    .catch(() => {
+                        Swal.fire({ title: 'Error', text: 'An error occurred. Please try again.', icon: 'error', confirmButtonColor: '#ef4444' });
+                    });
+            }
+        });
+    });
+};
+
+
+
+// PENDING MODAL
+window.showPendingModal = function(element) {
+    const programId = element.getAttribute('data-program-id');
+    const program   = myProgramsData.find(p => p.id == programId && p.is_pending);
+    if (!program) {
+        Swal.fire({ title: 'Error', text: 'Pending data not found.', icon: 'error' });
+        return;
+    }
+    populatePendingModal(program);
+    document.getElementById('pendingApplicationModal').classList.add('active');
+    document.body.style.overflow = 'hidden';
+};
+
+
+window.closePendingModal = function() {
+    document.getElementById('pendingApplicationModal').classList.remove('active');
+    document.body.style.overflow = '';
+};
+
+
+function populatePendingModal(program) {
+    document.getElementById('pendingModalTitle').textContent = program.name || 'Pending Application';
+    document.getElementById('pendingModalBodyContent').innerHTML = `
+        <div class="modal-section" style="border-left-color:#f59e0b;">
+            <h3><i class="fas fa-info-circle" style="color:#f59e0b;"></i> Application Details</h3>
+            <div class="modal-grid">
+                <div class="modal-info-item"><strong>Program Name</strong><span>${escapeHtml(program.name)}</span></div>
+                <div class="modal-info-item"><strong>Category</strong><span>${escapeHtml(program.category_name || 'General')}</span></div>
+                <div class="modal-info-item"><strong>Duration</strong><span>${escapeHtml(program.duration)} days</span></div>
+                <div class="modal-info-item"><strong>Schedule</strong><span>${formatDate(program.scheduleStart)} – ${formatDate(program.scheduleEnd)}</span></div>
+                <div class="modal-info-item"><strong>Trainer</strong><span>${escapeHtml(program.trainer || 'To be assigned')}</span></div>
+                <div class="modal-info-item"><strong>Available Slots</strong><span>${program.available_slots || 0} / ${program.total_slots || 0}</span></div>
+                <div class="modal-info-item"><strong>Status</strong><span style="color:#f59e0b;font-weight:600;"><i class="fas fa-clock"></i> PENDING</span></div>
+                <div class="modal-info-item"><strong>Applied On</strong><span>${formatDateTime(program.application_date)}</span></div>
+            </div>
+        </div>
+        <div class="modal-section" style="border-left-color:#f59e0b;background:#fef3c7;">
+            <h3><i class="fas fa-hourglass-half" style="color:#f59e0b;"></i> What's Next?</h3>
+            <div style="padding:1rem;">
+                <div style="display:flex;gap:1rem;margin-bottom:1rem;align-items:center;">
+                    <div style="width:40px;height:40px;background:#f59e0b;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;">1</div>
+                    <div><strong style="color:#92400e;">Application Submitted</strong><p style="color:#6b7280;font-size:0.875rem;">Your application has been received and is pending review.</p></div>
+                </div>
+                <div style="display:flex;gap:1rem;margin-bottom:1rem;align-items:center;">
+                    <div style="width:40px;height:40px;background:#e5e7eb;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#6b7280;font-weight:bold;">2</div>
+                    <div><strong style="color:#374151;">Admin Review</strong><p style="color:#6b7280;font-size:0.875rem;">An administrator will review your application.</p></div>
+                </div>
+                <div style="display:flex;gap:1rem;align-items:center;">
+                    <div style="width:40px;height:40px;background:#e5e7eb;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#6b7280;font-weight:bold;">3</div>
+                    <div><strong style="color:#374151;">Approval Decision</strong><p style="color:#6b7280;font-size:0.875rem;">You'll receive a notification once approved or rejected.</p></div>
+                </div>
+            </div>
+        </div>
+        <div class="certificate-actions">
+            <button class="btn btn-secondary" onclick="closePendingModal()" style="background:#f59e0b;"><i class="fas fa-times"></i> Close</button>
+        </div>`;
+}
+
+
+// ARCHIVED MODAL
+window.showArchivedModal = function(element) {
+    const archiveId     = element.getAttribute('data-archive-id');
+    const archivedProgram = allProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
+    if (!archivedProgram) {
+        Swal.fire({ title: 'Error', text: 'Archived data not found.', icon: 'error' });
+        return;
+    }
+    populateArchivedModal(archivedProgram);
+    document.getElementById('archivedProgramModal').classList.add('active');
+    document.body.style.overflow = 'hidden';
+};
+
+
+window.closeArchivedModal = function() {
+    document.getElementById('archivedProgramModal').classList.remove('active');
+    document.body.style.overflow = '';
+};
+
+
+function populateArchivedModal(program) {
+    document.getElementById('modalProgramName').textContent = program.name || 'Archived Program';
+
+    // Build feedback section HTML if feedback was submitted
+    let feedbackHtml = '';
+    if (program.has_feedback && program.feedback_details) {
+        const r = program.feedback_details;
+
+        const trainerRatings = [
+            { name: 'Expertise',      value: r.trainer_expertise_rating },
+            { name: 'Communication',  value: r.trainer_communication_rating },
+            { name: 'Methods',        value: r.trainer_methods_rating },
+            { name: 'Requests',       value: r.trainer_requests_rating },
+            { name: 'Questions',      value: r.trainer_questions_rating },
+            { name: 'Instructions',   value: r.trainer_instructions_rating },
+            { name: 'Prioritization', value: r.trainer_prioritization_rating },
+            { name: 'Fairness',       value: r.trainer_fairness_rating },
+        ].filter(x => x.value);
+
+        const programRatings = [
+            { name: 'Knowledge',   value: r.program_knowledge_rating },
+            { name: 'Process',     value: r.program_process_rating },
+            { name: 'Environment', value: r.program_environment_rating },
+            { name: 'Algorithms',  value: r.program_algorithms_rating },
+            { name: 'Preparation', value: r.program_preparation_rating },
+        ].filter(x => x.value);
+
+        const systemRatings = [
+            { name: 'Technology',  value: r.system_technology_rating },
+            { name: 'Workflow',    value: r.system_workflow_rating },
+            { name: 'Instructions',value: r.system_instructions_rating },
+            { name: 'Answers',     value: r.system_answers_rating },
+            { name: 'Performance', value: r.system_performance_rating },
+        ].filter(x => x.value);
+
+        // Helper to render a rating grid section
+        const ratingSection = (title, ratings) => ratings.length === 0 ? '' : `
+            <div class="feedback-detail">
+                <h4 style="margin-bottom:1rem;">${title}</h4>
+                <div class="feedback-rating-grid">
+                    ${ratings.map(x => `
+                        <div class="rating-category">
+                            <div style="font-size:0.8rem;color:#6b7280;">${x.name}</div>
+                            <div style="font-weight:600;">${x.value}/5
+                                <span class="rating-stars">${'★'.repeat(x.value)}${'☆'.repeat(5-x.value)}</span>
+                            </div>
+                        </div>`).join('')}
+                </div>
+            </div>`;
+
+        feedbackHtml = `
+            <div class="modal-section">
+                <h3><i class="fas fa-star"></i> Feedback Summary</h3>
+                <div class="rating-badge-large" style="margin-bottom:1rem;">
+                    <i class="fas fa-star"></i> Overall Rating: ${program.feedback_rating}/5
+                </div>
+                ${ratingSection('Trainer Evaluation', trainerRatings)}
+                ${ratingSection('Program Evaluation', programRatings)}
+                ${ratingSection('System Evaluation', systemRatings)}
+                ${program.feedback_comments ? `
+                    <div class="feedback-detail">
+                        <h4 style="margin-bottom:0.5rem;">Additional Comments</h4>
+                        <p style="font-style:italic;background:#f9fafb;padding:1rem;border-radius:0.5rem;">
+                            "${escapeHtml(program.feedback_comments)}"
+                        </p>
+                    </div>` : ''}
+                ${program.feedback_submitted_at ? `
+                    <p style="font-size:0.85rem;color:#6b7280;">
+                        <i class="far fa-calendar-check"></i> Submitted: ${formatDateTime(program.feedback_submitted_at)}
+                    </p>` : ''}
+            </div>`;
+    }
+
+    document.getElementById('modalBodyContent').innerHTML = `
+        <div class="modal-section">
+            <h3><i class="fas fa-info-circle"></i> Program Information</h3>
+            <div class="modal-grid">
+                <div class="modal-info-item"><strong>Program Name</strong><span>${escapeHtml(program.name)}</span></div>
+                <div class="modal-info-item"><strong>Category</strong><span>${escapeHtml(program.category_name || 'General')}</span></div>
+                <div class="modal-info-item"><strong>Duration</strong><span>${escapeHtml(String(program.duration))} ${escapeHtml(program.duration_unit || 'Days')}</span></div>
+                <div class="modal-info-item"><strong>Trainer</strong><span>${escapeHtml(program.trainer || 'N/A')}</span></div>
+                <div class="modal-info-item"><strong>Schedule Start</strong><span>${formatDate(program.scheduleStart)}</span></div>
+                <div class="modal-info-item"><strong>Schedule End</strong><span>${formatDate(program.scheduleEnd)}</span></div>
+                <div class="modal-info-item"><strong>Attendance</strong><span>${program.attendance || 0}%</span></div>
+                <div class="modal-info-item"><strong>Assessment</strong><span>${program.assessment || 'N/A'}</span></div>
+                <div class="modal-info-item"><strong>Completion Date</strong><span>${formatDate(program.completed_at)}</span></div>
+                <div class="modal-info-item"><strong>Archived Date</strong><span>${formatDateTime(program.archived_at)}</span></div>
+            </div>
+        </div>
+        ${feedbackHtml}
+        <div class="certificate-actions">
+            <button class="btn btn-secondary" onclick="closeArchivedModal()"><i class="fas fa-times"></i> Close</button>
+        </div>`;
+}
+
+
+
+function applyMyProgramsFilter(filterType) {
+    currentFilter = filterType;
+
+    // Highlight the active tab button
+    document.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (btn.getAttribute('data-filter') === filterType) btn.classList.add('active');
+    });
+
+    const searchQuery = (document.getElementById('searchQuery')?.value || '').toLowerCase().trim();
+    const cards = document.querySelectorAll('#myProgramsList .programs-list .program-card');
+    let visibleCount = 0;
+
+    cards.forEach(card => {
+        const programId = parseInt(card.getAttribute('data-program-id'));
+        const archiveId = card.getAttribute('data-archive-id');
+
+        // Find the matching program from our JS data
+        let program = null;
+        if (archiveId) {
+            program = myProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
+        }
+        if (!program) {
+            program = myProgramsData.find(p => p.id === programId);
+        }
+
+        if (!program) { card.style.display = 'none'; return; }
+
+        // Determine if the card matches the current filter tab
+        let show = false;
+        if (filterType === 'active') {
+            // ACTIVE = is_enrolled AND is_completed=false AND not archived.
+            // This catches both normal 'approved' enrollments AND the case where
+            // admin set status='completed' but trainee has not submitted feedback yet.
+            // PHP sets is_completed=false in that case, so this gate works for both.
+            show = program.is_enrolled === true &&
+                   program.is_completed === false &&
+                   program.is_archived !== true;
+        } else if (filterType === 'pending') {
+            show = program.is_pending === true && program.is_archived !== true;
+        } else if (filterType === 'completed') {
+            // COMPLETED = ONLY archived_history records AND feedback must be submitted.
+            // If archived but no feedback, the trainee never truly finished — hidden here.
+            show = program.is_archived === true && program.has_feedback_value === true;
+        }
+
+        // Also apply search filter if query exists
+        if (show && searchQuery) {
+            const name     = (program.name || '').toLowerCase();
+            const category = (program.category_name || '').toLowerCase();
+            const trainer  = (program.trainer || '').toLowerCase();
+            show = name.includes(searchQuery) || category.includes(searchQuery) || trainer.includes(searchQuery);
+        }
+
+        card.style.display = show ? '' : 'none';
+        if (show) visibleCount++;
+    });
+
+    // Update the "My Programs" count badge
+    const badge = document.getElementById('myProgramsCount');
+    if (badge) badge.textContent = visibleCount + ' program' + (visibleCount !== 1 ? 's' : '');
+}
+
+
+
+document.addEventListener('DOMContentLoaded', function() {
+
+    // Start notification polling
+    loadNotifications();
+    setInterval(loadNotifications, 30000); // refresh every 30s
+
+    // Apply the default filter tab
+    setTimeout(() => applyMyProgramsFilter(currentFilter), 100);
+
+    // ---- Search input ----
+    const searchInput = document.getElementById('searchQuery');
+    const clearBtn    = document.getElementById('clearSearch');
+
+    if (searchInput) {
+        searchInput.addEventListener('input', function() {
+            const q = this.value.trim().toLowerCase();
+            if (clearBtn) clearBtn.style.display = q ? 'block' : 'none';
+
+            // Filter available programs
+            let availableVisible = 0;
+            document.querySelectorAll('#availableProgramsList .program-card').forEach(card => {
+                const programId = parseInt(card.getAttribute('data-program-id'));
+                const program   = availableProgramsData.find(p => p.id === programId);
+                const show = !program || !q || [program.name, program.category_name, program.trainer]
+                    .some(s => (s || '').toLowerCase().includes(q));
+                card.style.display = show ? '' : 'none';
+                if (show) availableVisible++;
+            });
+            const availBadge = document.getElementById('availableCount');
+            if (availBadge) availBadge.textContent = availableVisible + ' program' + (availableVisible !== 1 ? 's' : '');
+
+            // Re-apply my programs filter with new search term
+            applyMyProgramsFilter(currentFilter);
+
+            const resultsEl = document.getElementById('searchResults');
+            if (resultsEl) {
+                resultsEl.style.display = q ? 'block' : 'none';
+                resultsEl.textContent   = q ? `Search results for "${q}"` : '';
+            }
+        });
+    }
+
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            if (searchInput) searchInput.value = '';
+            clearBtn.style.display = 'none';
+            // Reset available programs visibility
+            document.querySelectorAll('#availableProgramsList .program-card').forEach(c => c.style.display = '');
+            const availBadge = document.getElementById('availableCount');
+            if (availBadge) availBadge.textContent = availableProgramsData.length + ' program' + (availableProgramsData.length !== 1 ? 's' : '');
+            applyMyProgramsFilter(currentFilter);
+            const resultsEl = document.getElementById('searchResults');
+            if (resultsEl) resultsEl.style.display = 'none';
+        });
+    }
+
+    // ---- Filter tab buttons ----
+    document.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            if (!this.disabled) applyMyProgramsFilter(this.getAttribute('data-filter'));
+        });
+    });
+
+    // ---- Profile dropdown toggle ----
+    const profileBtn      = document.getElementById('profileBtn');
+    const profileDropdown = document.getElementById('profileDropdown');
+    if (profileBtn) {
+        profileBtn.addEventListener('click', e => {
+            e.stopPropagation();
+            profileDropdown.style.display = profileDropdown.style.display === 'block' ? 'none' : 'block';
+            document.getElementById('notificationDropdown').style.display = 'none';
+        });
+    }
+
+    // ---- Notification dropdown toggle ----
+    const notificationBtn      = document.getElementById('notificationBtn');
+    const notificationDropdown = document.getElementById('notificationDropdown');
+    if (notificationBtn) {
+        notificationBtn.addEventListener('click', e => {
+            e.stopPropagation();
+            notificationDropdown.style.display = notificationDropdown.style.display === 'block' ? 'none' : 'block';
+            profileDropdown.style.display = 'none';
+        });
+    }
+
+    // ---- Close dropdowns when clicking elsewhere ----
+    document.addEventListener('click', e => {
+        if (profileBtn && !profileBtn.contains(e.target) && !profileDropdown.contains(e.target)) {
+            profileDropdown.style.display = 'none';
+        }
+        if (notificationBtn && !notificationBtn.contains(e.target) && !notificationDropdown.contains(e.target)) {
+            notificationDropdown.style.display = 'none';
+        }
+    });
+
+    // ---- Mobile sidebar toggle ----
+    const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+    const sidebar       = document.getElementById('sidebar');
+    const overlay       = document.createElement('div');
+    overlay.className   = 'sidebar-overlay';
+    Object.assign(overlay.style, {
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        background: 'rgba(0,0,0,0.5)', zIndex: 998, display: 'none'
+    });
+    document.body.appendChild(overlay);
+
+    function toggleSidebar() {
+        const isOpen = sidebar.classList.contains('mobile-open');
+        sidebar.classList.toggle('mobile-open', !isOpen);
+        overlay.style.display = isOpen ? 'none' : 'block';
+        document.body.style.overflow = isOpen ? '' : 'hidden';
+    }
+
+    if (mobileMenuBtn) mobileMenuBtn.addEventListener('click', toggleSidebar);
+    overlay.addEventListener('click', toggleSidebar);
+    window.addEventListener('resize', () => {
+        if (window.innerWidth > 768) {
+            sidebar.classList.remove('mobile-open');
+            overlay.style.display = 'none';
+            document.body.style.overflow = '';
+        }
+    });
+
+    // ---- Close modals on ESC or backdrop click ----
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') { closeArchivedModal(); closePendingModal(); }
+    });
+    document.getElementById('archivedProgramModal').addEventListener('click', function(e) {
+        if (e.target === this) closeArchivedModal();
+    });
+    document.getElementById('pendingApplicationModal').addEventListener('click', function(e) {
+        if (e.target === this) closePendingModal();
+    });
+});
+
+
+
+function confirmLogout() {
+    Swal.fire({
+        title: 'Confirm Logout',
+        text: 'Are you sure you want to logout?',
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Yes, Logout',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#d33',
+        cancelButtonColor: '#6b7280'
+    }).then(result => {
+        if (result.isConfirmed) window.location.href = '?action=logout';
+    });
+}
+
+
+function goToProfile() {
+    window.location.href = 'profile.php';
+}
+</script>
 </body>
 </html>

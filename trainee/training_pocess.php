@@ -73,7 +73,6 @@ $stmt->close();
 $notifications = [];
 $allNotifications = [];
 
-// Get ALL notifications (read + unread)
 $notifQuery = $conn->prepare("
     SELECT id, title, message, is_read, 
            DATE_FORMAT(created_at, '%M %d, %Y at %h:%i %p') AS created_at 
@@ -87,7 +86,6 @@ $notifQuery->execute();
 $nResult = $notifQuery->get_result();
 while ($row = $nResult->fetch_assoc()) {
     $allNotifications[] = $row;
-    // Keep unread count separate for badge
     if (!$row['is_read']) {
         $notifications[] = $row;
     }
@@ -105,8 +103,6 @@ date_default_timezone_set('Asia/Manila');
 $currentPrograms = [];
 $history = [];
 
-// FIXED: Include ALL enrollment statuses except 'pending'
-// This ensures programs with failed assessment still appear
 $query = "
     SELECT 
         e.id AS enrollment_id,
@@ -153,7 +149,6 @@ $today = new DateTime();
 $today->setTime(0, 0, 0);
 
 while ($row = $result->fetch_assoc()) {
-    // Calculate total days
     $start = new DateTime($row['schedule_start']);
     $end = new DateTime($row['schedule_end']);
     $total_days = $start->diff(new DateTime($row['schedule_end']))->days + 1;
@@ -169,24 +164,21 @@ while ($row = $result->fetch_assoc()) {
     $has_feedback = $row['has_feedback'] > 0;
     $overall_result = $row['overall_result'] ?? null;
     
-    // FIX: Only consider assessment as done if overall_result is NOT NULL and NOT empty
     $assessment_done = !empty($overall_result) && $overall_result !== null;
     $assessment_passed = ($assessment_done && $overall_result === 'Passed');
     $attendance_met = ($row['attendance'] >= $attendance_threshold);
     
-    // Handle project score properly
     $project_score = $row['project_score'];
     if ($project_score === null || $project_score === '') {
         $project_score = null;
     }
   
     // ==========================================
-    // HANDLE PROJECT SUBMISSION - SAME PAGE
+    // HANDLE PROJECT SUBMISSION
     // ==========================================
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_project'])) {
         $enrollment_id = intval($_POST['enrollment_id']);
         
-        // Verify na ito ang enrollment ng trainee
         $check = $conn->prepare("SELECT id FROM enrollments WHERE id = ? AND user_id = ?");
         $check->bind_param("ii", $enrollment_id, $user_id);
         $check->execute();
@@ -194,7 +186,6 @@ while ($row = $result->fetch_assoc()) {
             die("Invalid enrollment");
         }
         
-        // Handle file upload
         $photo_path = '';
         if (isset($_FILES['project_photo']) && $_FILES['project_photo']['error'] == 0) {
             $target_dir = "../uploads/projects/";
@@ -211,7 +202,6 @@ while ($row = $result->fetch_assoc()) {
             }
         }
         
-        // Check if assessment component exists
         $check_ac = $conn->query("SELECT id FROM assessment_components WHERE enrollment_id = $enrollment_id");
         
         if ($check_ac->num_rows > 0) {
@@ -232,32 +222,35 @@ while ($row = $result->fetch_assoc()) {
             $stmt->execute();
         }
         
-        // Redirect to same page with success message
         header("Location: training_progress.php?project_submitted=1");
         exit;
     }
     
-    // ==========================================
-    // VISIBILITY - Kapag naka-toggle ON, lalabas
-    // ==========================================
     $show_project = ($row['project_visible_to_trainee'] == 1);
     
     $move_to_history = $program_has_ended;
     
-    // Certificate availability logic - ONLY FOR PASSED ASSESSMENTS
+    // ==========================================
+    // FIX: Certificate/Feedback button logic
+    // Certificate only shows if: assessment passed AND feedback submitted
+    // Feedback button shows if: assessment passed AND feedback NOT yet submitted
+    // ==========================================
     $show_feedback_button = false;
     $show_certificate_button = false;
     
     if ($program_has_started) {
-        // Only show feedback/certificate options if assessment is PASSED
-        if ($assessment_done && $assessment_passed && $has_feedback) {
-            $show_certificate_button = true;
-        } elseif ($assessment_done && $assessment_passed && !$has_feedback) {
-            $show_feedback_button = true;
+        if ($assessment_done && $assessment_passed) {
+            if ($has_feedback) {
+                $show_certificate_button = true;  // Both done = show certificate
+            } else {
+                $show_feedback_button = true;     // Needs feedback first
+            }
         }
     }
     
-    // Status display - FIXED to show Failed status properly
+    // ==========================================
+    // FIX: Status display — added 'Awaiting Feedback' state
+    // ==========================================
     $status = 'Upcoming';
     if ($program_not_started) {
         $status = 'Not Started Yet';
@@ -265,7 +258,13 @@ while ($row = $result->fetch_assoc()) {
         $status = 'Ongoing';
     } elseif ($program_has_ended) {
         if ($assessment_done) {
-            $status = $assessment_passed ? 'Completed' : 'Failed';
+            if (!$assessment_passed) {
+                $status = 'Failed';
+            } elseif ($assessment_passed && !$has_feedback) {
+                $status = 'Awaiting Feedback'; // FIX: was 'Completed' even without feedback
+            } else {
+                $status = 'Completed'; // Truly completed: passed + feedback submitted
+            }
         } else {
             $status = 'Ended - Waiting for Assessment';
         }
@@ -297,7 +296,6 @@ while ($row = $result->fetch_assoc()) {
         "program_is_ongoing" => $program_is_ongoing,
         "completed_at" => $row['completed_at'],
         "overall_result" => $overall_result,
-        // Project data
         "show_project" => $show_project,
         "project_title_override" => $row['project_title_override'],  
         "project_instruction" => $row['project_instruction'],        
@@ -371,33 +369,13 @@ function formatDateTime($dateTimeStr) {
             background-color: #f3f4f6;
         }
 
-        .flex {
-            display: flex;
-        }
-
-        .flex-col {
-            flex-direction: column;
-        }
-
-        .flex-1 {
-            flex: 1;
-        }
-
-        .items-center {
-            align-items: center;
-        }
-
-        .justify-between {
-            justify-content: space-between;
-        }
-
-        .min-h-screen {
-            min-height: 100vh;
-        }
-
-        .bg-gray-100 {
-            background-color: #f3f4f6;
-        }
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .flex-1 { flex: 1; }
+        .items-center { align-items: center; }
+        .justify-between { justify-content: space-between; }
+        .min-h-screen { min-height: 100vh; }
+        .bg-gray-100 { background-color: #f3f4f6; }
 
         /* Header */
         .header-bar {
@@ -472,9 +450,7 @@ function formatDateTime($dateTimeStr) {
         }
 
         /* Notifications */
-        .notification-container {
-            position: relative;
-        }
+        .notification-container { position: relative; }
 
         .notification-btn {
             background: none;
@@ -525,9 +501,7 @@ function formatDateTime($dateTimeStr) {
             position: relative;
         }
 
-        .notification-list {
-            list-style: none;
-        }
+        .notification-list { list-style: none; }
 
         .notification-item {
             padding: 0.75rem 1rem;
@@ -538,22 +512,15 @@ function formatDateTime($dateTimeStr) {
             padding-right: 30px;
         }
 
-        .notification-item:hover {
-            background: #f9fafb;
-        }
+        .notification-item:hover { background: #f9fafb; }
 
         .notification-item.unread {
             background: #f0f9ff;
             border-left: 3px solid #3b82f6;
         }
 
-        .notification-item.unread:hover {
-            background: #e0f2fe;
-        }
-
-        .notification-item.unread .notification-title {
-            font-weight: 600 !important;
-        }
+        .notification-item.unread:hover { background: #e0f2fe; }
+        .notification-item.unread .notification-title { font-weight: 600 !important; }
 
         .notification-item.unread .notification-message {
             font-weight: 500;
@@ -618,9 +585,7 @@ function formatDateTime($dateTimeStr) {
             gap: 4px;
         }
 
-        .mark-all-btn:hover {
-            background: #2563eb !important;
-        }
+        .mark-all-btn:hover { background: #2563eb !important; }
 
         .new-badge {
             background: #3b82f6;
@@ -632,9 +597,7 @@ function formatDateTime($dateTimeStr) {
         }
 
         /* Profile */
-        .profile-container {
-            position: relative;
-        }
+        .profile-container { position: relative; }
 
         .profile-btn {
             display: flex;
@@ -649,9 +612,7 @@ function formatDateTime($dateTimeStr) {
             max-width: 200px;
         }
 
-        .profile-btn:hover {
-            background: rgba(255,255,255,.1);
-        }
+        .profile-btn:hover { background: rgba(255,255,255,.1); }
 
         .profile-text {
             white-space: nowrap;
@@ -674,9 +635,7 @@ function formatDateTime($dateTimeStr) {
             display: none;
         }
 
-        .profile-dropdown ul {
-            list-style: none;
-        }
+        .profile-dropdown ul { list-style: none; }
 
         .dropdown-item {
             width: 100%;
@@ -689,23 +648,8 @@ function formatDateTime($dateTimeStr) {
             font-size: 0.875rem;
         }
 
-        .dropdown-item:hover {
-            background: #e5e7eb;
-        }
-
-        .logout-btn {
-            color: #dc2626;
-        }
-
-        .role-badge {
-            background: #3b82f6;
-            color: white;
-            padding: 0.25rem 0.5rem;
-            border-radius: 0.25rem;
-            font-size: 0.75rem;
-            font-weight: bold;
-            margin-left: 0.5rem;
-        }
+        .dropdown-item:hover { background: #e5e7eb; }
+        .logout-btn { color: #dc2626; }
 
         /* Body container */
         .body-container {
@@ -739,13 +683,8 @@ function formatDateTime($dateTimeStr) {
             font-size: 0.875rem;
         }
 
-        .sidebar-btn:hover {
-            background: #35485b;
-        }
-
-        .sidebar-btn.active {
-            background: #059669;
-        }
+        .sidebar-btn:hover { background: #35485b; }
+        .sidebar-btn.active { background: #059669; }
 
         .sidebar-overlay {
             display: none;
@@ -758,9 +697,7 @@ function formatDateTime($dateTimeStr) {
             z-index: 89;
         }
 
-        .sidebar-overlay.active {
-            display: block;
-        }
+        .sidebar-overlay.active { display: block; }
 
         /* Main content */
         .main-content {
@@ -781,9 +718,7 @@ function formatDateTime($dateTimeStr) {
         }
 
         /* Programs section */
-        .programs-section {
-            margin-bottom: 2.5rem;
-        }
+        .programs-section { margin-bottom: 2.5rem; }
 
         .section-title {
             font-size: 1.25rem;
@@ -808,7 +743,7 @@ function formatDateTime($dateTimeStr) {
             background-color: #dbeafe;
             border-left: 4px solid #3b82f6;
         }
-        
+
         .failed-program {
             background-color: #fee2e2;
             border-left: 4px solid #dc2626;
@@ -817,6 +752,12 @@ function formatDateTime($dateTimeStr) {
         .history-program {
             background-color: #f9fafb;
             border-left: 4px solid #10b981;
+        }
+
+        /* FIX: New style for awaiting feedback in history */
+        .awaiting-feedback-program {
+            background-color: #fffbeb;
+            border-left: 4px solid #f59e0b;
         }
 
         .program-name {
@@ -831,7 +772,7 @@ function formatDateTime($dateTimeStr) {
             color: #4b5563;
         }
 
-        /* Program status indicator */
+        /* Status badges */
         .program-status {
             display: inline-block;
             padding: 0.25rem 0.75rem;
@@ -840,36 +781,21 @@ function formatDateTime($dateTimeStr) {
             font-weight: 600;
             margin-left: 0.5rem;
         }
-        
-        .status-upcoming {
-            background: #e5e7eb;
-            color: #4b5563;
-        }
-        
-        .status-ongoing {
-            background: #dbeafe;
-            color: #1e40af;
-        }
-        
-        .status-ended {
-            background: #f3e8ff;
-            color: #6b21a8;
-        }
-        
-        .status-completed {
-            background: #d1fae5;
-            color: #065f46;
-        }
-        
-        .status-failed {
-            background: #fee2e2;
-            color: #991b1b;
+
+        .status-upcoming { background: #e5e7eb; color: #4b5563; }
+        .status-ongoing { background: #dbeafe; color: #1e40af; }
+        .status-ended { background: #f3e8ff; color: #6b21a8; }
+        .status-completed { background: #d1fae5; color: #065f46; }
+        .status-failed { background: #fee2e2; color: #991b1b; }
+
+        /* FIX: New badge for awaiting feedback status */
+        .status-awaiting-feedback {
+            background: #fff3cd;
+            color: #856404;
         }
 
         /* Attendance progress bar */
-        .attendance-progress-container {
-            margin: 1rem 0;
-        }
+        .attendance-progress-container { margin: 1rem 0; }
 
         .attendance-progress-bar {
             width: 100%;
@@ -922,10 +848,29 @@ function formatDateTime($dateTimeStr) {
             border-left: 5px solid #10b981;
         }
 
+        /* FIX: Specific styling for feedback-required section */
+        .feedback-required-section {
+            margin-top: 1.5rem;
+            padding: 1.5rem;
+            background: #fffbeb;
+            border-radius: 0.75rem;
+            border-left: 5px solid #f59e0b;
+        }
+
         .certificate-title {
             font-size: 1.25rem;
             font-weight: 600;
             color: #059669;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .feedback-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #d97706;
             margin-bottom: 1rem;
             display: flex;
             align-items: center;
@@ -938,6 +883,14 @@ function formatDateTime($dateTimeStr) {
             border-radius: 0.5rem;
             margin-bottom: 1rem;
             border-left: 4px solid #059669;
+        }
+
+        .feedback-requirements {
+            background: white;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid #f59e0b;
         }
 
         .requirement {
@@ -953,13 +906,8 @@ function formatDateTime($dateTimeStr) {
             text-align: center;
         }
 
-        .requirement-met {
-            color: #059669;
-        }
-
-        .requirement-not-met {
-            color: #dc2626;
-        }
+        .requirement-met { color: #059669; }
+        .requirement-not-met { color: #dc2626; }
 
         .certificate-buttons {
             display: flex;
@@ -981,14 +929,14 @@ function formatDateTime($dateTimeStr) {
         }
 
         .feedback-btn {
-            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            background: linear-gradient(135deg, #f59e0b, #d97706);
             color: white;
         }
 
         .feedback-btn:hover {
-            background: linear-gradient(135deg, #1d4ed8, #1e40af);
+            background: linear-gradient(135deg, #d97706, #b45309);
             transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
         }
 
         .view-certificate-btn {
@@ -1010,7 +958,7 @@ function formatDateTime($dateTimeStr) {
             border-left: 4px solid #ffc107;
         }
 
-        /* No programs message */
+        /* No programs */
         .no-programs {
             text-align: center;
             color: #6b7280;
@@ -1027,7 +975,6 @@ function formatDateTime($dateTimeStr) {
             color: #9ca3af;
         }
 
-        /* Feedback submission date */
         .feedback-date {
             margin-top: 0.5rem;
             font-size: 0.875rem;
@@ -1049,14 +996,8 @@ function formatDateTime($dateTimeStr) {
         }
 
         @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
         /* Submit button */
@@ -1105,28 +1046,15 @@ function formatDateTime($dateTimeStr) {
             gap: 5px;
         }
 
-        .refresh-btn:hover {
-            background: #2563eb;
-        }
-
-        .refresh-btn i {
-            font-size: 0.7rem;
-        }
+        .refresh-btn:hover { background: #2563eb; }
+        .refresh-btn i { font-size: 0.7rem; }
 
         /* Responsive */
         @media (max-width: 768px) {
-            .mobile-menu-btn {
-                display: block !important;
-            }
-            
-            .system-name-full {
-                display: none;
-            }
-            
-            .system-name-abbr {
-                display: block;
-            }
-            
+            .mobile-menu-btn { display: block !important; }
+            .system-name-full { display: none; }
+            .system-name-abbr { display: block; }
+
             .sidebar {
                 position: fixed;
                 top: 0;
@@ -1136,38 +1064,19 @@ function formatDateTime($dateTimeStr) {
                 z-index: 999;
                 transition: left 0.3s ease-in-out;
             }
-            
-            .sidebar.mobile-open {
-                left: 0;
-            }
-            
+
+            .sidebar.mobile-open { left: 0; }
+
             .main-content {
                 width: 100%;
                 padding: 1rem;
             }
-            
-            .program-card {
-                padding: 1rem;
-            }
-            
-            .certificate-buttons {
-                flex-direction: column;
-            }
-            
-            .certificate-btn {
-                width: 100%;
-                justify-content: center;
-            }
-            
-            .notification-dropdown {
-                width: 280px;
-                right: -30px;
-            }
-            
-            .profile-dropdown {
-                width: 180px;
-                right: 0;
-            }
+
+            .program-card { padding: 1rem; }
+            .certificate-buttons { flex-direction: column; }
+            .certificate-btn { width: 100%; justify-content: center; }
+            .notification-dropdown { width: 280px; right: -30px; }
+            .profile-dropdown { width: 180px; right: 0; }
         }
     </style>
 </head>
@@ -1285,6 +1194,9 @@ function formatDateTime($dateTimeStr) {
                 </div>
             <?php endif; ?>
 
+            <!-- ==========================================
+                 CURRENT PROGRAMS
+            ========================================== -->
             <?php if (!empty($currentPrograms)): ?>
                 <div class="programs-section">
                     <h2 class="section-title">Current Programs</h2>
@@ -1297,10 +1209,13 @@ function formatDateTime($dateTimeStr) {
                                     <span class="program-status status-upcoming">Not Started</span>
                                 <?php elseif ($program['program_is_ongoing']): ?>
                                     <span class="program-status status-ongoing">Ongoing</span>
-                                <?php elseif ($program['assessment_done'] && $program['assessment_passed']): ?>
-                                    <span class="program-status status-completed">Completed</span>
                                 <?php elseif ($program['assessment_done'] && !$program['assessment_passed']): ?>
                                     <span class="program-status status-failed">Failed</span>
+                                <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
+                                    <!-- FIX: Awaiting Feedback badge for current programs -->
+                                    <span class="program-status status-awaiting-feedback">Awaiting Feedback</span>
+                                <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
+                                    <span class="program-status status-completed">Completed</span>
                                 <?php endif; ?>
                             </h3>
                             
@@ -1320,7 +1235,6 @@ function formatDateTime($dateTimeStr) {
                                 <?php endif; ?>
                             </p>
                             
-                            <!-- Show progress and attendance (only if program has started) -->
                             <?php if ($program['program_has_started']): ?>
                                 <div class="attendance-progress-container">
                                     <b>Attendance:</b> <?php echo $program['sessions_attended']; ?> / <?php echo $program['total_days']; ?> days attended
@@ -1358,7 +1272,6 @@ function formatDateTime($dateTimeStr) {
                                         <?php endif; ?>
                                     </div>
 
-                                    <!-- PROJECT SETUP DISPLAY (Title, Instructions, Rubrics) -->
                                     <?php if (!empty($program['project_title_override']) || !empty($program['project_instruction']) || !empty($program['project_rubrics'])): ?>
                                         <div style="background: #f0f9ff; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 4px solid #0ea5e9;">
                                             <h5 style="color: #0ea5e9; margin-bottom: 15px;">
@@ -1418,9 +1331,7 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     <?php endif; ?>
 
-                                    <!-- SUBMISSION FORM OR DISPLAY -->
                                     <?php if ($program['project_submitted']): ?>
-                                        <!-- DISPLAY SUBMITTED PROJECT -->
                                         <div style="background: #f0fdf4; padding: 20px; border-radius: 10px;">
                                             <h5 style="color: #28a745; margin-bottom: 15px;">
                                                 <i class="fas fa-check-circle"></i> Your Submission
@@ -1456,7 +1367,6 @@ function formatDateTime($dateTimeStr) {
                                             <?php endif; ?>
                                         </div>
                                     <?php else: ?>
-                                        <!-- PROJECT SUBMISSION FORM -->
                                         <div style="background: #f0f9ff; padding: 25px; border-radius: 10px;">
                                             <p style="font-size: 0.9rem; color: #0ea5e9; margin-bottom: 20px;">
                                                 <i class="fas fa-info-circle"></i> Submit your project output below. You can only submit once.
@@ -1502,7 +1412,6 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     <?php endif; ?>
 
-                                    <!-- TRAINER'S EVALUATION - ONLY SHOW WHEN SCORE EXISTS AND > 0 -->
                                     <?php if (!empty($program['project_score']) && $program['project_score'] !== null && $program['project_score'] > 0): ?>
                                         <div style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
                                             <h5 style="color: #0ea5e9; margin-bottom: 15px;">
@@ -1536,20 +1445,23 @@ function formatDateTime($dateTimeStr) {
                                             <?php endif; ?>
                                         </div>
                                     <?php elseif ($program['project_submitted'] && (empty($program['project_score']) || $program['project_score'] == 0)): ?>
-                                        <!-- Show waiting message when project is submitted but not yet graded -->
                                         <div style="margin-top: 20px; padding: 20px; background: #fff3cd; border-radius: 10px; border-left: 4px solid #ffc107;">
                                             <h5 style="color: #856404; margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
                                                 <i class="fas fa-clock"></i> Awaiting Evaluation
                                             </h5>
                                             <p style="color: #856404; margin: 0;">
-                                                Your project has been submitted and is waiting for the trainer's evaluation. You will receive the score and feedback once evaluated.
+                                                Your project has been submitted and is waiting for the trainer's evaluation.
                                             </p>
                                         </div>
                                     <?php endif; ?>
                                 </div>
                             <?php endif; ?>
                             
-                            <!-- Certificate/Feedback Section - ONLY FOR PASSED ASSESSMENTS -->
+                            <!-- ==========================================
+                                 FIX: Certificate / Feedback section
+                                 - show_certificate_button = passed + feedback submitted
+                                 - show_feedback_button     = passed + feedback NOT submitted
+                            ========================================== -->
                             <?php if ($program['show_certificate_button']): ?>
                                 <div class="certificate-section">
                                     <div class="certificate-title">
@@ -1573,12 +1485,14 @@ function formatDateTime($dateTimeStr) {
                                         </button>
                                     </div>
                                 </div>
+
                             <?php elseif ($program['show_feedback_button']): ?>
-                                <div class="certificate-section">
-                                    <div class="certificate-title">
+                                <!-- FIX: Use amber/yellow styling to match "awaiting feedback" -->
+                                <div class="feedback-required-section">
+                                    <div class="feedback-title">
                                         <i class="fas fa-comment-dots"></i> Feedback Required
                                     </div>
-                                    <div class="certificate-requirements">
+                                    <div class="feedback-requirements">
                                         <p><strong>Certificate Requirements:</strong></p>
                                         <div class="requirement requirement-met">
                                             <i class="fas fa-check-circle"></i> Attendance
@@ -1587,7 +1501,7 @@ function formatDateTime($dateTimeStr) {
                                             <i class="fas fa-check-circle"></i> Assessment: Passed
                                         </div>
                                         <div class="requirement requirement-not-met">
-                                            <i class="fas fa-times-circle"></i> Feedback: Pending
+                                            <i class="fas fa-times-circle"></i> Feedback: Pending — please submit to unlock your certificate
                                         </div>
                                     </div>
                                     <div class="certificate-buttons">
@@ -1596,6 +1510,7 @@ function formatDateTime($dateTimeStr) {
                                         </button>
                                     </div>
                                 </div>
+
                             <?php elseif ($program['attendance_met'] && !$program['assessment_done']): ?>
                                 <div class="assessment-info">
                                     <h5><i class="fas fa-clock"></i> Awaiting Assessment</h5>
@@ -1607,16 +1522,32 @@ function formatDateTime($dateTimeStr) {
                 </div>
             <?php endif; ?>
 
+            <!-- ==========================================
+                 TRAINING HISTORY
+            ========================================== -->
             <?php if (!empty($history)): ?>
                 <div class="programs-section">
                     <h2 class="section-title">Training History</h2>
                     
                     <?php foreach ($history as $program): ?>
-                        <div class="program-card history-program">
+                        <?php
+                        // FIX: Determine correct card style for history entries
+                        if ($program['assessment_done'] && !$program['assessment_passed']) {
+                            $historyCardClass = 'failed-program';
+                        } elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']) {
+                            $historyCardClass = 'awaiting-feedback-program'; // FIX: amber card while feedback pending
+                        } else {
+                            $historyCardClass = 'history-program'; // green = fully done
+                        }
+                        ?>
+                        <div class="program-card <?php echo $historyCardClass; ?>">
                             <h3 class="program-name">
                                 <?php echo htmlspecialchars($program['program_name']); ?>
-                                <?php if ($program['assessment_done'] && $program['assessment_passed']): ?>
+                                <?php if ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
                                     <span class="program-status status-completed">Completed</span>
+                                <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
+                                    <!-- FIX: Show Awaiting Feedback badge instead of Completed -->
+                                    <span class="program-status status-awaiting-feedback">Awaiting Feedback</span>
                                 <?php elseif ($program['assessment_done'] && !$program['assessment_passed']): ?>
                                     <span class="program-status status-failed">Failed</span>
                                 <?php else: ?>
@@ -1644,12 +1575,37 @@ function formatDateTime($dateTimeStr) {
                                 <?php endif; ?>
                             </p>
                             
-                            <!-- Only show certificate button if assessment is passed -->
-                            <?php if ($program['assessment_done'] && $program['assessment_passed']): ?>
+                            <?php if ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
+                                <!-- FIX: Only show certificate if feedback is also submitted -->
                                 <div style="margin-top: 15px;">
                                     <button class="certificate-btn view-certificate-btn" onclick="location.href='feedback_certificate.php?generate_certificate=1&program_id=<?php echo $program['program_id']; ?>'">
                                         <i class="fas fa-certificate"></i> View Certificate
                                     </button>
+                                </div>
+
+                            <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
+                                <!-- FIX: Show feedback button in history if not yet submitted -->
+                                <div class="feedback-required-section" style="margin-top: 15px;">
+                                    <div class="feedback-title">
+                                        <i class="fas fa-comment-dots"></i> Feedback Required
+                                    </div>
+                                    <div class="feedback-requirements">
+                                        <p><strong>Certificate Requirements:</strong></p>
+                                        <div class="requirement requirement-met">
+                                            <i class="fas fa-check-circle"></i> Attendance
+                                        </div>
+                                        <div class="requirement requirement-met">
+                                            <i class="fas fa-check-circle"></i> Assessment: Passed
+                                        </div>
+                                        <div class="requirement requirement-not-met">
+                                            <i class="fas fa-times-circle"></i> Feedback: Pending — please submit to unlock your certificate
+                                        </div>
+                                    </div>
+                                    <div class="certificate-buttons">
+                                        <button class="certificate-btn feedback-btn" onclick="location.href='feedback_certificate.php?program_id=<?php echo $program['program_id']; ?>&program_name=<?php echo urlencode($program['program_name']); ?>'">
+                                            <i class="fas fa-comment-dots"></i> Submit Feedback
+                                        </button>
+                                    </div>
                                 </div>
                             <?php endif; ?>
                         </div>
@@ -1665,8 +1621,6 @@ function formatDateTime($dateTimeStr) {
 // ==========================================
 // NOTIFICATION FUNCTIONS
 // ==========================================
-
-// Load notifications via AJAX
 function loadNotifications() {
     fetch('notification.php?load=notifications')
         .then(response => response.json())
@@ -1678,25 +1632,16 @@ function loadNotifications() {
         .catch(err => console.error('Notification error:', err));
 }
 
-// Update notification UI
 function updateNotificationUI(notifications, unreadCount) {
-    // Update badge
     updateNotificationBadge(unreadCount);
-    
-    // Update dropdown content
     updateNotificationDropdown(notifications, unreadCount);
 }
 
-// Update notification badge
 function updateNotificationBadge(unreadCount) {
     const notificationBtn = document.querySelector('.notification-btn');
     if (!notificationBtn) return;
-    
-    // Remove existing badge
     const existingBadge = notificationBtn.querySelector('.notification-badge');
     if (existingBadge) existingBadge.remove();
-    
-    // Add new badge if there are unread notifications
     if (unreadCount > 0) {
         const badge = document.createElement('span');
         badge.className = 'notification-badge';
@@ -1705,17 +1650,11 @@ function updateNotificationBadge(unreadCount) {
     }
 }
 
-// Update notification dropdown content
 function updateNotificationDropdown(notifications, unreadCount) {
     const dropdown = document.getElementById('notificationDropdown');
     if (!dropdown) return;
-    
-    // Get the notification list element
     let notificationList = document.getElementById('notificationList');
-    
-    // If notificationList doesn't exist, create it
     if (!notificationList) {
-        // Remove old content and create new structure
         dropdown.innerHTML = `
             <div class="notification-header">
                 Notifications
@@ -1725,7 +1664,6 @@ function updateNotificationDropdown(notifications, unreadCount) {
         `;
         notificationList = document.getElementById('notificationList');
     } else {
-        // Update header
         const header = dropdown.querySelector('.notification-header');
         if (header) {
             header.innerHTML = `
@@ -1733,134 +1671,77 @@ function updateNotificationDropdown(notifications, unreadCount) {
                 ${unreadCount > 0 ? '<button class="mark-all-btn" onclick="markAllAsRead()"><i class="fas fa-check-double"></i> Mark all read</button>' : ''}
             `;
         }
-        
-        // Clear existing list
         notificationList.innerHTML = '';
     }
-    
     if (!notificationList) return;
-    
-    // Populate notifications
     if (notifications.length === 0) {
         notificationList.innerHTML = '<li class="no-notifications">No notifications</li>';
         return;
     }
-    
     notifications.forEach(notif => {
         const isUnread = !notif.is_read;
         const li = document.createElement('li');
         li.className = `notification-item ${isUnread ? 'unread' : ''}`;
         li.setAttribute('data-id', notif.id);
         li.setAttribute('data-read', notif.is_read ? 'true' : 'false');
-        
         li.innerHTML = `
             <div class="notification-title">
                 ${escapeHtml(notif.title)}
                 ${isUnread ? '<span class="new-badge">NEW</span>' : ''}
             </div>
-            <div class="notification-message">
-                ${escapeHtml(notif.message)}
-            </div>
+            <div class="notification-message">${escapeHtml(notif.message)}</div>
             <div class="notification-time">${escapeHtml(notif.created_at)}</div>
         `;
-        
-        // Add click handler directly to the li element
         li.addEventListener('click', function(e) {
             e.stopPropagation();
             const notificationId = this.getAttribute('data-id');
             const isRead = this.getAttribute('data-read') === 'true';
-            
-            if (!isRead) {
-                markAsRead(notificationId, this);
-            }
+            if (!isRead) markAsRead(notificationId, this);
         });
-        
         notificationList.appendChild(li);
     });
 }
 
-// Mark a single notification as read
 function markAsRead(notificationId, element) {
-    // Create form data
     const formData = new FormData();
     formData.append('action', 'mark_read');
     formData.append('notification_id', notificationId);
-    
-    fetch('notification.php', {
-        method: 'POST',
-        body: formData
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            // Update the element
-            element.classList.remove('unread');
-            element.setAttribute('data-read', 'true');
-            
-            // Remove NEW badge
-            const titleDiv = element.querySelector('.notification-title');
-            if (titleDiv) {
-                const newBadge = titleDiv.querySelector('.new-badge');
-                if (newBadge) newBadge.remove();
+    fetch('notification.php', { method: 'POST', body: formData })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                element.classList.remove('unread');
+                element.setAttribute('data-read', 'true');
+                const titleDiv = element.querySelector('.notification-title');
+                if (titleDiv) { const nb = titleDiv.querySelector('.new-badge'); if (nb) nb.remove(); }
+                updateBadgeCountAfterRead();
             }
-            
-            // Update notification message style
-            const messageDiv = element.querySelector('.notification-message');
-            if (messageDiv) {
-                messageDiv.style.fontWeight = '';
-            }
-            
-            // Update badge count
-            updateBadgeCountAfterRead();
-        }
-    })
-    .catch(error => console.error('Error marking as read:', error));
+        })
+        .catch(error => console.error('Error marking as read:', error));
 }
 
-// Mark all notifications as read
 function markAllAsRead() {
     const formData = new FormData();
     formData.append('action', 'mark_all_read');
-    
-    fetch('notification.php', {
-        method: 'POST',
-        body: formData
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            // Update all notification items
-            document.querySelectorAll('.notification-item').forEach(item => {
-                item.classList.remove('unread');
-                item.setAttribute('data-read', 'true');
-                
-                // Remove NEW badges
-                const titleDiv = item.querySelector('.notification-title');
-                if (titleDiv) {
-                    const newBadge = titleDiv.querySelector('.new-badge');
-                    if (newBadge) newBadge.remove();
-                }
-                
-                // Reset message style
-                const messageDiv = item.querySelector('.notification-message');
-                if (messageDiv) {
-                    messageDiv.style.fontWeight = '';
-                }
-            });
-            
-            // Remove badge
-            const badge = document.querySelector('.notification-badge');
-            if (badge) badge.remove();
-            
-            // Hide mark all button
-            const markAllBtn = document.querySelector('.mark-all-btn');
-            if (markAllBtn) markAllBtn.style.display = 'none';
-        }
-    })
-    .catch(error => console.error('Error marking all as read:', error));
+    fetch('notification.php', { method: 'POST', body: formData })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                document.querySelectorAll('.notification-item').forEach(item => {
+                    item.classList.remove('unread');
+                    item.setAttribute('data-read', 'true');
+                    const titleDiv = item.querySelector('.notification-title');
+                    if (titleDiv) { const nb = titleDiv.querySelector('.new-badge'); if (nb) nb.remove(); }
+                });
+                const badge = document.querySelector('.notification-badge');
+                if (badge) badge.remove();
+                const markAllBtn = document.querySelector('.mark-all-btn');
+                if (markAllBtn) markAllBtn.style.display = 'none';
+            }
+        })
+        .catch(error => console.error('Error marking all as read:', error));
 }
 
-// Update badge count after marking one as read
 function updateBadgeCountAfterRead() {
     const badge = document.querySelector('.notification-badge');
     if (badge) {
@@ -1869,14 +1750,12 @@ function updateBadgeCountAfterRead() {
             badge.textContent = count;
         } else {
             badge.remove();
-            // Hide mark all button if no unread
             const markAllBtn = document.querySelector('.mark-all-btn');
             if (markAllBtn) markAllBtn.style.display = 'none';
         }
     }
 }
 
-// Helper function to escape HTML
 function escapeHtml(text) {
     if (!text) return '';
     const div = document.createElement('div');
@@ -1884,38 +1763,25 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Initialize notification system
+function handleNotificationItemClick(e) {
+    e.stopPropagation();
+    const notificationId = this.getAttribute('data-id');
+    const isRead = this.getAttribute('data-read') === 'true';
+    if (!isRead) markAsRead(notificationId, this);
+}
+
 function initNotifications() {
-    // Load notifications immediately
     loadNotifications();
-    
-    // Set up periodic refresh (every 30 seconds)
     setInterval(loadNotifications, 30000);
-    
-    // Add click handlers to initial notification items
     document.querySelectorAll('.notification-item').forEach(item => {
-        // Remove any existing listeners to prevent duplicates
         item.removeEventListener('click', handleNotificationItemClick);
         item.addEventListener('click', handleNotificationItemClick);
     });
 }
 
-// Handler for notification item clicks
-function handleNotificationItemClick(e) {
-    e.stopPropagation();
-    const notificationId = this.getAttribute('data-id');
-    const isRead = this.getAttribute('data-read') === 'true';
-    
-    if (!isRead) {
-        markAsRead(notificationId, this);
-    }
-}
-
 document.addEventListener('DOMContentLoaded', function() {
-    // Initialize notifications
     initNotifications();
 
-    // Mobile menu toggle
     const mobileMenuBtn = document.getElementById('mobileMenuBtn');
     const sidebar = document.getElementById('sidebar');
     const sidebarOverlay = document.createElement('div');
@@ -1927,12 +1793,10 @@ document.addEventListener('DOMContentLoaded', function() {
         if (isOpen) {
             sidebar.classList.remove('mobile-open');
             sidebarOverlay.classList.remove('active');
-            document.body.classList.remove('sidebar-open');
             document.body.style.overflow = '';
         } else {
             sidebar.classList.add('mobile-open');
             sidebarOverlay.classList.add('active');
-            document.body.classList.add('sidebar-open');
             document.body.style.overflow = 'hidden';
             if (profileDropdown) profileDropdown.style.display = 'none';
             if (notificationDropdown) notificationDropdown.style.display = 'none';
@@ -1946,12 +1810,10 @@ document.addEventListener('DOMContentLoaded', function() {
         if (window.innerWidth > 768) {
             sidebar.classList.remove('mobile-open');
             sidebarOverlay.classList.remove('active');
-            document.body.classList.remove('sidebar-open');
             document.body.style.overflow = '';
         }
     });
     
-    // Profile dropdown
     const profileBtn = document.getElementById('profileBtn');
     const profileDropdown = document.getElementById('profileDropdown');
     
@@ -1963,7 +1825,6 @@ document.addEventListener('DOMContentLoaded', function() {
         if (notificationDropdown) notificationDropdown.style.display = 'none';
     });
     
-    // Notification dropdown
     const notificationBtn = document.getElementById('notificationBtn');
     const notificationDropdown = document.getElementById('notificationDropdown');
     
@@ -1974,8 +1835,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 notificationDropdown.style.display = notificationDropdown.style.display === 'block' ? 'none' : 'block';
             }
             if (profileDropdown) profileDropdown.style.display = 'none';
-            
-            // Re-attach click handlers when dropdown opens
             setTimeout(() => {
                 document.querySelectorAll('.notification-item').forEach(item => {
                     item.removeEventListener('click', handleNotificationItemClick);
@@ -1985,7 +1844,6 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
     
-    // Close dropdowns when clicking outside
     document.addEventListener('click', function(e) {
         if (profileBtn && profileDropdown && !profileBtn.contains(e.target) && !profileDropdown.contains(e.target)) {
             profileDropdown.style.display = 'none';
@@ -2020,16 +1878,8 @@ function confirmLogout() {
 function validateProjectForm() {
     const title = document.querySelector('input[name="project_title"]')?.value.trim();
     const description = document.querySelector('textarea[name="project_description"]')?.value.trim();
-    
-    if (!title) {
-        Swal.fire('Error', 'Please enter a project title', 'error');
-        return false;
-    }
-    if (!description) {
-        Swal.fire('Error', 'Please enter a project description', 'error');
-        return false;
-    }
-    
+    if (!title) { Swal.fire('Error', 'Please enter a project title', 'error'); return false; }
+    if (!description) { Swal.fire('Error', 'Please enter a project description', 'error'); return false; }
     return Swal.fire({
         title: 'Submit Project?',
         text: 'You can only submit once. Make sure your project is final.',
@@ -2037,58 +1887,36 @@ function validateProjectForm() {
         showCancelButton: true,
         confirmButtonColor: '#0ea5e9',
         confirmButtonText: 'Yes, submit'
-    }).then((result) => {
-        return result.isConfirmed;
-    });
+    }).then((result) => result.isConfirmed);
 }
 
-// MANUAL REFRESH
 function refreshData() {
     Swal.fire({
         title: 'Refreshing...',
         text: 'Updating training progress',
         allowOutsideClick: false,
-        didOpen: () => {
-            Swal.showLoading();
-        }
+        didOpen: () => { Swal.showLoading(); }
     });
-
-    fetch(window.location.href, {
-        headers: {
-            'X-Requested-With': 'XMLHttpRequest'
-        }
-    })
-    .then(response => response.text())
-    .then(html => {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, 'text/html');
-        const newContent = doc.getElementById('programsContent');
-        
-        if (newContent) {
-            document.getElementById('programsContent').innerHTML = newContent.innerHTML;
-        }
-        
-        const now = new Date();
-        document.getElementById('lastUpdatedTime').textContent = now.toLocaleString('en-US', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
+    fetch(window.location.href, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(response => response.text())
+        .then(html => {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const newContent = doc.getElementById('programsContent');
+            if (newContent) {
+                document.getElementById('programsContent').innerHTML = newContent.innerHTML;
+            }
+            const now = new Date();
+            document.getElementById('lastUpdatedTime').textContent = now.toLocaleString('en-US', {
+                year: 'numeric', month: 'long', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
+            Swal.close();
+        })
+        .catch(error => {
+            console.error('Refresh failed:', error);
+            Swal.fire({ title: 'Refresh Failed', text: 'Unable to update data. Please try again.', icon: 'error', confirmButtonColor: '#3b82f6' });
         });
-        
-        Swal.close();
-    })
-    .catch(error => {
-        console.error('Refresh failed:', error);
-        Swal.fire({
-            title: 'Refresh Failed',
-            text: 'Unable to update data. Please try again.',
-            icon: 'error',
-            confirmButtonColor: '#3b82f6'
-        });
-    });
 }
 </script>
 </body>
