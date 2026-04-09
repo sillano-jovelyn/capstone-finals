@@ -103,7 +103,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $email = trim($_POST['email'] ?? '');
     $password_plain = generatePassword();
 
-    // Debug: Log checkbox values
     error_log("APPLICANT_TYPE POST: " . print_r($_POST['applicant_type'] ?? [], true));
     error_log("NC_HOLDER POST: " . print_r($_POST['nc_holder'] ?? [], true));
     error_log("APPLICANT_TYPE after sanitization: " . print_r($applicant_type, true));
@@ -116,12 +115,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = "Please fill in all required fields.";
     }
 
-    // Validate middle initial
     if (!empty($middleinitial) && !preg_match('/^[A-Za-z]{1,2}$/', $middleinitial)) {
         $errors[] = "Middle initial must be 1-2 letters only.";
     }
 
-    // Validate name fields
     if (!preg_match('/^[A-Za-zÑñ\s-]+$/', $lastname)) {
         $errors[] = "Last name can only contain letters, spaces, and hyphens.";
     }
@@ -129,17 +126,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = "First name can only contain letters, spaces, and hyphens.";
     }
 
-    // Validate contact number
     if (!preg_match('/^09[0-9]{9}$/', $contact_number)) {
         $errors[] = "Contact number must start with 09 and be exactly 11 digits.";
     }
 
-    // Validate email
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = "Invalid email format.";
     }
 
-    // Validate birthday
     if (!empty($birthday)) {
         $dateParts = explode('-', $birthday);
         if (count($dateParts) == 3) {
@@ -163,7 +157,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Check duplicate email
     if (empty($errors)) {
         $checkQuery = "SELECT * FROM trainees WHERE email = ?";
         $checkStmt = $conn->prepare($checkQuery);
@@ -197,7 +190,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $uploadedValidIds = [];
     $uploadedVotersCerts = [];
 
-    // Process scanned ID data
+    $allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
+    $maxFileSize = 10 * 1024 * 1024; // 10MB
+
+    // Process scanned ID data (camera)
     if (isset($_POST['scanned_id_data']) && !empty($_POST['scanned_id_data'])) {
         $scannedIds = json_decode($_POST['scanned_id_data'], true);
         if (is_array($scannedIds)) {
@@ -211,7 +207,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Process scanned certificate data
+    // Process uploaded ID files (file upload)
+    if (isset($_FILES['valid_id_upload']) && !empty($_FILES['valid_id_upload']['name'][0])) {
+        $fileCount = count($_FILES['valid_id_upload']['name']);
+        for ($i = 0; $i < $fileCount; $i++) {
+            if ($_FILES['valid_id_upload']['error'][$i] === UPLOAD_ERR_OK) {
+                $fileTmpPath = $_FILES['valid_id_upload']['tmp_name'][$i];
+                $fileSize    = $_FILES['valid_id_upload']['size'][$i];
+                $fileMime    = mime_content_type($fileTmpPath);
+
+                if ($fileSize > $maxFileSize) {
+                    $errors[] = "Valid ID file #" . ($i + 1) . " exceeds the 10MB size limit.";
+                    continue;
+                }
+                if (!in_array($fileMime, $allowedMimeTypes)) {
+                    $errors[] = "Valid ID file #" . ($i + 1) . " must be an image (JPG, PNG, GIF, WEBP, BMP).";
+                    continue;
+                }
+
+                $ext        = pathinfo($_FILES['valid_id_upload']['name'][$i], PATHINFO_EXTENSION);
+                $uniqueName = 'UPLOADED_ID_' . time() . '_' . $i . '.' . strtolower($ext);
+                $destination = $uploadDir . $uniqueName;
+
+                if (move_uploaded_file($fileTmpPath, $destination)) {
+                    $uploadedValidIds[] = $uniqueName;
+                } else {
+                    $errors[] = "Failed to save uploaded ID file #" . ($i + 1) . ".";
+                }
+            }
+        }
+    }
+
+    // Process scanned certificate data (camera)
     if (isset($_POST['scanned_cert_data']) && !empty($_POST['scanned_cert_data'])) {
         $scannedCerts = json_decode($_POST['scanned_cert_data'], true);
         if (is_array($scannedCerts)) {
@@ -225,11 +252,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    $hasValidId = !empty($uploadedValidIds);
+    // Process uploaded certificate files (file upload)
+    if (isset($_FILES['voters_cert_upload']) && !empty($_FILES['voters_cert_upload']['name'][0])) {
+        $fileCount = count($_FILES['voters_cert_upload']['name']);
+        for ($i = 0; $i < $fileCount; $i++) {
+            if ($_FILES['voters_cert_upload']['error'][$i] === UPLOAD_ERR_OK) {
+                $fileTmpPath = $_FILES['voters_cert_upload']['tmp_name'][$i];
+                $fileSize    = $_FILES['voters_cert_upload']['size'][$i];
+                $fileMime    = mime_content_type($fileTmpPath);
+
+                if ($fileSize > $maxFileSize) {
+                    $errors[] = "Certificate file #" . ($i + 1) . " exceeds the 10MB size limit.";
+                    continue;
+                }
+                if (!in_array($fileMime, $allowedMimeTypes)) {
+                    $errors[] = "Certificate file #" . ($i + 1) . " must be an image (JPG, PNG, GIF, WEBP, BMP).";
+                    continue;
+                }
+
+                $ext        = pathinfo($_FILES['voters_cert_upload']['name'][$i], PATHINFO_EXTENSION);
+                $uniqueName = 'UPLOADED_CERT_' . time() . '_' . $i . '.' . strtolower($ext);
+                $destination = $uploadDir . $uniqueName;
+
+                if (move_uploaded_file($fileTmpPath, $destination)) {
+                    $uploadedVotersCerts[] = $uniqueName;
+                } else {
+                    $errors[] = "Failed to save uploaded certificate file #" . ($i + 1) . ".";
+                }
+            }
+        }
+    }
+
+    $hasValidId    = !empty($uploadedValidIds);
     $hasVotersCert = !empty($uploadedVotersCerts);
 
     if (!$hasValidId || !$hasVotersCert) {
-        $errors[] = "Please upload both Valid Government-Issued ID and Voter's Certificate/Barangay Residency.";
+        $errors[] = "Please provide both Valid Government-Issued ID and Voter's Certificate/Barangay Residency (via camera scan or file upload).";
     }
 
     // If no errors, proceed with registration
@@ -239,53 +297,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $conn->begin_transaction();
         
         try {
-            // Prepare data
-            $fullname = "$lastname, $firstname" . (!empty($middleinitial) ? " $middleinitial." : "");
-            $address = "$house_street, $barangay, $municipality, $city";
-            $finalGender = ($gender === 'Others') ? $gender_specify : $gender;
+            $fullname  = "$lastname, $firstname" . (!empty($middleinitial) ? " $middleinitial." : "");
+            $address   = "$house_street, $barangay, $municipality, $city";
+            $finalGender    = ($gender === 'Others') ? $gender_specify : $gender;
             $finalEducation = ($education === 'Others') ? $education_specify : $education;
             
-            // =============================================
-            // FIX: Handle applicant_type correctly
-            // =============================================
             if (empty($applicant_type)) {
                 $applicant_type = ['None'];
             }
-            // If 'None' is checked along with others, keep only None
             if (in_array('None', $applicant_type) && count($applicant_type) > 1) {
                 $applicant_type = ['None'];
             }
-            $applicant_type_json = json_encode($applicant_type);
-            $finalApplicantType = implode(', ', $applicant_type);
+            $applicant_type_json  = json_encode($applicant_type);
+            $finalApplicantType   = implode(', ', $applicant_type);
 
-            // =============================================
-            // FIX: Handle nc_holder correctly
-            // =============================================
             if (empty($nc_holder)) {
                 $nc_holder = ['None'];
             }
-            // If 'None' is checked along with others, keep only None
             if (in_array('None', $nc_holder) && count($nc_holder) > 1) {
                 $nc_holder = ['None'];
             }
             $nc_holder_json = json_encode($nc_holder);
-            $finalNCHolder = implode(', ', $nc_holder);
+            $finalNCHolder  = implode(', ', $nc_holder);
 
-            // Debug: Log final values
             error_log("Final NC_HOLDER array: " . print_r($nc_holder, true));
             error_log("Final NC_HOLDER JSON: " . $nc_holder_json);
             error_log("Final NC_HOLDER string: " . $finalNCHolder);
             error_log("Final APPLICANT_TYPE array: " . print_r($applicant_type, true));
             error_log("Final APPLICANT_TYPE JSON: " . $applicant_type_json);
 
-            $validIdJson = json_encode($uploadedValidIds);
-            $votersCertJson = json_encode($uploadedVotersCerts);
-            $hashed = password_hash($password_plain, PASSWORD_DEFAULT);
+            $validIdJson     = json_encode($uploadedValidIds);
+            $votersCertJson  = json_encode($uploadedVotersCerts);
+            $hashed          = password_hash($password_plain, PASSWORD_DEFAULT);
 
-            // Insert into users table
-            $userRole = 'trainee';
-            $userStatus = 'active';
-            $allowMultiplePrograms = 0;
+            $userRole               = 'trainee';
+            $userStatus             = 'active';
+            $allowMultiplePrograms  = 0;
             
             $sql2 = "INSERT INTO users (fullname, email, password, role, date_created, status, allow_multiple_programs)
                      VALUES (?, ?, ?, ?, NOW(), ?, ?)";
@@ -304,12 +351,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $user_id = $conn->insert_id;
             $stmt2->close();
 
-            // =============================================
-            // FIX: Corrected bind_param type string
-            // Total: 27 params = 25 strings + age(i) + user_id(i)
-            // s s s s s s s  s  i  s              s       s             s             s               s          s                  s                    s              s                  s           s              s      s       s         s       i
-            // l f m h b mu ci bi ag contact_number gender g_specify civil emp_status education edu_spec app_type nc_holder trainings toolkit validId votersCert email hashed fullname address user_id
-            // =============================================
             $sql1 = "INSERT INTO trainees 
             (lastname, firstname, middleinitial, house_street, barangay, municipality, city,
             birthday, age, contact_number, gender, gender_specify, civil_status, employment_status, 
@@ -323,40 +364,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new Exception("Prepare failed for trainees: " . $conn->error);
             }
 
-            // =============================================
-            // FIX: Correct type string = 27 chars
-            // Positions: 1-7=s, 8=s(birthday), 9=i(age), 10-24=s x15, 25=s(fullname), 26=s(address), 27=i(user_id)
-            // Type string: sssssss + s + i + sssssssssssssss + ss + i = "ssssssssisssssssssssssssssi"
-            // =============================================
             $stmt1->bind_param(
                 "ssssssssisssssssssssssssssi",
-                $lastname,              // 1  s
-                $firstname,             // 2  s
-                $middleinitial,         // 3  s
-                $house_street,          // 4  s
-                $barangay,              // 5  s
-                $municipality,          // 6  s
-                $city,                  // 7  s
-                $birthday,              // 8  s
-                $age,                   // 9  i  ← INTEGER
-                $contact_number,        // 10 s
-                $gender,                // 11 s
-                $gender_specify,        // 12 s
-                $civil_status,          // 13 s
-                $employment_status,     // 14 s
-                $education,             // 15 s
-                $education_specify,     // 16 s
-                $applicant_type_json,   // 17 s
-                $nc_holder_json,        // 18 s  ← NC HOLDER JSON
-                $trainings_attended,    // 19 s
-                $toolkit_received,      // 20 s
-                $validIdJson,           // 21 s
-                $votersCertJson,        // 22 s
-                $email,                 // 23 s
-                $hashed,                // 24 s
-                $fullname,              // 25 s
-                $address,               // 26 s
-                $user_id                // 27 i  ← INTEGER
+                $lastname,
+                $firstname,
+                $middleinitial,
+                $house_street,
+                $barangay,
+                $municipality,
+                $city,
+                $birthday,
+                $age,
+                $contact_number,
+                $gender,
+                $gender_specify,
+                $civil_status,
+                $employment_status,
+                $education,
+                $education_specify,
+                $applicant_type_json,
+                $nc_holder_json,
+                $trainings_attended,
+                $toolkit_received,
+                $validIdJson,
+                $votersCertJson,
+                $email,
+                $hashed,
+                $fullname,
+                $address,
+                $user_id
             );
 
             if (!$stmt1->execute()) {
@@ -367,21 +403,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $conn->commit();
             error_log("Registration successful for: $email");
             
-            // Handle enrollment redirect
             if (isset($_SESSION['pending_enrollment'])) {
                 $program_id = $_SESSION['pending_enrollment'];
                 error_log("Pending enrollment found: $program_id");
                 
                 $_SESSION['temp_registration'] = [
-                    'email' => $email,
-                    'password' => $password_plain,
+                    'email'      => $email,
+                    'password'   => $password_plain,
                     'program_id' => $program_id
                 ];
                 
-                // Send email
                 try {
                     $mail = new PHPMailer(true);
-                    
                     $mail->isSMTP();
                     $mail->Host       = 'smtp.gmail.com';
                     $mail->SMTPAuth   = true;
@@ -389,19 +422,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $mail->Password   = 'gubivcizhhkewkda';
                     $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
                     $mail->Port       = 587;
-                    
                     $mail->setFrom('noreply@municipallivelihood.gov.ph', 'Municipal Livelihood Program');
                     $mail->addAddress($email, $fullname);
-                    
                     $mail->isHTML(true);
                     $mail->Subject = 'Your Account Credentials - Municipal Livelihood Program';
-                    
-                    $mail->Body = generateEmailBody($fullname, $email, $password_plain, $address, $contact_number, $finalGender, $civil_status, $employment_status, $finalEducation, $finalApplicantType, $finalNCHolder, true);
-                    $mail->AltBody = "Welcome to Municipal Livelihood Program!\n\nDear $fullname,\n\nThank you for registering. Your account has been created and you are being enrolled in the selected program.\n\nYOUR TEMPORARY LOGIN CREDENTIALS:\nEmail: $email\nPassword: $password_plain\n\nIMPORTANT: After your first login, please change your password immediately for security.";
-                    
+                    $mail->Body    = generateEmailBody($fullname, $email, $password_plain, $address, $contact_number, $finalGender, $civil_status, $employment_status, $finalEducation, $finalApplicantType, $finalNCHolder, true);
+                    $mail->AltBody = "Welcome to Municipal Livelihood Program!\n\nDear $fullname,\n\nYour account has been created.\n\nEmail: $email\nPassword: $password_plain";
                     $mail->send();
                     error_log("Email sent successfully to: $email");
-                    
                 } catch (Exception $e) {
                     error_log("Mailer Error: " . $e->getMessage());
                 }
@@ -411,12 +439,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit();
             }
             
-            // Regular registration
             error_log("No pending enrollment, sending regular registration email");
             
             try {
                 $mail = new PHPMailer(true);
-                
                 $mail->isSMTP();
                 $mail->Host       = 'smtp.gmail.com';
                 $mail->SMTPAuth   = true;
@@ -424,21 +450,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $mail->Password   = 'gubivcizhhkewkda';
                 $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
                 $mail->Port       = 587;
-                
                 $mail->setFrom('noreply@municipallivelihood.gov.ph', 'Municipal Livelihood Program');
                 $mail->addAddress($email, $fullname);
-                
                 $mail->isHTML(true);
                 $mail->Subject = 'Your Account Credentials - Municipal Livelihood Program';
-                
-                $mail->Body = generateEmailBody($fullname, $email, $password_plain, $address, $contact_number, $finalGender, $civil_status, $employment_status, $finalEducation, $finalApplicantType, $finalNCHolder, false);
-                $mail->AltBody = "Welcome to Municipal Livelihood Program!\n\nDear $fullname,\n\nThank you for registering. Your account has been created.\n\nYOUR TEMPORARY LOGIN CREDENTIALS:\nEmail: $email\nPassword: $password_plain\n\nIMPORTANT: After your first login, please change your password immediately for security.";
-                
+                $mail->Body    = generateEmailBody($fullname, $email, $password_plain, $address, $contact_number, $finalGender, $civil_status, $employment_status, $finalEducation, $finalApplicantType, $finalNCHolder, false);
+                $mail->AltBody = "Welcome to Municipal Livelihood Program!\n\nDear $fullname,\n\nYour account has been created.\n\nEmail: $email\nPassword: $password_plain";
                 $mail->send();
                 $success = true;
                 $message = "Registration successful! Your temporary login credentials have been sent to $email. Please check your email for instructions to change your password after first login.";
                 error_log("Regular registration email sent successfully");
-                
             } catch (Exception $e) {
                 $success = true;
                 $message = "Registration successful! However, we were unable to send the credentials email to $email. Please note your temporary credentials:<br><br>
@@ -486,32 +507,26 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
     <body>
         <div class='container'>
             <h2 class='header'>Welcome to Municipal Livelihood Program!</h2>
-            
             <div class='user-info'>
                 <p><strong>Dear $fullname,</strong></p>
                 <p>Thank you for registering with the Municipal Livelihood Program. Your account has been successfully created.</p>
                 $enrollmentText
             </div>
-            
             <div class='credentials-box'>
                 <h3 style='color: #d35400; margin-top: 0; text-align: center;'>YOUR TEMPORARY LOGIN CREDENTIALS</h3>
-                
                 <div class='credential-item'>
                     <span class='label'>Email Address:</span><br>
                     <span class='value'>$email</span>
                 </div>
-                
                 <div class='credential-item'>
                     <span class='label'>Temporary Password:</span><br>
                     <div style='background-color: #e7f3fe; border: 1px solid #0066cc; border-radius: 6px; padding: 10px; margin: 10px 0; font-family: monospace; font-size: 16px;'>$password_plain</div>
                 </div>
             </div>
-
             <div class='password-change'>
                 <h4 style='color: #0c5460; margin-top: 0;'>⚠️ IMPORTANT: CHANGE YOUR PASSWORD</h4>
                 <p>After your first login, please change your password immediately.</p>
             </div>
-
             <div class='warning'>
                 <h4 style='color: #dc3545; margin-top: 0;'>SECURITY REMINDER</h4>
                 <ul>
@@ -519,7 +534,6 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                     <li>Do not share your password with anyone</li>
                 </ul>
             </div>
-
             <div class='user-info'>
                 <h4 style='color: #2c5aa0; margin-top: 0;'>Registration Details</h4>
                 <p><strong>Full Name:</strong> $fullname</p>
@@ -533,12 +547,10 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                 <p><strong>NC Holder:</strong> $finalNCHolder</p>
                 <p><strong>Registration Date:</strong> " . date('F j, Y') . "</p>
             </div>
-            
             <div class='footer'>
                 <p><strong>Need Help?</strong> Contact our support team.</p>
                 <p>This is an automated message. Please do not reply.</p>
             </div>
-            
             <p>Best regards,<br><strong>Municipal Livelihood Program Team</strong></p>
         </div>
     </body>
@@ -610,8 +622,33 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
         .checkbox-item:hover { background: rgba(255, 255, 255, 0.1); }
         .checkbox-item input[type="checkbox"] { width: 18px; height: 18px; margin-right: 10px; accent-color: #20c997; flex-shrink: 0; }
         .checkbox-item label { margin: 0; font-weight: normal; cursor: pointer; flex: 1; }
-        /* Disabled state for mutually exclusive checkboxes */
         .checkbox-item input[type="checkbox"]:disabled + label { opacity: 0.5; cursor: not-allowed; }
+
+        /* ── Document upload tab styles ── */
+        .doc-upload-box { border: 2px dashed #20c997; border-radius: 10px; padding: 20px; background: rgba(32, 201, 151, 0.1); margin-bottom: 15px; }
+        .tab-switcher { display: flex; gap: 0; margin-bottom: 18px; border-radius: 8px; overflow: hidden; border: 2px solid #20c997; }
+        .tab-btn { flex: 1; padding: 10px 0; background: transparent; border: none; color: rgba(255,255,255,0.7); font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.25s; font-family: 'Poppins', sans-serif; }
+        .tab-btn.active { background: linear-gradient(135deg, #20c997, #17a589); color: white; }
+        .tab-btn:not(.active):hover { background: rgba(32,201,151,0.15); color: white; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        /* file drop zone */
+        .file-drop-zone { border: 2px dashed rgba(255,255,255,0.35); border-radius: 10px; padding: 28px 20px; text-align: center; background: rgba(255,255,255,0.05); cursor: pointer; transition: all 0.3s; position: relative; }
+        .file-drop-zone:hover, .file-drop-zone.dragover { border-color: #20c997; background: rgba(32,201,151,0.1); }
+        .file-drop-zone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+        .file-drop-zone .drop-icon { font-size: 2.5rem; margin-bottom: 10px; }
+        .file-drop-zone p { color: rgba(255,255,255,0.8); margin: 0; font-size: 14px; }
+        .file-drop-zone strong { color: #20c997; }
+        .uploaded-file-list { margin-top: 12px; }
+        .uploaded-file-item { display: flex; align-items: center; gap: 10px; background: rgba(32,201,151,0.12); border: 1px solid rgba(32,201,151,0.3); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
+        .uploaded-file-item img { width: 50px; height: 50px; object-fit: cover; border-radius: 5px; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; }
+        .uploaded-file-item .file-info { flex: 1; overflow: hidden; }
+        .uploaded-file-item .file-name { font-size: 13px; color: white; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .uploaded-file-item .file-size { font-size: 11px; color: rgba(255,255,255,0.6); }
+        .uploaded-file-item .remove-btn { background: rgba(220,53,69,0.7); border: none; color: white; border-radius: 5px; padding: 4px 8px; cursor: pointer; font-size: 12px; flex-shrink: 0; transition: background 0.2s; }
+        .uploaded-file-item .remove-btn:hover { background: rgba(220,53,69,1); }
+
         @media (max-width: 768px) {
             .form-row { flex-direction: column; gap: 0; }
             .form-wrapper { padding: 25px 20px; margin: 10px; transform: translateY(10px); }
@@ -679,7 +716,7 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
         <div class="container">
             <div class="form-wrapper">
                 <h1>Municipal Livelihood Program Registration</h1>
-                <p class="subtitle">Please complete the form and scan your requirements using the camera.</p>
+                <p class="subtitle">Please complete the form and provide your required documents.</p>
 
                 <?php if (isset($_SESSION['pending_enrollment'])): 
                     $program_id = $_SESSION['pending_enrollment'];
@@ -693,7 +730,6 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                     <div class="program-notice">
                         <h3>Program Enrollment</h3>
                         <p>You are registering for: <strong><?php echo htmlspecialchars($program_name); ?></strong></p>
-                       <!-- <p>After registration, you will be automatically enrolled in this program.</p> -->
                     </div>
                 <?php endif; ?>
 
@@ -901,116 +937,144 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                         <input type="text" name="toolkit_received" required placeholder="Put N/A if none" value="<?php echo htmlspecialchars($toolkit_received ?? ''); ?>">
                     </div>
 
-                    <!-- Document Scanning Section -->
-                    <h2>Document Scanning</h2>
+                    <!-- ============================================================ -->
+                    <!-- DOCUMENT SCANNING SECTION                                    -->
+                    <!-- ============================================================ -->
+                    <h2>Document Submission</h2>
 
-                    <!-- Step-by-Step Guide -->
                     <div class="scan-step">
-                        <div style="background: rgba(0, 0, 0, 0.2); border: 2px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 20px; margin-bottom: 15px;">
-                            <strong style="color: #20c997; display: block; margin-bottom: 10px;">Step-by-Step Scanning Procedure:</strong>
-                            <ol style="margin: 0 0 0 20px; color: rgba(255, 255, 255, 0.9); padding: 0;">
-                                <li><strong>Click "Scan ID/Certificate" button</strong> below</li>
-                                <li><strong>Position document:</strong> Place on dark surface
-                                    <ul style="margin: 5px 0 5px 20px;">
-                                        <li>Align document edges properly</li>
-                                        <li>Ensure official seals are visible</li>
-                                        <li>Good lighting is helpful</li>
-                                    </ul>
-                                </li>
-                                <li><strong>Scan:</strong> Capture the document
-                                    <ul style="margin: 5px 0 5px 20px;">
-                                        <li>Keep within the frame</li>
-                                        <li>Text must be readable</li>
-                                    </ul>
-                                </li>
-                                <li><strong>Verification:</strong> System will check:
-                                    <ul style="margin: 5px 0 5px 20px;">
-                                        <li>Readability of text</li>
-                                        <li>Visibility of signatures and seals</li>
-                                    </ul>
-                                </li>
-                                <li><strong>Submit:</strong> Click "Confirm Scan" if verification passes</li>
-                            </ol>
+                        <div style="background: rgba(0,0,0,0.2); border: 2px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 20px; margin-bottom: 15px;">
+                            <strong style="color: #20c997; display: block; margin-bottom: 10px;">How to submit your documents:</strong>
+                            <p style="color: rgba(255,255,255,0.85); font-size: 14px; margin: 0;">
+                                For each document below, you can either <strong>scan using your camera</strong> or <strong>upload an image file</strong> from your device.
+                                Both methods are accepted. Accepted formats: JPG, PNG, GIF, WEBP, BMP (max 10 MB per file).
+                            </p>
                         </div>
                     </div>
 
-                    <!-- ID Scanning -->
+                    <!-- ── VALID ID ── -->
                     <div class="form-group">
                         <label>Valid Government-Issued ID *</label>
 
-                        <div style="border: 2px dashed #20c997; border-radius: 10px; padding: 20px; text-align: center; background: rgba(32, 201, 151, 0.1); margin-bottom: 15px;">
-                            <div id="cameraContainer" style="display: none;">
-                                <video id="cameraFeed" autoplay playsinline style="width: 100%; max-width: 500px; border-radius: 8px; border: 2px solid #20c997;"></video>
-                                <div style="margin: 15px 0;">
-                                    <canvas id="scanCanvas" style="display: none;"></canvas>
-                                    <button type="button" id="captureBtn" class="btn-primary" style="margin: 5px;">Capture Scan</button>
-                                    <button type="button" id="cancelScanBtn" class="btn-primary" style="margin: 5px; background: rgba(108, 117, 125, 0.8);">Cancel</button>
-                                </div>
-                            </div>
-
-                            <div id="scanPreview" style="display: none; margin: 15px 0;">
-                                <h4 style="color: #20c997;">ID Scan Preview</h4>
-                                <img id="previewImage" src="" style="max-width: 300px; border: 2px solid rgba(255, 255, 255, 0.2); border-radius: 8px; margin-bottom: 15px;">
-                                <div style="margin: 15px 0;">
-                                    <button type="button" id="confirmScanBtn" class="btn-primary" style="margin: 5px;">Confirm Scan</button>
-                                    <button type="button" id="rescanBtn" class="btn-primary" style="margin: 5px; background: rgba(108, 117, 125, 0.8);">Rescan</button>
-                                </div>
-                            </div>
-
-                            <div id="scanControls">
-                                <button type="button" id="startScanBtn" class="btn-primary" style="margin: 10px;">
-                                    <i style="margin-right: 8px;">📷</i> Start Live ID Scanning
+                        <div class="doc-upload-box">
+                            <!-- Tab switcher -->
+                            <div class="tab-switcher">
+                                <button type="button" class="tab-btn active" onclick="switchTab('id','camera')">
+                                    📷 Use Camera
                                 </button>
-                                <div style="color: rgba(255, 255, 255, 0.8); font-size: 14px; margin-top: 10px;">
-                                    <p><strong>Note:</strong> Make sure the ID is clear and all text is readable.</p>
-                                </div>
+                                <button type="button" class="tab-btn" onclick="switchTab('id','upload')">
+                                    📁 Upload File
+                                </button>
                             </div>
 
-                            <input type="hidden" name="scanned_id_data" id="scanned_id_data">
-                            <input type="file" name="valid_id[]" id="valid_id_file" multiple accept="image/*" style="display: none;">
+                            <!-- Camera tab -->
+                            <div class="tab-panel active" id="id-tab-camera">
+                                <div id="cameraContainer" style="display: none;">
+                                    <video id="cameraFeed" autoplay playsinline style="width: 100%; max-width: 500px; border-radius: 8px; border: 2px solid #20c997;"></video>
+                                    <div style="margin: 15px 0;">
+                                        <canvas id="scanCanvas" style="display: none;"></canvas>
+                                        <button type="button" id="captureBtn" class="btn-primary" style="margin: 5px;">Capture Scan</button>
+                                        <button type="button" id="cancelScanBtn" class="btn-primary" style="margin: 5px; background: rgba(108,117,125,0.8);">Cancel</button>
+                                    </div>
+                                </div>
+
+                                <div id="scanPreview" style="display: none; margin: 15px 0;">
+                                    <h4 style="color: #20c997;">ID Scan Preview</h4>
+                                    <img id="previewImage" src="" style="max-width: 300px; border: 2px solid rgba(255,255,255,0.2); border-radius: 8px; margin-bottom: 15px;">
+                                    <div style="margin: 15px 0;">
+                                        <button type="button" id="confirmScanBtn" class="btn-primary" style="margin: 5px;">Confirm Scan</button>
+                                        <button type="button" id="rescanBtn" class="btn-primary" style="margin: 5px; background: rgba(108,117,125,0.8);">Rescan</button>
+                                    </div>
+                                </div>
+
+                                <div id="scanControls" style="text-align:center;">
+                                    <button type="button" id="startScanBtn" class="btn-primary" style="margin: 10px;">
+                                        📷 Start Live ID Scanning
+                                    </button>
+                                    <div style="color: rgba(255,255,255,0.8); font-size: 14px; margin-top: 10px;">
+                                        <p><strong>Note:</strong> Make sure the ID is clear and all text is readable.</p>
+                                    </div>
+                                </div>
+
+                                <input type="hidden" name="scanned_id_data" id="scanned_id_data">
+                            </div>
+
+                            <!-- Upload tab -->
+                            <div class="tab-panel" id="id-tab-upload">
+                                <div class="file-drop-zone" id="idDropZone">
+                                    <input type="file" name="valid_id_upload[]" id="valid_id_upload" multiple accept="image/*" onchange="handleFileSelect(this,'idFileList','idDropZone')">
+                                    <div class="drop-icon">🖼️</div>
+                                    <p><strong>Click to browse</strong> or drag &amp; drop your ID image(s) here</p>
+                                    <p style="margin-top: 6px; font-size: 12px;">JPG, PNG, GIF, WEBP, BMP &nbsp;|&nbsp; Max 10 MB per file</p>
+                                </div>
+                                <div class="uploaded-file-list" id="idFileList"></div>
+                            </div>
                         </div>
 
-                        <div id="scannedIdList" style="margin-top: 15px;"></div>
+                        <div id="scannedIdList" style="margin-top: 10px;"></div>
                     </div>
 
-                    <!-- Voter's Certificate Scanning -->
+                    <!-- ── VOTER'S / BARANGAY CERTIFICATE ── -->
                     <div class="form-group">
                         <label>Voter's Certificate / Barangay Certificate of Residency *</label>
 
-                        <div style="border: 2px dashed #20c997; border-radius: 10px; padding: 20px; text-align: center; background: rgba(32, 201, 151, 0.1);">
-                            <div id="certCameraContainer" style="display: none;">
-                                <video id="certCameraFeed" autoplay playsinline style="width: 100%; max-width: 500px; border-radius: 8px; border: 2px solid #20c997;"></video>
-                                <div style="margin: 15px 0;">
-                                    <canvas id="certScanCanvas" style="display: none;"></canvas>
-                                    <button type="button" id="certCaptureBtn" class="btn-primary" style="margin: 5px;">Capture Scan</button>
-                                    <button type="button" id="certCancelScanBtn" class="btn-primary" style="margin: 5px; background: rgba(108, 117, 125, 0.8);">Cancel</button>
-                                </div>
-                            </div>
-
-                            <div id="certScanPreview" style="display: none; margin: 15px 0;">
-                                <h4 style="color: #20c997;">Certificate Scan Preview</h4>
-                                <img id="certPreviewImage" src="" style="max-width: 300px; border: 2px solid rgba(255, 255, 255, 0.2); border-radius: 8px;">
-                                <div id="certVerificationResult" style="margin: 15px 0; padding: 15px; border-radius: 8px; display: none;"></div>
-                                <div style="margin: 15px 0;">
-                                    <button type="button" id="certConfirmScanBtn" class="btn-primary" style="margin: 5px; display: none;">Confirm Scan</button>
-                                    <button type="button" id="certRescanBtn" class="btn-primary" style="margin: 5px; background: rgba(108, 117, 125, 0.8);">Rescan</button>
-                                </div>
-                            </div>
-
-                            <div id="certScanControls">
-                                <button type="button" id="startCertScanBtn" class="btn-primary" style="margin: 10px;">
-                                    <i style="margin-right: 8px;">📄</i> Start Live Certificate Scanning
+                        <div class="doc-upload-box">
+                            <!-- Tab switcher -->
+                            <div class="tab-switcher">
+                                <button type="button" class="tab-btn active" onclick="switchTab('cert','camera')">
+                                    📷 Use Camera
                                 </button>
-                                <div style="color: rgba(255, 255, 255, 0.8); font-size: 14px; margin-top: 10px;">
-                                    <p><strong>Note:</strong> Certificate should be issued within last 3 months. Low resolution accepted as long as text is readable.</p>
-                                </div>
+                                <button type="button" class="tab-btn" onclick="switchTab('cert','upload')">
+                                    📁 Upload File
+                                </button>
                             </div>
 
-                            <input type="hidden" name="scanned_cert_data" id="scanned_cert_data">
-                            <input type="file" name="voters_certificate[]" id="voters_cert_file" multiple accept="image/*" style="display: none;">
+                            <!-- Camera tab -->
+                            <div class="tab-panel active" id="cert-tab-camera">
+                                <div id="certCameraContainer" style="display: none;">
+                                    <video id="certCameraFeed" autoplay playsinline style="width: 100%; max-width: 500px; border-radius: 8px; border: 2px solid #20c997;"></video>
+                                    <div style="margin: 15px 0;">
+                                        <canvas id="certScanCanvas" style="display: none;"></canvas>
+                                        <button type="button" id="certCaptureBtn" class="btn-primary" style="margin: 5px;">Capture Scan</button>
+                                        <button type="button" id="certCancelScanBtn" class="btn-primary" style="margin: 5px; background: rgba(108,117,125,0.8);">Cancel</button>
+                                    </div>
+                                </div>
+
+                                <div id="certScanPreview" style="display: none; margin: 15px 0;">
+                                    <h4 style="color: #20c997;">Certificate Scan Preview</h4>
+                                    <img id="certPreviewImage" src="" style="max-width: 300px; border: 2px solid rgba(255,255,255,0.2); border-radius: 8px;">
+                                    <div id="certVerificationResult" style="margin: 15px 0; padding: 15px; border-radius: 8px; display: none;"></div>
+                                    <div style="margin: 15px 0;">
+                                        <button type="button" id="certConfirmScanBtn" class="btn-primary" style="margin: 5px; display: none;">Confirm Scan</button>
+                                        <button type="button" id="certRescanBtn" class="btn-primary" style="margin: 5px; background: rgba(108,117,125,0.8);">Rescan</button>
+                                    </div>
+                                </div>
+
+                                <div id="certScanControls" style="text-align:center;">
+                                    <button type="button" id="startCertScanBtn" class="btn-primary" style="margin: 10px;">
+                                        📄 Start Live Certificate Scanning
+                                    </button>
+                                    <div style="color: rgba(255,255,255,0.8); font-size: 14px; margin-top: 10px;">
+                                        <p><strong>Note:</strong> Certificate should be issued within last 3 months.</p>
+                                    </div>
+                                </div>
+
+                                <input type="hidden" name="scanned_cert_data" id="scanned_cert_data">
+                            </div>
+
+                            <!-- Upload tab -->
+                            <div class="tab-panel" id="cert-tab-upload">
+                                <div class="file-drop-zone" id="certDropZone">
+                                    <input type="file" name="voters_cert_upload[]" id="voters_cert_upload" multiple accept="image/*" onchange="handleFileSelect(this,'certFileList','certDropZone')">
+                                    <div class="drop-icon">📄</div>
+                                    <p><strong>Click to browse</strong> or drag &amp; drop your certificate image(s) here</p>
+                                    <p style="margin-top: 6px; font-size: 12px;">JPG, PNG, GIF, WEBP, BMP &nbsp;|&nbsp; Max 10 MB per file</p>
+                                </div>
+                                <div class="uploaded-file-list" id="certFileList"></div>
+                            </div>
                         </div>
 
-                        <div id="scannedCertList" style="margin-top: 15px;"></div>
+                        <div id="scannedCertList" style="margin-top: 10px;"></div>
                     </div>
 
                     <!-- Password Note -->
@@ -1041,71 +1105,122 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                 e.stopPropagation();
                 mobileMenu.classList.toggle('active');
                 body.classList.toggle('menu-open');
-                
                 const icon = burgerBtn.querySelector('i');
                 if (mobileMenu.classList.contains('active')) {
-                    icon.classList.remove('fa-bars');
-                    icon.classList.add('fa-times');
+                    icon.classList.replace('fa-bars','fa-times');
                 } else {
-                    icon.classList.remove('fa-times');
-                    icon.classList.add('fa-bars');
+                    icon.classList.replace('fa-times','fa-bars');
                 }
             });
-
             document.addEventListener('click', (e) => {
                 if (!burgerBtn.contains(e.target) && !mobileMenu.contains(e.target)) {
                     mobileMenu.classList.remove('active');
                     body.classList.remove('menu-open');
-                    
-                    const icon = burgerBtn.querySelector('i');
-                    icon.classList.remove('fa-times');
-                    icon.classList.add('fa-bars');
+                    burgerBtn.querySelector('i').classList.replace('fa-times','fa-bars');
                 }
             });
-
-            const mobileLinks = mobileMenu.querySelectorAll('.nav-link');
-            mobileLinks.forEach(link => {
+            mobileMenu.querySelectorAll('.nav-link').forEach(link => {
                 link.addEventListener('click', () => {
                     mobileMenu.classList.remove('active');
                     body.classList.remove('menu-open');
-                    
-                    const icon = burgerBtn.querySelector('i');
-                    icon.classList.remove('fa-times');
-                    icon.classList.add('fa-bars');
+                    burgerBtn.querySelector('i').classList.replace('fa-times','fa-bars');
                 });
             });
-
             document.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape' && mobileMenu.classList.contains('active')) {
                     mobileMenu.classList.remove('active');
                     body.classList.remove('menu-open');
-                    
-                    const icon = burgerBtn.querySelector('i');
-                    icon.classList.remove('fa-times');
-                    icon.classList.add('fa-bars');
+                    burgerBtn.querySelector('i').classList.replace('fa-times','fa-bars');
                 }
             });
         }
 
-        function toggleBodyScroll(disable) {
-            if (disable) {
-                body.style.overflow = 'hidden';
+        // ==========================================
+        // TAB SWITCHER FOR DOCUMENT UPLOAD
+        // ==========================================
+        function switchTab(doc, tab) {
+            // doc = 'id' | 'cert'
+            const cameraPanel = document.getElementById(doc + '-tab-camera');
+            const uploadPanel  = document.getElementById(doc + '-tab-upload');
+            const btns = cameraPanel.closest('.doc-upload-box').querySelectorAll('.tab-btn');
+
+            btns.forEach(b => b.classList.remove('active'));
+            cameraPanel.classList.remove('active');
+            uploadPanel.classList.remove('active');
+
+            if (tab === 'camera') {
+                cameraPanel.classList.add('active');
+                btns[0].classList.add('active');
             } else {
-                body.style.overflow = '';
+                uploadPanel.classList.add('active');
+                btns[1].classList.add('active');
             }
         }
 
-        if (mobileMenu) {
-            const observer = new MutationObserver(function(mutations) {
-                mutations.forEach(function(mutation) {
-                    if (mutation.attributeName === 'class') {
-                        toggleBodyScroll(mobileMenu.classList.contains('active'));
-                    }
-                });
+        // ==========================================
+        // FILE UPLOAD PREVIEW
+        // ==========================================
+        function handleFileSelect(input, listId, dropZoneId) {
+            const list = document.getElementById(listId);
+            list.innerHTML = '';
+
+            const files = Array.from(input.files);
+            const maxSize = 10 * 1024 * 1024;
+            const allowedTypes = ['image/jpeg','image/png','image/gif','image/webp','image/bmp'];
+
+            files.forEach((file, idx) => {
+                if (!allowedTypes.includes(file.type)) {
+                    showFileError(list, file.name + ': Not a valid image type.');
+                    return;
+                }
+                if (file.size > maxSize) {
+                    showFileError(list, file.name + ': Exceeds 10 MB limit.');
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const item = document.createElement('div');
+                    item.className = 'uploaded-file-item';
+                    item.dataset.index = idx;
+                    item.innerHTML = `
+                        <img src="${e.target.result}" alt="preview">
+                        <div class="file-info">
+                            <div class="file-name">${file.name}</div>
+                            <div class="file-size">${(file.size / 1024).toFixed(1)} KB</div>
+                        </div>
+                        <button type="button" class="remove-btn" onclick="removeFile(this,'${input.id}','${listId}',${idx})">✕ Remove</button>
+                    `;
+                    list.appendChild(item);
+                };
+                reader.readAsDataURL(file);
             });
-            
-            observer.observe(mobileMenu, { attributes: true });
         }
+
+        function showFileError(list, msg) {
+            const err = document.createElement('p');
+            err.style.cssText = 'color: #fca5a5; font-size: 13px; margin: 5px 0;';
+            err.textContent = '⚠️ ' + msg;
+            list.appendChild(err);
+        }
+
+        function removeFile(btn, inputId, listId, idx) {
+            const input = document.getElementById(inputId);
+            const dt = new DataTransfer();
+            Array.from(input.files).forEach((f, i) => {
+                if (i !== idx) dt.items.add(f);
+            });
+            input.files = dt.files;
+            // Re-render the list
+            handleFileSelect(input, listId, null);
+        }
+
+        // Drag & drop highlight
+        document.querySelectorAll('.file-drop-zone').forEach(zone => {
+            zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+            zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+            zone.addEventListener('drop', e => { e.preventDefault(); zone.classList.remove('dragover'); });
+        });
 
         // ==========================================
         // FORM VALIDATION AND INTERACTIVITY
@@ -1121,7 +1236,6 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
             const educationSpecifyInput = document.getElementById('education_specify');
             const contactNumberInput = document.getElementById('contact_number');
             
-            // Calculate age when birthday changes
             if (birthdayInput && ageInput) {
                 birthdayInput.addEventListener('change', function() {
                     if (this.value) {
@@ -1129,164 +1243,106 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                         const today = new Date();
                         let age = today.getFullYear() - birthDate.getFullYear();
                         const monthDiff = today.getMonth() - birthDate.getMonth();
-                        
-                        if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-                            age--;
-                        }
-                        
+                        if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) age--;
                         ageInput.value = age;
-                        
-                        if (age < 18 || age > 70) {
-                            birthdayInput.style.borderColor = '#ffc107';
-                            ageInput.style.borderColor = '#ffc107';
-                        } else {
-                            birthdayInput.style.borderColor = '';
-                            ageInput.style.borderColor = '';
-                        }
+                        const invalid = age < 18 || age > 70;
+                        birthdayInput.style.borderColor = invalid ? '#ffc107' : '';
+                        ageInput.style.borderColor    = invalid ? '#ffc107' : '';
                     }
                 });
-                
-                if (birthdayInput.value) {
-                    const birthDate = new Date(birthdayInput.value);
-                    const today = new Date();
-                    let age = today.getFullYear() - birthDate.getFullYear();
-                    const monthDiff = today.getMonth() - birthDate.getMonth();
-                    
-                    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-                        age--;
-                    }
-                    
-                    ageInput.value = age;
-                }
+                if (birthdayInput.value) birthdayInput.dispatchEvent(new Event('change'));
             }
             
-            // Handle gender change
             if (genderSelect) {
                 genderSelect.addEventListener('change', function() {
-                    if (this.value === 'Others') {
-                        genderSpecifyGroup.style.display = 'flex';
-                        genderSpecifyInput.required = true;
-                    } else {
-                        genderSpecifyGroup.style.display = 'none';
-                        genderSpecifyInput.required = false;
-                        genderSpecifyInput.value = '';
-                    }
+                    const show = this.value === 'Others';
+                    genderSpecifyGroup.style.display = show ? 'flex' : 'none';
+                    genderSpecifyInput.required = show;
+                    if (!show) genderSpecifyInput.value = '';
                 });
-                
                 if (genderSelect.value === 'Others') {
                     genderSpecifyGroup.style.display = 'flex';
                     genderSpecifyInput.required = true;
                 }
             }
             
-            // Handle education change
             if (educationSelect) {
                 educationSelect.addEventListener('change', function() {
-                    if (this.value === 'Others') {
-                        educationSpecifyGroup.style.display = 'flex';
-                        educationSpecifyInput.required = true;
-                    } else {
-                        educationSpecifyGroup.style.display = 'none';
-                        educationSpecifyInput.required = false;
-                        educationSpecifyInput.value = '';
-                    }
+                    const show = this.value === 'Others';
+                    educationSpecifyGroup.style.display = show ? 'flex' : 'none';
+                    educationSpecifyInput.required = show;
+                    if (!show) educationSpecifyInput.value = '';
                 });
-                
                 if (educationSelect.value === 'Others') {
                     educationSpecifyGroup.style.display = 'flex';
                     educationSpecifyInput.required = true;
                 }
             }
             
-            // Validate contact number - digits only
             if (contactNumberInput) {
                 contactNumberInput.addEventListener('input', function() {
-                    let value = this.value.replace(/\D/g, '');
-                    if (value.length > 11) {
-                        value = value.substring(0, 11);
-                    }
-                    this.value = value;
+                    let v = this.value.replace(/\D/g, '');
+                    if (v.length > 11) v = v.substring(0, 11);
+                    this.value = v;
                 });
             }
 
-            // ==========================================
-            // FIX: NC HOLDER MUTUAL EXCLUSION LOGIC
-            // ==========================================
+            // NC Holder mutual exclusion
             const ncNone = document.getElementById('nc_none');
             const ncNC1  = document.getElementById('nc_nc1');
             const ncNC2  = document.getElementById('nc_nc2');
-
             if (ncNone && ncNC1 && ncNC2) {
-                // When "None" is checked → uncheck NC1 and NC2
-                ncNone.addEventListener('change', function() {
-                    if (this.checked) {
-                        ncNC1.checked = false;
-                        ncNC2.checked = false;
-                    }
-                });
-
-                // When NC1 is checked → uncheck "None"
-                ncNC1.addEventListener('change', function() {
-                    if (this.checked) {
-                        ncNone.checked = false;
-                    }
-                });
-
-                // When NC2 is checked → uncheck "None"
-                ncNC2.addEventListener('change', function() {
-                    if (this.checked) {
-                        ncNone.checked = false;
-                    }
-                });
+                ncNone.addEventListener('change', function() { if (this.checked) { ncNC1.checked = false; ncNC2.checked = false; } });
+                ncNC1.addEventListener('change',  function() { if (this.checked) ncNone.checked = false; });
+                ncNC2.addEventListener('change',  function() { if (this.checked) ncNone.checked = false; });
             }
 
-            // ==========================================
-            // FIX: APPLICANT TYPE MUTUAL EXCLUSION LOGIC
-            // ==========================================
+            // Applicant Type mutual exclusion
             const appNone   = document.getElementById('type_none1');
             const appPwd    = document.getElementById('type_pwd');
             const appSenior = document.getElementById('type_senior');
             const app4ps    = document.getElementById('type_4ps');
-
             if (appNone && appPwd && appSenior && app4ps) {
-                // When "None of the above" is checked → uncheck all others
                 appNone.addEventListener('change', function() {
-                    if (this.checked) {
-                        appPwd.checked    = false;
-                        appSenior.checked = false;
-                        app4ps.checked    = false;
-                    }
+                    if (this.checked) { appPwd.checked = false; appSenior.checked = false; app4ps.checked = false; }
                 });
-
-                // When any other option is checked → uncheck "None of the above"
-                [appPwd, appSenior, app4ps].forEach(function(cb) {
-                    cb.addEventListener('change', function() {
-                        if (this.checked) {
-                            appNone.checked = false;
-                        }
-                    });
+                [appPwd, appSenior, app4ps].forEach(cb => {
+                    cb.addEventListener('change', function() { if (this.checked) appNone.checked = false; });
                 });
             }
 
-            // ==========================================
-            // FORM SUBMIT VALIDATION
-            // ==========================================
+            // Form submit validation
             const registrationForm = document.getElementById('registrationForm');
             if (registrationForm) {
                 registrationForm.addEventListener('submit', function(e) {
-                    // Ensure at least one nc_holder is checked
-                    const ncChecked = document.querySelectorAll('input[name="nc_holder[]"]:checked');
+                    const ncChecked  = document.querySelectorAll('input[name="nc_holder[]"]:checked');
+                    const appChecked = document.querySelectorAll('input[name="applicant_type[]"]:checked');
+
                     if (ncChecked.length === 0) {
                         e.preventDefault();
                         alert('Please select at least one option for NC Holder (NC1, NC2, or None).');
                         return false;
                     }
-
-                    // Ensure at least one applicant_type is checked
-                    const appChecked = document.querySelectorAll('input[name="applicant_type[]"]:checked');
                     if (appChecked.length === 0) {
                         e.preventDefault();
                         alert('Please select at least one option for Applicant Type (or "None of the above").');
+                        return false;
+                    }
+
+                    // Check that at least one document is provided for each section
+                    const hasIdScan   = document.getElementById('scanned_id_data').value !== '';
+                    const hasIdUpload = document.getElementById('valid_id_upload').files.length > 0;
+                    const hasCertScan  = document.getElementById('scanned_cert_data').value !== '';
+                    const hasCertUpload = document.getElementById('voters_cert_upload').files.length > 0;
+
+                    if (!hasIdScan && !hasIdUpload) {
+                        e.preventDefault();
+                        alert('Please provide your Valid Government-Issued ID via camera scan or file upload.');
+                        return false;
+                    }
+                    if (!hasCertScan && !hasCertUpload) {
+                        e.preventDefault();
+                        alert("Please provide your Voter's Certificate / Barangay Residency via camera scan or file upload.");
                         return false;
                     }
                 });
@@ -1297,75 +1353,64 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
         // SCANNING FUNCTIONALITY
         // ==========================================
         document.addEventListener('DOMContentLoaded', function() {
-            // Variables for ID scanning
             let cameraStream = null;
             let scanCount = 0;
             const maxScans = 2;
             
-            // ID Scanning Elements
-            const startScanBtn = document.getElementById('startScanBtn');
+            const startScanBtn    = document.getElementById('startScanBtn');
             const cameraContainer = document.getElementById('cameraContainer');
-            const cameraFeed = document.getElementById('cameraFeed');
-            const captureBtn = document.getElementById('captureBtn');
-            const cancelScanBtn = document.getElementById('cancelScanBtn');
-            const scanPreview = document.getElementById('scanPreview');
-            const previewImage = document.getElementById('previewImage');
-            const confirmScanBtn = document.getElementById('confirmScanBtn');
-            const rescanBtn = document.getElementById('rescanBtn');
-            const scanControls = document.getElementById('scanControls');
-            const scannedIdList = document.getElementById('scannedIdList');
-            const validIdFile = document.getElementById('valid_id_file');
-            const scannedIdData = document.getElementById('scanned_id_data');
+            const cameraFeed      = document.getElementById('cameraFeed');
+            const captureBtn      = document.getElementById('captureBtn');
+            const cancelScanBtn   = document.getElementById('cancelScanBtn');
+            const scanPreview     = document.getElementById('scanPreview');
+            const previewImage    = document.getElementById('previewImage');
+            const confirmScanBtn  = document.getElementById('confirmScanBtn');
+            const rescanBtn       = document.getElementById('rescanBtn');
+            const scanControls    = document.getElementById('scanControls');
+            const scannedIdList   = document.getElementById('scannedIdList');
+            const validIdFile     = document.getElementById('valid_id_upload');
+            const scannedIdData   = document.getElementById('scanned_id_data');
             
-            // Certificate Scanning Elements
-            const startCertScanBtn = document.getElementById('startCertScanBtn');
+            const startCertScanBtn    = document.getElementById('startCertScanBtn');
             const certCameraContainer = document.getElementById('certCameraContainer');
-            const certCameraFeed = document.getElementById('certCameraFeed');
-            const certCaptureBtn = document.getElementById('certCaptureBtn');
-            const certCancelScanBtn = document.getElementById('certCancelScanBtn');
-            const certScanPreview = document.getElementById('certScanPreview');
-            const certPreviewImage = document.getElementById('certPreviewImage');
-            const certConfirmScanBtn = document.getElementById('certConfirmScanBtn');
-            const certRescanBtn = document.getElementById('certRescanBtn');
-            const certScanControls = document.getElementById('certScanControls');
-            const scannedCertList = document.getElementById('scannedCertList');
-            const votersCertFile = document.getElementById('voters_cert_file');
-            const scannedCertData = document.getElementById('scanned_cert_data');
+            const certCameraFeed      = document.getElementById('certCameraFeed');
+            const certCaptureBtn      = document.getElementById('certCaptureBtn');
+            const certCancelScanBtn   = document.getElementById('certCancelScanBtn');
+            const certScanPreview     = document.getElementById('certScanPreview');
+            const certPreviewImage    = document.getElementById('certPreviewImage');
+            const certConfirmScanBtn  = document.getElementById('certConfirmScanBtn');
+            const certRescanBtn       = document.getElementById('certRescanBtn');
+            const certScanControls    = document.getElementById('certScanControls');
+            const scannedCertList     = document.getElementById('scannedCertList');
+            const votersCertFile      = document.getElementById('voters_cert_upload');
+            const scannedCertData     = document.getElementById('scanned_cert_data');
             const certVerificationResult = document.getElementById('certVerificationResult');
             
-            // Start ID Scanning
+            async function startCamera(videoEl) {
+                return await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                });
+            }
+
             if (startScanBtn) {
                 startScanBtn.addEventListener('click', async function() {
                     try {
-                        cameraStream = await navigator.mediaDevices.getUserMedia({ 
-                            video: { 
-                                facingMode: 'environment',
-                                width: { ideal: 1920 },
-                                height: { ideal: 1080 }
-                            } 
-                        });
-                        
+                        cameraStream = await startCamera(cameraFeed);
                         cameraFeed.srcObject = cameraStream;
                         cameraContainer.style.display = 'block';
                         scanControls.style.display = 'none';
-                        
-                        alert('📷 Camera activated! Ready to scan your ID.\n\nPosition your ID clearly in the camera view.');
-                        
+                        alert('📷 Camera activated! Position your ID clearly in the view.');
                     } catch (error) {
-                        console.error('Camera error:', error);
                         alert('Unable to access camera. Please ensure camera permissions are granted and try again.');
                     }
                 });
             }
             
-            // Capture ID Scan
             if (captureBtn) {
                 captureBtn.addEventListener('click', function() {
                     captureScan(cameraFeed, previewImage, scanPreview, cameraContainer);
                 });
             }
-            
-            // Cancel ID Scanning
             if (cancelScanBtn) {
                 cancelScanBtn.addEventListener('click', function() {
                     stopCamera();
@@ -1373,84 +1418,53 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                     scanControls.style.display = 'block';
                 });
             }
-            
-            // Confirm ID Scan
             if (confirmScanBtn) {
                 confirmScanBtn.addEventListener('click', function() {
-                    const dataUrl = previewImage.src;
-                    saveScan(dataUrl, 'ID', scannedIdList, validIdFile, scannedIdData);
+                    saveScan(previewImage.src, 'ID', scannedIdList, scannedIdData);
                     scanPreview.style.display = 'none';
                     scanControls.style.display = 'block';
                     scanCount++;
-                    
                     if (scanCount >= maxScans) {
                         startScanBtn.disabled = true;
-                        startScanBtn.innerHTML = '<i style="margin-right: 8px;">✅</i> ID Scanning Complete';
-                        startScanBtn.style.background = 'rgba(40, 167, 69, 0.8)';
+                        startScanBtn.innerHTML = '✅ ID Scanning Complete';
+                        startScanBtn.style.background = 'rgba(40,167,69,0.8)';
                     }
                 });
             }
-            
-            // Rescan ID
             if (rescanBtn) {
                 rescanBtn.addEventListener('click', async function() {
                     scanPreview.style.display = 'none';
-                    
                     try {
                         stopCamera();
-                        cameraStream = await navigator.mediaDevices.getUserMedia({ 
-                            video: { 
-                                facingMode: 'environment',
-                                width: { ideal: 1920 },
-                                height: { ideal: 1080 }
-                            } 
-                        });
-                        
+                        cameraStream = await startCamera(cameraFeed);
                         cameraFeed.srcObject = cameraStream;
                         cameraContainer.style.display = 'block';
-                        
                     } catch (error) {
-                        console.error('Camera restart error:', error);
-                        alert('Unable to restart camera. Please refresh the page and try again.');
+                        alert('Unable to restart camera. Please refresh and try again.');
                         cameraContainer.style.display = 'none';
                         scanControls.style.display = 'block';
                     }
                 });
             }
             
-            // Start Certificate Scanning
             if (startCertScanBtn) {
                 startCertScanBtn.addEventListener('click', async function() {
                     try {
-                        cameraStream = await navigator.mediaDevices.getUserMedia({ 
-                            video: { 
-                                facingMode: 'environment',
-                                width: { ideal: 1920 },
-                                height: { ideal: 1080 }
-                            } 
-                        });
-                        
+                        cameraStream = await startCamera(certCameraFeed);
                         certCameraFeed.srcObject = cameraStream;
                         certCameraContainer.style.display = 'block';
                         certScanControls.style.display = 'none';
-                        
-                        alert('📄 Camera activated! Ready to scan your certificate.\n\nPosition the certificate clearly in the camera view.');
-                        
+                        alert('📄 Camera activated! Position the certificate clearly in the view.');
                     } catch (error) {
-                        console.error('Camera error:', error);
                         alert('Unable to access camera. Please ensure camera permissions are granted and try again.');
                     }
                 });
             }
-            
-            // Capture Certificate Scan
             if (certCaptureBtn) {
                 certCaptureBtn.addEventListener('click', function() {
                     captureScan(certCameraFeed, certPreviewImage, certScanPreview, certCameraContainer, true);
                 });
             }
-            
-            // Cancel Certificate Scanning
             if (certCancelScanBtn) {
                 certCancelScanBtn.addEventListener('click', function() {
                     stopCamera();
@@ -1458,143 +1472,76 @@ function generateEmailBody($fullname, $email, $password_plain, $address, $contac
                     certScanControls.style.display = 'block';
                 });
             }
-            
-            // Confirm Certificate Scan
             if (certConfirmScanBtn) {
                 certConfirmScanBtn.addEventListener('click', function() {
-                    const dataUrl = certPreviewImage.src;
-                    saveScan(dataUrl, 'CERTIFICATE', scannedCertList, votersCertFile, scannedCertData);
+                    saveScan(certPreviewImage.src, 'CERTIFICATE', scannedCertList, scannedCertData);
                     certScanPreview.style.display = 'none';
                     certScanControls.style.display = 'block';
                 });
             }
-            
-            // Rescan Certificate
             if (certRescanBtn) {
                 certRescanBtn.addEventListener('click', async function() {
                     certScanPreview.style.display = 'none';
                     certVerificationResult.style.display = 'none';
                     certConfirmScanBtn.style.display = 'none';
-                    
                     try {
                         stopCamera();
-                        cameraStream = await navigator.mediaDevices.getUserMedia({ 
-                            video: { 
-                                facingMode: 'environment',
-                                width: { ideal: 1920 },
-                                height: { ideal: 1080 }
-                            } 
-                        });
-                        
+                        cameraStream = await startCamera(certCameraFeed);
                         certCameraFeed.srcObject = cameraStream;
                         certCameraContainer.style.display = 'block';
-                        
                     } catch (error) {
-                        console.error('Camera restart error:', error);
-                        alert('Unable to restart camera. Please refresh the page and try again.');
+                        alert('Unable to restart camera. Please refresh and try again.');
                         certCameraContainer.style.display = 'none';
                         certScanControls.style.display = 'block';
                     }
                 });
             }
             
-            // Helper Functions
-            function captureScan(videoElement, previewImg, previewDiv, cameraDiv, isCertificate = false) {
+            function captureScan(videoEl, previewImg, previewDiv, cameraDiv, isCertificate = false) {
                 const canvas = document.createElement('canvas');
-                canvas.width = videoElement.videoWidth;
-                canvas.height = videoElement.videoHeight;
-                
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-                
+                canvas.width  = videoEl.videoWidth;
+                canvas.height = videoEl.videoHeight;
+                canvas.getContext('2d').drawImage(videoEl, 0, 0);
                 const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-                
                 previewImg.src = dataUrl;
                 previewDiv.style.display = 'block';
-                cameraDiv.style.display = 'none';
-                
+                cameraDiv.style.display  = 'none';
                 stopCamera();
-                
                 if (isCertificate) {
                     certVerificationResult.innerHTML = `
                         <strong>Certificate Verification:</strong><br>
                         Image Captured: ✅ Success<br>
-                        Quality Check: ✅ Passed (Text readability confirmed)<br><br>
-                        <span style="color: #20c997; font-weight: bold;">✅ SCAN ACCEPTED</span><br>
+                        Quality Check: ✅ Passed<br><br>
+                        <span style="color:#20c997;font-weight:bold;">✅ SCAN ACCEPTED</span><br>
                         Click "Confirm Scan" to use this certificate.
                     `;
-                    certVerificationResult.style.display = 'block';
-                    certVerificationResult.style.backgroundColor = 'rgba(32, 201, 151, 0.2)';
-                    certVerificationResult.style.border = '2px solid #20c997';
-                    certVerificationResult.style.color = 'rgba(255, 255, 255, 0.9)';
-                    
+                    certVerificationResult.style.cssText = 'display:block; background:rgba(32,201,151,0.2); border:2px solid #20c997; color:rgba(255,255,255,0.9); padding:15px; border-radius:8px; margin:15px 0;';
                     certConfirmScanBtn.style.display = 'inline-block';
                 }
             }
             
-            function saveScan(dataUrl, type, listElement, fileInput, hiddenInput) {
-                const scanType = type === 'ID' ? 'ID' : 'Certificate';
-                const fileName = type === 'ID' ? `ID_${Date.now()}.jpg` : `CERTIFICATE_${Date.now()}.jpg`;
-                
-                const listItem = document.createElement('div');
-                listItem.style.cssText = 'background: rgba(32, 201, 151, 0.1); border: 1px solid rgba(32, 201, 151, 0.3); border-radius: 8px; padding: 10px; margin: 5px 0; backdrop-filter: blur(5px);';
-                
-                const timestamp = new Date().toLocaleTimeString();
-                listItem.innerHTML = `
-                    <strong style="color: #20c997;">${scanType}</strong> - ${timestamp}
-                    <div style="margin-top: 5px;">
-                        <img src="${dataUrl}" style="max-width: 100px; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 4px;">
-                    </div>
-                    <div style="margin-top: 5px; color: #20c997; font-size: 12px;">
-                        <i>✅ Verified and Accepted</i>
-                    </div>
+            function saveScan(dataUrl, type, listEl, hiddenInput) {
+                const label = type === 'ID' ? 'ID' : 'Certificate';
+                const item  = document.createElement('div');
+                item.style.cssText = 'background:rgba(32,201,151,0.1);border:1px solid rgba(32,201,151,0.3);border-radius:8px;padding:10px;margin:5px 0;';
+                item.innerHTML = `
+                    <strong style="color:#20c997;">${label}</strong> — ${new Date().toLocaleTimeString()}
+                    <div style="margin-top:5px;"><img src="${dataUrl}" style="max-width:100px;border:1px solid rgba(255,255,255,0.2);border-radius:4px;"></div>
+                    <div style="margin-top:5px;color:#20c997;font-size:12px;">✅ Verified and Accepted</div>
                 `;
-                
-                listElement.appendChild(listItem);
-                
-                const blob = dataURLtoBlob(dataUrl);
-                const file = new File([blob], fileName, { type: 'image/jpeg' });
-                
-                const dataTransfer = new DataTransfer();
-                if (fileInput.files.length > 0) {
-                    for (let i = 0; i < fileInput.files.length; i++) {
-                        dataTransfer.items.add(fileInput.files[i]);
-                    }
-                }
-                dataTransfer.items.add(file);
-                fileInput.files = dataTransfer.files;
-                
-                let currentScans = hiddenInput.value ? JSON.parse(hiddenInput.value) : [];
-                currentScans.push(dataUrl);
-                hiddenInput.value = JSON.stringify(currentScans);
-            }
-            
-            function dataURLtoBlob(dataurl) {
-                const arr = dataurl.split(',');
-                const mime = arr[0].match(/:(.*?);/)[1];
-                const bstr = atob(arr[1]);
-                let n = bstr.length;
-                const u8arr = new Uint8Array(n);
-                while (n--) {
-                    u8arr[n] = bstr.charCodeAt(n);
-                }
-                return new Blob([u8arr], { type: mime });
+                listEl.appendChild(item);
+                let scans = hiddenInput.value ? JSON.parse(hiddenInput.value) : [];
+                scans.push(dataUrl);
+                hiddenInput.value = JSON.stringify(scans);
             }
             
             function stopCamera() {
                 if (cameraStream) {
-                    cameraStream.getTracks().forEach(track => {
-                        track.stop();
-                    });
+                    cameraStream.getTracks().forEach(t => t.stop());
                     cameraStream = null;
                 }
-                
-                if (cameraFeed && cameraFeed.srcObject) {
-                    cameraFeed.srcObject = null;
-                }
-                if (certCameraFeed && certCameraFeed.srcObject) {
-                    certCameraFeed.srcObject = null;
-                }
+                if (cameraFeed && cameraFeed.srcObject)     cameraFeed.srcObject = null;
+                if (certCameraFeed && certCameraFeed.srcObject) certCameraFeed.srcObject = null;
             }
             
             window.addEventListener('beforeunload', stopCamera);

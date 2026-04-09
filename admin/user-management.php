@@ -601,6 +601,10 @@ if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_user'])){
     $full_name = $conn->real_escape_string($_POST['full_name']);
     $email = $conn->real_escape_string($_POST['email']);
     
+    // Get current user role to determine if we should update specialization
+    $role_check = $conn->query("SELECT role FROM users WHERE id = $user_id");
+    $current_role = $role_check->fetch_assoc()['role'];
+    
     // Check for duplicate fullname/email (excluding current user)
     $duplicate_check = $conn->query("
         SELECT id FROM users 
@@ -615,27 +619,30 @@ if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_user'])){
         exit;
     }
     
-    // Handle specialization
-    if($_POST['specialization'] === 'custom_new_category' && !empty($_POST['new_category_name'])) {
-        // Insert new category
-        $new_category_name = $conn->real_escape_string($_POST['new_category_name']);
-        $new_category_desc = $conn->real_escape_string($_POST['new_category_description'] ?? '');
-        
-        $category_stmt = $conn->prepare("INSERT INTO program_categories (name, description, status) VALUES (?, ?, 'active')");
-        $category_stmt->bind_param("ss", $new_category_name, $new_category_desc);
-        
-        if($category_stmt->execute()) {
-            $specialization = $new_category_name;
-        } else {
-            $_SESSION['flash'] = 'Error creating new category: ' . $conn->error;
-            header("Location: " . $_SERVER['HTTP_REFERER']);
-            exit;
+    // Only handle specialization if user is a trainer
+    $specialization = null;
+    if($current_role === 'trainer') {
+        if($_POST['specialization'] === 'custom_new_category' && !empty($_POST['new_category_name'])) {
+            // Insert new category
+            $new_category_name = $conn->real_escape_string($_POST['new_category_name']);
+            $new_category_desc = $conn->real_escape_string($_POST['new_category_description'] ?? '');
+            
+            $category_stmt = $conn->prepare("INSERT INTO program_categories (name, description, status) VALUES (?, ?, 'active')");
+            $category_stmt->bind_param("ss", $new_category_name, $new_category_desc);
+            
+            if($category_stmt->execute()) {
+                $specialization = $new_category_name;
+            } else {
+                $_SESSION['flash'] = 'Error creating new category: ' . $conn->error;
+                header("Location: " . $_SERVER['HTTP_REFERER']);
+                exit;
+            }
+            $category_stmt->close();
+        } elseif($_POST['specialization'] === 'custom' && !empty($_POST['custom_specialization'])) {
+            $specialization = $conn->real_escape_string($_POST['custom_specialization']);
+        } elseif(isset($_POST['specialization']) && !empty($_POST['specialization'])) {
+            $specialization = $conn->real_escape_string($_POST['specialization']);
         }
-        $category_stmt->close();
-    } elseif($_POST['specialization'] === 'custom' && !empty($_POST['custom_specialization'])) {
-        $specialization = $conn->real_escape_string($_POST['custom_specialization']);
-    } else {
-        $specialization = $conn->real_escape_string($_POST['specialization']);
     }
     
     $program_ids = $_POST['programs'] ?? [];
@@ -655,15 +662,23 @@ if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_user'])){
     $current_user = $conn->query("SELECT program FROM users WHERE id = $user_id")->fetch_assoc();
     $old_program = $current_user['program'] ?? null;
 
-    // Update user with specialization
-    $stmt = $conn->prepare("UPDATE users SET fullname = ?, email = ?, program = ?, specialization = ?, other_programs = ? WHERE id = ?");
-    $program_name = !empty($program_names) ? $program_names[0] : '';
-    $other_programs = $allow_multiple_programs && count($program_names) > 1 ? implode(', ', array_slice($program_names, 1)) : null;
-    $stmt->bind_param("sssssi", $full_name, $email, $program_name, $specialization, $other_programs, $user_id);
+    // Update user - conditionally include specialization field
+    if($current_role === 'trainer' && $specialization !== null) {
+        $stmt = $conn->prepare("UPDATE users SET fullname = ?, email = ?, program = ?, specialization = ?, other_programs = ? WHERE id = ?");
+        $program_name = !empty($program_names) ? $program_names[0] : '';
+        $other_programs = $allow_multiple_programs && count($program_names) > 1 ? implode(', ', array_slice($program_names, 1)) : null;
+        $stmt->bind_param("sssssi", $full_name, $email, $program_name, $specialization, $other_programs, $user_id);
+    } else {
+        // For trainees, don't update specialization
+        $stmt = $conn->prepare("UPDATE users SET fullname = ?, email = ?, program = ?, other_programs = ? WHERE id = ?");
+        $program_name = !empty($program_names) ? $program_names[0] : '';
+        $other_programs = $allow_multiple_programs && count($program_names) > 1 ? implode(', ', array_slice($program_names, 1)) : null;
+        $stmt->bind_param("ssssi", $full_name, $email, $program_name, $other_programs, $user_id);
+    }
     
     if($stmt->execute()){
-        // Handle program assignment changes
-        if($old_program != $program_name) {
+        // Handle program assignment changes (only for trainers)
+        if($current_role === 'trainer' && $old_program != $program_name) {
             // Remove trainer from old programs
             $conn->query("UPDATE programs SET trainer_id = NULL WHERE trainer_id = $user_id");
             
@@ -1051,11 +1066,12 @@ include '../components/header.php';
   
   .pin-form-container {
       margin-top: 15px;
-      padding: 15px;
-      background: #f0f9ff;
-      border-radius: 6px;
+      padding: 20px;
+      background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+      border-radius: 12px;
       border-left: 4px solid #0d9488;
       animation: slideDown 0.3s ease-out;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
   }
   
   @keyframes slideDown {
@@ -1147,7 +1163,7 @@ include '../components/header.php';
   }
   
   .legend-color.trainer {
-      background: #3b82f6; /* Blue for trainers */
+      background: #3b82f6;
   }
   
   .legend-color.radius {
@@ -1163,7 +1179,7 @@ include '../components/header.php';
   }
   
   .legend-color.trainee-hidden {
-      background: #10b981; /* Green for hidden trainees */
+      background: #10b981;
   }
   
   /* PIN Settings Styles */
@@ -1802,6 +1818,41 @@ include '../components/header.php';
       border-left: 4px solid #3b82f6;
   }
   
+  /* Draggable marker hint */
+  .leaflet-marker-icon {
+      cursor: grab !important;
+  }
+  
+  .leaflet-marker-icon:active {
+      cursor: grabbing !important;
+  }
+  
+  /* Success animation */
+  @keyframes slideDown {
+      from {
+          opacity: 0;
+          transform: translateY(-10px);
+      }
+      to {
+          opacity: 1;
+          transform: translateY(0);
+      }
+  }
+  
+  .temp-message {
+      animation: slideDown 0.3s ease-out;
+  }
+  
+  .pin-form-container input[type="number"] {
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+  }
+  
+  .pin-form-container input[type="number"]:focus {
+      border-color: #0d9488;
+      box-shadow: 0 0 0 2px rgba(13, 148, 136, 0.1);
+  }
+  
   @media (max-width: 768px) {
       .filter-form {
           flex-direction: column;
@@ -1962,25 +2013,27 @@ include '../components/header.php';
                         </div>
                       </div>
                     </div>
-                  </td>
+                   </div>
                   <td class="date-cell">
                     <?= date('M j, Y', strtotime($u['date_created'])) ?>
-                  </td>
+                   </td>
                   <td class="email-cell"><?= htmlspecialchars($u['email']) ?></td>
                   <td>
                     <span class="badge <?= $u['role'] === 'trainer' ? 'badge-trainer' : 'badge-trainee' ?>">
                       <?= htmlspecialchars(ucfirst($u['role'])) ?>
                     </span>
-                  </td>
+                   </td>
                   <td>
-                    <?php if(!empty($u['specialization'])): ?>
+                    <?php if($u['role'] === 'trainer' && !empty($u['specialization'])): ?>
                       <span class="badge badge-specialization">
                         <?= htmlspecialchars($u['specialization']) ?>
                       </span>
-                    <?php else: ?>
+                    <?php elseif($u['role'] === 'trainer'): ?>
                       <span style="color: #6b7280; font-style: italic;">None</span>
+                    <?php else: ?>
+                      <span style="color: #9ca3af; font-style: italic;">N/A for trainees</span>
                     <?php endif; ?>
-                  </td>
+                   </td>
                   <td>
                     <?php
                       $status = $u['status'] ?? 'active';
@@ -1990,7 +2043,7 @@ include '../components/header.php';
                     <span class="<?= $status_class ?>">
                       <?= $status_display ?>
                     </span>
-                  </td>
+                   </td>
                   <td class="actions">
                     <button class="btn btn-ghost edit-user-btn" 
                             data-user-id="<?= (int)$u['id'] ?>" 
@@ -2007,7 +2060,7 @@ include '../components/header.php';
                       <input type="hidden" name="id" value="<?= (int)$u['id'] ?>">
                       <button class="btn btn-yellow" type="submit">Archive</button>
                     </form>
-                  </td>
+                   </td>
                 </tr>
               <?php endforeach; ?>
             <?php endif; ?>
@@ -2097,13 +2150,12 @@ include '../components/header.php';
 
   <!-- Quick Location Set for Selected Trainer -->
   <div class="pin-bulk-actions" id="quickLocationSet" style="display: none;">
-    <h3>📍 Set Location for Trainer</h3>
+    <h3>📍 Quick Location Set for Trainer</h3>
     <p>Apply the selected map location to a trainer:</p>
     
     <select id="quickUserSelect" class="modal-select" style="width: 100%; margin-bottom: 15px;">
       <option value="">Select a trainer...</option>
       <?php 
-      // Combine trainers with and without pins
       $all_trainers = array_merge($users_with_pins, $users_without_pins);
       foreach($all_trainers as $trainer): 
       ?>
@@ -2115,8 +2167,10 @@ include '../components/header.php';
     
     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
       <input type="number" id="quickRadius" class="modal-input" placeholder="Radius (meters)" value="100" min="10" max="1000" style="width: 150px;">
-      <input type="text" id="quickLocationName" class="modal-input" placeholder="Location name (optional)" style="flex: 1;">
-      <button class="btn btn-teal" onclick="applyLocationToUser()">Apply to Trainer</button>
+      <input type="text" id="quickLocationName" class="modal-input" placeholder="Location name (auto-detected)" readonly style="flex: 1; background-color: #f3f4f6;">
+      <button class="btn btn-blue" onclick="applyLocationToUser()">
+        <i class="fas fa-check-double"></i> Apply to Trainer
+      </button>
       <button class="btn btn-ghost" onclick="document.getElementById('quickLocationSet').style.display='none'">Cancel</button>
     </div>
   </div>
@@ -2163,10 +2217,13 @@ include '../components/header.php';
           </span>
         </div>
         <div class="coordinates-input">
-          <label for="pin_location_name">Location Name (Optional)</label>
+          <label for="pin_location_name">Location Name (Auto-detected from coordinates)</label>
           <input type="text" id="pin_location_name" name="pin_location_name" 
-                 value="<?= isset($users_with_pins[0]) ? htmlspecialchars($users_with_pins[0]['pin_location_name']) : 'Main Office' ?>" 
-                 placeholder="e.g., Main Office, Training Center">
+                 value="<?= isset($users_with_pins[0]) ? htmlspecialchars($users_with_pins[0]['pin_location_name']) : '' ?>" 
+                 placeholder="Will be auto-detected when you click on map" 
+                 readonly
+                 style="background-color: #f3f4f6; cursor: not-allowed;">
+          <small style="color: #6b7280;">This is automatically set when you select coordinates on the map</small>
         </div>
       </div>
       
@@ -2226,8 +2283,8 @@ include '../components/header.php';
             <button class="btn btn-ghost" onclick="focusOnUser(<?= $user['id'] ?>, <?= $user['pin_latitude'] ?>, <?= $user['pin_longitude'] ?>)">
               <i class="fas fa-search-location"></i> Focus on Map
             </button>
-            <button class="btn btn-ghost" onclick="showEditPinForm(<?= $user['id'] ?>)">
-              <i class="fas fa-edit"></i> Edit PIN
+            <button class="btn btn-teal" onclick="showEditPinForm(<?= $user['id'] ?>)">
+              <i class="fas fa-edit"></i> Edit PIN Location
             </button>
             <form method="POST" action="" style="display: inline;" onsubmit="return confirm('Reset PIN location for this trainer?');">
               <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
@@ -2238,47 +2295,70 @@ include '../components/header.php';
             </form>
           </div>
           
-          <!-- Edit PIN Form (Hidden by default) -->
+          <!-- SIMPLIFIED EDIT PIN FORM -->
           <div id="edit-pin-form-<?= $user['id'] ?>" class="pin-form-container" style="display: none;">
             <form method="POST" action="" onsubmit="return validatePinForm(<?= $user['id'] ?>)">
-              <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
-              <input type="hidden" name="update_user_pin" value="1">
-              
-              <div class="pin-coordinates">
-                <div class="pin-coordinate-input">
-                  <label>Latitude</label>
-                  <input type="number" id="lat_<?= $user['id'] ?>" name="pin_latitude" step="any" 
-                         value="<?= $user['pin_latitude'] ?>" required>
+                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
+                <input type="hidden" name="update_user_pin" value="1">
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div>
+                        <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                            📍 Latitude
+                        </label>
+                        <input type="number" id="lat_<?= $user['id'] ?>" name="pin_latitude" step="any" 
+                               value="<?= $user['pin_latitude'] ?>" 
+                               onchange="updateMapMarkerForUser(<?= $user['id'] ?>)"
+                               style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-family: monospace;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                            📍 Longitude
+                        </label>
+                        <input type="number" id="lng_<?= $user['id'] ?>" name="pin_longitude" step="any" 
+                               value="<?= $user['pin_longitude'] ?>" 
+                               onchange="updateMapMarkerForUser(<?= $user['id'] ?>)"
+                               style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-family: monospace;">
+                    </div>
                 </div>
-                <div class="pin-coordinate-input">
-                  <label>Longitude</label>
-                  <input type="number" id="lng_<?= $user['id'] ?>" name="pin_longitude" step="any" 
-                         value="<?= $user['pin_longitude'] ?>" required>
+                
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 8px; font-weight: 500;">
+                        📏 Geofence Radius: <strong id="radius_display_<?= $user['id'] ?>" style="color: #0d9488;"><?= $user['pin_radius'] ?> meters</strong>
+                    </label>
+                    <input type="range" id="radius_slider_<?= $user['id'] ?>" name="pin_radius" 
+                           min="10" max="1000" value="<?= $user['pin_radius'] ?>" 
+                           oninput="updateRadiusDisplay(<?= $user['id'] ?>, this.value)"
+                           style="width: 100%;">
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; color: #6b7280; margin-top: 4px;">
+                        <span>🔴 10m</span>
+                        <span>🟡 500m</span>
+                        <span>🟢 1000m</span>
+                    </div>
                 </div>
-              </div>
-              
-              <div class="radius-input">
-                <label>
-                  Radius (meters): <span id="radius_display_<?= $user['id'] ?>" class="radius-value-display"><?= $user['pin_radius'] ?></span>
-                </label>
-                <input type="range" id="radius_slider_<?= $user['id'] ?>" name="pin_radius" 
-                       min="10" max="1000" value="<?= $user['pin_radius'] ?>" 
-                       oninput="updateRadiusDisplay(<?= $user['id'] ?>, this.value)">
-              </div>
-              
-              <div class="pin-coordinate-input" style="margin-bottom: 10px;">
-                <label>Location Name (Optional)</label>
-                <input type="text" name="pin_location_name" value="<?= htmlspecialchars($user['pin_location_name'] ?: '') ?>" 
-                       placeholder="e.g., Main Office, Training Center">
-              </div>
-              
-              <div style="display: flex; gap: 10px;">
-                <button type="button" class="btn btn-blue" onclick="selectOnMap(<?= $user['id'] ?>)">
-                  <i class="fas fa-map-marker-alt"></i> Select on Map
-                </button>
-                <button type="submit" class="btn btn-teal">Update PIN</button>
-                <button type="button" class="btn btn-ghost" onclick="hideEditPinForm(<?= $user['id'] ?>)">Cancel</button>
-              </div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                        🏢 Location Name (Auto-detected)
+                    </label>
+                    <input type="text" name="pin_location_name" id="pin_location_name_<?= $user['id'] ?>" 
+                           value="<?= htmlspecialchars($user['pin_location_name'] ?: '') ?>" 
+                           readonly
+                           style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; background-color: #f3f4f6; font-size: 13px;">
+                    <small style="color: #6b7280; font-size: 11px;">💡 Tip: Click on the map above to auto-set location and name</small>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+                    <button type="button" class="btn btn-blue" onclick="setCurrentMapLocation(<?= $user['id'] ?>)">
+                        <i class="fas fa-map-marker-alt"></i> Use Current Map Location
+                    </button>
+                    <button type="submit" class="btn btn-teal">
+                        <i class="fas fa-save"></i> Save PIN Location
+                    </button>
+                    <button type="button" class="btn btn-ghost" onclick="hideEditPinForm(<?= $user['id'] ?>)">
+                        Cancel
+                    </button>
+                </div>
             </form>
           </div>
         </div>
@@ -2318,51 +2398,82 @@ include '../components/header.php';
           </div>
           
           <div style="margin-top: 10px;">
-            <button class="btn btn-ghost" onclick="showEditPinForm(<?= $user['id'] ?>)">
+            <button class="btn btn-teal" onclick="showEditPinForm(<?= $user['id'] ?>)">
               <i class="fas fa-plus-circle"></i> Set PIN Location
             </button>
           </div>
           
-          <!-- Set PIN Form (Hidden by default) -->
+          <!-- SIMPLIFIED SET PIN FORM -->
           <div id="edit-pin-form-<?= $user['id'] ?>" class="pin-form-container" style="display: none;">
+            <div style="background: #f0fdf4; border-left: 4px solid #22c55e; padding: 12px; margin-bottom: 15px; border-radius: 4px;">
+                <strong>📍 Easy PIN Setup:</strong> Click anywhere on the map above to set the location, or drag the orange marker to adjust. The location name will be auto-detected.
+            </div>
+            
             <form method="POST" action="" onsubmit="return validatePinForm(<?= $user['id'] ?>)">
-              <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
-              <input type="hidden" name="update_user_pin" value="1">
-              
-              <div class="pin-coordinates">
-                <div class="pin-coordinate-input">
-                  <label>Latitude</label>
-                  <input type="number" id="lat_<?= $user['id'] ?>" name="pin_latitude" step="any" 
-                         placeholder="e.g., 14.5995" required>
+                <input type="hidden" name="user_id" value="<?= $user['id'] ?>">
+                <input type="hidden" name="update_user_pin" value="1">
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div>
+                        <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                            📍 Latitude
+                        </label>
+                        <input type="number" id="lat_<?= $user['id'] ?>" name="pin_latitude" step="any" 
+                               placeholder="e.g., 14.5995"
+                               onchange="updateMapMarkerForUser(<?= $user['id'] ?>)"
+                               style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-family: monospace;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                            📍 Longitude
+                        </label>
+                        <input type="number" id="lng_<?= $user['id'] ?>" name="pin_longitude" step="any" 
+                               placeholder="e.g., 120.9842"
+                               onchange="updateMapMarkerForUser(<?= $user['id'] ?>)"
+                               style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-family: monospace;">
+                    </div>
                 </div>
-                <div class="pin-coordinate-input">
-                  <label>Longitude</label>
-                  <input type="number" id="lng_<?= $user['id'] ?>" name="pin_longitude" step="any" 
-                         placeholder="e.g., 120.9842" required>
+                
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 8px; font-weight: 500;">
+                        📏 Geofence Radius: <strong id="radius_display_<?= $user['id'] ?>" style="color: #0d9488;">100 meters</strong>
+                    </label>
+                    <input type="range" id="radius_slider_<?= $user['id'] ?>" name="pin_radius" 
+                           min="10" max="1000" value="100" 
+                           oninput="updateRadiusDisplay(<?= $user['id'] ?>, this.value)"
+                           style="width: 100%;">
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; color: #6b7280; margin-top: 4px;">
+                        <span>🔴 10m</span>
+                        <span>🟡 500m</span>
+                        <span>🟢 1000m</span>
+                    </div>
                 </div>
-              </div>
-              
-              <div class="radius-input">
-                <label>
-                  Radius (meters): <span id="radius_display_<?= $user['id'] ?>" class="radius-value-display">100</span>
-                </label>
-                <input type="range" id="radius_slider_<?= $user['id'] ?>" name="pin_radius" 
-                       min="10" max="1000" value="100" 
-                       oninput="updateRadiusDisplay(<?= $user['id'] ?>, this.value)">
-              </div>
-              
-              <div class="pin-coordinate-input" style="margin-bottom: 10px;">
-                <label>Location Name (Optional)</label>
-                <input type="text" name="pin_location_name" placeholder="e.g., Main Office, Training Center">
-              </div>
-              
-              <div style="display: flex; gap: 10px;">
-                <button type="button" class="btn btn-blue" onclick="selectOnMap(<?= $user['id'] ?>)">
-                  <i class="fas fa-map-marker-alt"></i> Select on Map
-                </button>
-                <button type="submit" class="btn btn-teal">Set PIN</button>
-                <button type="button" class="btn btn-ghost" onclick="hideEditPinForm(<?= $user['id'] ?>)">Cancel</button>
-              </div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; font-size: 12px; color: #4b5563; margin-bottom: 5px; font-weight: 500;">
+                        🏢 Location Name (Auto-detected)
+                    </label>
+                    <input type="text" name="pin_location_name" id="pin_location_name_<?= $user['id'] ?>" 
+                           placeholder="Will be auto-detected when you select coordinates"
+                           readonly
+                           style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; background-color: #f3f4f6; font-size: 13px;">
+                    <small style="color: #6b7280; font-size: 11px;">💡 Tip: Click on the map above to auto-set location and name</small>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+                    <button type="button" class="btn btn-blue" onclick="setCurrentMapLocation(<?= $user['id'] ?>)">
+                        <i class="fas fa-map-marker-alt"></i> Use Current Map Location
+                    </button>
+                    <button type="button" class="btn btn-purple" onclick="searchAndSetLocation(<?= $user['id'] ?>)">
+                        <i class="fas fa-search"></i> Search Address
+                    </button>
+                    <button type="submit" class="btn btn-teal">
+                        <i class="fas fa-save"></i> Set PIN Location
+                    </button>
+                    <button type="button" class="btn btn-ghost" onclick="hideEditPinForm(<?= $user['id'] ?>)">
+                        Cancel
+                    </button>
+                </div>
             </form>
           </div>
         </div>
@@ -2371,7 +2482,7 @@ include '../components/header.php';
   </div>
 </div> <!-- Close pin-location-tab -->
 
-<!-- Add Trainer Modal (Enhanced with Programs) -->
+<!-- Add Trainer Modal -->
 <div class="modal-backdrop" id="trainerModalBackdrop">
     <div class="modal-content">
         <div class="modal-header">
@@ -2394,7 +2505,7 @@ include '../components/header.php';
                 <div class="error-message" id="add_email_error"></div>
             </div>
             
-            <!-- Specialization (Connected to Program Categories) -->
+            <!-- Specialization -->
             <div class="form-group">
                 <label for="specialization" class="modal-label required-field">Specialization</label>
                 <select name="specialization" id="specialization" class="modal-select" required onchange="toggleCustomSpecialization()">
@@ -2417,11 +2528,7 @@ include '../components/header.php';
                     <label for="new_category_desc" class="modal-label" style="margin-top: 10px;">Description (Optional)</label>
                     <input type="text" id="new_category_desc" name="new_category_description" class="modal-input" placeholder="Enter category description">
                 </div>
-                
-               
             </div>
-            
-         
             
             <!-- Email Note -->
             <div class="email-note">
@@ -2440,7 +2547,7 @@ include '../components/header.php';
     </div>
 </div>
 
-<!-- Edit User Modal (Enhanced with Programs) -->
+<!-- Edit User Modal -->
 <div class="modal-backdrop" id="editUserModalBackdrop">
     <div class="modal-content">
         <div class="modal-header">
@@ -2473,10 +2580,10 @@ include '../components/header.php';
                 <small style="color: #6b7280; font-size: 0.875rem;">User role cannot be changed</small>
             </div>
             
-            <!-- Specialization - With New Category Option -->
-            <div class="form-group">
+            <!-- Specialization - Only show for trainers -->
+            <div class="form-group" id="specialization_group" style="display: none;">
                 <label for="edit_specialization" class="modal-label required-field">Specialization</label>
-                <select name="specialization" id="edit_specialization" class="modal-select" required onchange="toggleEditCustomSpecialization()">
+                <select name="specialization" id="edit_specialization" class="modal-select" onchange="toggleEditCustomSpecialization()">
                     <option value="">Select Specialization</option>
                     <?php foreach($program_categories as $category): ?>
                         <option value="<?= htmlspecialchars($category['name']) ?>">
@@ -2523,7 +2630,8 @@ let leafletMap;
 let markers = [];
 let circles = [];
 let selectedMarker = null;
-let activeUserId = null;
+let activeEditingUserId = null;
+let userMarkers = {};
 
 // Initialize map when DOM is loaded
 document.addEventListener('DOMContentLoaded', function() {
@@ -2580,7 +2688,7 @@ function initializeEventListeners() {
         closeEditUserBtn.addEventListener('click', closeEditUserModal);
     }
     
-    // Edit user buttons - FIXED VERSION
+    // Edit user buttons
     attachEditButtonListeners();
     
     // Add trainer form submission
@@ -2647,29 +2755,24 @@ function initializeEventListeners() {
     }
 }
 
-// FIXED: Function to attach edit button listeners
+// Function to attach edit button listeners
 function attachEditButtonListeners() {
     console.log('Attaching edit button listeners');
     
-    // Use setTimeout to ensure DOM is fully loaded
     setTimeout(function() {
         const editButtons = document.querySelectorAll('.edit-user-btn');
         console.log('Found ' + editButtons.length + ' edit buttons');
         
         editButtons.forEach(btn => {
-            // Remove any existing listeners by cloning and replacing
             const newBtn = btn.cloneNode(true);
             if (btn.parentNode) {
                 btn.parentNode.replaceChild(newBtn, btn);
             }
             
-            // Add new listener
             newBtn.addEventListener('click', function(e) {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('Edit button clicked for user');
                 
-                // Get data attributes from the button
                 const userId = this.getAttribute('data-user-id');
                 const fullName = this.getAttribute('data-fullname');
                 const email = this.getAttribute('data-email');
@@ -2679,18 +2782,12 @@ function attachEditButtonListeners() {
                 const otherPrograms = this.getAttribute('data-other-programs');
                 const allowMultiple = this.getAttribute('data-allow-multiple') === '1';
                 
-                console.log('Edit button clicked with data:', {
-                    userId, fullName, email, role, program, specialization, otherPrograms, allowMultiple
-                });
-                
-                // Validate required data
                 if (!userId || !fullName || !email) {
                     console.error('Missing required user data');
                     alert('Error: Missing user data. Please refresh the page and try again.');
                     return;
                 }
                 
-                // Prepare user data object
                 const userData = {
                     userId: userId,
                     fullName: fullName,
@@ -2702,11 +2799,10 @@ function attachEditButtonListeners() {
                     allowMultiple: allowMultiple
                 };
                 
-                // Open the edit modal with the user data
                 openEditUserModal(userData);
             });
         });
-    }, 100); // Small delay to ensure DOM is ready
+    }, 100);
 }
 
 // Handle add trainer form submission
@@ -2718,11 +2814,9 @@ async function handleAddTrainerSubmit(e) {
     const newCategory = document.getElementById('new_category')?.value || '';
     const submitBtn = document.getElementById('addSubmitBtn');
     
-    // Clear previous errors
     document.getElementById('add_fullname_error').style.display = 'none';
     document.getElementById('add_email_error').style.display = 'none';
     
-    // Validation
     if (!fullName) {
         document.getElementById('add_fullname_error').textContent = 'Please enter a full name';
         document.getElementById('add_fullname_error').style.display = 'block';
@@ -2740,31 +2834,22 @@ async function handleAddTrainerSubmit(e) {
         return;
     }
     
-    if (specialization === 'custom' && !customSpecialization) {
-        alert('Please enter a custom specialization');
-        return;
-    }
-    
     if (specialization === 'custom_new_category' && !newCategory) {
         alert('Please enter a new category name');
         return;
     }
     
-    // Generate password
     const generatedPassword = generatePassword();
     
-    // Add password to form
     const passwordInput = document.createElement('input');
     passwordInput.type = 'hidden';
     passwordInput.name = 'password';
     passwordInput.value = generatedPassword;
     e.target.appendChild(passwordInput);
     
-    // Disable submit button
     submitBtn.disabled = true;
     submitBtn.textContent = 'Checking...';
     
-    // Check for duplicates
     const duplicateCheck = await checkDuplicateBeforeSubmit(0, fullName, email);
     
     if (duplicateCheck.hasDuplicate) {
@@ -2776,14 +2861,12 @@ async function handleAddTrainerSubmit(e) {
             document.getElementById('add_email_error').style.display = 'block';
         }
         
-        // Re-enable submit button and remove password input
         submitBtn.disabled = false;
         submitBtn.textContent = 'Add Trainer';
         e.target.removeChild(passwordInput);
         return;
     }
     
-    // Submit the form
     submitBtn.textContent = 'Adding Trainer...';
     e.target.submit();
 }
@@ -2795,21 +2878,17 @@ async function handleEditUserSubmit(e) {
     const email = document.getElementById('edit_email').value.trim();
     const submitBtn = document.getElementById('editSubmitBtn');
     
-    // Clear previous errors
     document.getElementById('edit_fullname_error').style.display = 'none';
     document.getElementById('edit_email_error').style.display = 'none';
     
-    // Validation
     if (!fullname || !email) {
         alert('Please fill in all required fields');
         return;
     }
     
-    // Disable submit button
     submitBtn.disabled = true;
     submitBtn.textContent = 'Checking...';
     
-    // Check for duplicates
     const duplicateCheck = await checkDuplicateBeforeSubmit(userId, fullname, email);
     
     if (duplicateCheck.hasDuplicate) {
@@ -2821,21 +2900,17 @@ async function handleEditUserSubmit(e) {
             document.getElementById('edit_email_error').style.display = 'block';
         }
         
-        // Re-enable submit button
         submitBtn.disabled = false;
         submitBtn.textContent = 'Update User';
         return;
     }
     
-    // If no duplicates, submit the form
     submitBtn.textContent = 'Updating...';
     
-    // Handle new category if selected
     const specializationSelect = document.getElementById('edit_specialization');
     if (specializationSelect && specializationSelect.value === 'custom_new_category') {
         const newCategory = document.getElementById('edit_new_category').value.trim();
         if (newCategory) {
-            // Add hidden input for new category
             const hiddenInput = document.createElement('input');
             hiddenInput.type = 'hidden';
             hiddenInput.name = 'new_category_name';
@@ -2853,47 +2928,44 @@ async function handleEditUserSubmit(e) {
         }
     }
     
-    // Submit the form
     e.target.submit();
 }
 
-// Toggle custom specialization input for add form
 function toggleCustomSpecialization() {
     const specializationSelect = document.getElementById('specialization');
     const customContainer = document.getElementById('customSpecializationContainer');
     const newCategoryContainer = document.getElementById('newCategoryContainer');
     
     if (specializationSelect.value === 'custom') {
-        customContainer.style.display = 'block';
-        newCategoryContainer.style.display = 'none';
+        if(customContainer) customContainer.style.display = 'block';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'none';
     } else if (specializationSelect.value === 'custom_new_category') {
-        newCategoryContainer.style.display = 'block';
-        customContainer.style.display = 'none';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'block';
+        if(customContainer) customContainer.style.display = 'none';
     } else {
-        customContainer.style.display = 'none';
-        newCategoryContainer.style.display = 'none';
+        if(customContainer) customContainer.style.display = 'none';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'none';
     }
 }
 
-// Toggle custom specialization input for edit form
 function toggleEditCustomSpecialization() {
     const specializationSelect = document.getElementById('edit_specialization');
     const customContainer = document.getElementById('editCustomSpecializationContainer');
     const newCategoryContainer = document.getElementById('editNewCategoryContainer');
     
     if (specializationSelect.value === 'custom') {
-        customContainer.style.display = 'block';
-        newCategoryContainer.style.display = 'none';
+        if(customContainer) customContainer.style.display = 'block';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'none';
     } else if (specializationSelect.value === 'custom_new_category') {
-        newCategoryContainer.style.display = 'block';
-        customContainer.style.display = 'none';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'block';
+        if(customContainer) customContainer.style.display = 'none';
     } else {
-        customContainer.style.display = 'none';
-        newCategoryContainer.style.display = 'none';
+        if(customContainer) customContainer.style.display = 'none';
+        if(newCategoryContainer) newCategoryContainer.style.display = 'none';
     }
 }
 
-// Initialize Google Map (Leaflet)
+// Initialize Leaflet Map
 function initGoogleMap() {
     const mapEl = document.getElementById('googleMap');
     if (!mapEl) return;
@@ -2905,7 +2977,6 @@ function initGoogleMap() {
         maxZoom: 19
     }).addTo(leafletMap);
 
-    // Click map to select location
     leafletMap.on('click', function(e) {
         selectLocation(e.latlng.lat, e.latlng.lng);
     });
@@ -2920,13 +2991,11 @@ function selectLocation(lat, lng, address = '') {
     document.getElementById('selectedLat').textContent = parseFloat(lat).toFixed(6);
     document.getElementById('selectedLng').textContent = parseFloat(lng).toFixed(6);
 
-    // Remove previous selected marker
     if (selectedMarker) {
         leafletMap.removeLayer(selectedMarker);
         selectedMarker = null;
     }
 
-    // Green marker for selected location
     const greenIcon = L.icon({
         iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-green.png',
         shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
@@ -2940,23 +3009,41 @@ function selectLocation(lat, lng, address = '') {
         .bindPopup('📍 Selected Location')
         .openPopup();
 
-    // Auto-fill location name using free Nominatim reverse geocoding
+    const updateLocationName = (displayName) => {
+        const bulkLocationField = document.getElementById('pin_location_name');
+        if (bulkLocationField) {
+            bulkLocationField.value = displayName;
+        }
+        
+        if (activeEditingUserId) {
+            const trainerLocationField = document.getElementById(`pin_location_name_${activeEditingUserId}`);
+            if (trainerLocationField) {
+                trainerLocationField.value = displayName;
+            }
+        }
+        
+        const quickName = document.getElementById('quickLocationName');
+        if (quickName) quickName.value = displayName;
+    };
+    
     if (!address) {
         fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`)
             .then(r => r.json())
             .then(data => {
                 if (data.display_name) {
-                    document.getElementById('pin_location_name').value = data.display_name;
-                    const quickName = document.getElementById('quickLocationName');
-                    if (quickName) quickName.value = data.display_name;
+                    updateLocationName(data.display_name);
+                } else {
+                    updateLocationName(`${parseFloat(lat).toFixed(6)}, ${parseFloat(lng).toFixed(6)}`);
                 }
             })
-            .catch(() => {}); // silently fail if no internet
+            .catch(() => {
+                updateLocationName(`${parseFloat(lat).toFixed(6)}, ${parseFloat(lng).toFixed(6)}`);
+            });
     } else {
-        document.getElementById('pin_location_name').value = address;
+        updateLocationName(address);
     }
 
-    if (activeUserId) {
+    if (activeEditingUserId) {
         document.getElementById('quickLocationSet').style.display = 'block';
     }
 }
@@ -2965,6 +3052,7 @@ function clearSelectedLocation() {
     document.getElementById('selectedCoordinates').style.display = 'none';
     document.getElementById('pin_latitude').value = '';
     document.getElementById('pin_longitude').value = '';
+    document.getElementById('pin_location_name').value = '';
 
     if (selectedMarker) {
         leafletMap.removeLayer(selectedMarker);
@@ -2976,7 +3064,6 @@ function performSearch() {
     const query = document.getElementById('locationSearch').value.trim();
     if (!query) return;
 
-    // Free geocoding via Nominatim (no API key needed)
     fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`)
         .then(r => r.json())
         .then(data => {
@@ -2996,22 +3083,22 @@ function searchLocation() {
     performSearch();
 }
 
-function getCurrentLocation() {
-    if (!navigator.geolocation) {
-        alert('Geolocation is not supported by your browser.');
+function useSelectedLocation() {
+    const lat = document.getElementById('pin_latitude').value;
+    const lng = document.getElementById('pin_longitude').value;
+    const locationName = document.getElementById('pin_location_name').value;
+    
+    if (!lat || !lng) {
+        alert('Please click on the map to select a location first.');
         return;
     }
-    navigator.geolocation.getCurrentPosition(
-        function(position) {
-            const lat = position.coords.latitude;
-            const lng = position.coords.longitude;
-            leafletMap.setView([lat, lng], 15);
-            selectLocation(lat, lng);
-        },
-        function() {
-            alert('Could not get your location. Please allow location access.');
-        }
-    );
+    
+    if (!locationName) {
+        alert('Location name is being detected. Please wait a moment or try clicking the map again.');
+        return;
+    }
+    
+    alert(`Location ready!\n\nCoordinates: ${lat}, ${lng}\nLocation: ${locationName}\n\nClick "Update PIN Location for All Trainers" to save.`);
 }
 
 function addUserToMap(user) {
@@ -3043,7 +3130,6 @@ function addUserToMap(user) {
         highlightUserCard(user.id);
     });
 
-    // Geofence radius circle
     const circle = L.circle([user.lat, user.lng], {
         radius: user.radius,
         color: '#3b82f6',
@@ -3075,7 +3161,6 @@ function loadUserLocations() {
         .then(users => {
             users.forEach(user => addUserToMap(user));
 
-            // Fit map to show all markers
             if (markers.length > 0) {
                 const group = L.featureGroup(markers.map(m => m.marker));
                 leafletMap.fitBounds(group.getBounds().pad(0.2));
@@ -3099,7 +3184,6 @@ function focusOnUser(userId, lat, lng) {
     const found = markers.find(m => m.id == userId);
     if (found) {
         found.marker.openPopup();
-        // Bounce effect using CSS
         const el = found.marker.getElement();
         if (el) {
             el.style.transition = 'transform 0.3s';
@@ -3117,94 +3201,213 @@ function refreshUserLocations() {
     loadUserLocations();
 }
 
-function useSelectedLocation() {
+// NEW: Set current map location to a trainer's form
+function setCurrentMapLocation(userId) {
     const lat = document.getElementById('pin_latitude').value;
     const lng = document.getElementById('pin_longitude').value;
+    const locationName = document.getElementById('pin_location_name').value;
+    
     if (!lat || !lng) {
-        alert('Please click on the map to select a location first.');
+        alert('Please click on the map first to select a location.');
         return;
     }
-    alert('Location ready! Click "Update PIN Location for All Trainers" to save.');
-}
-
-function selectOnMap(userId) {
-    activeUserId = userId;
-    document.getElementById('quickLocationSet').style.display = 'block';
-
-    const select = document.getElementById('quickUserSelect');
-    for (let i = 0; i < select.options.length; i++) {
-        if (select.options[i].value == userId) {
-            select.selectedIndex = i;
-            break;
-        }
-    }
-
-    const latEl = document.getElementById(`lat_${userId}`);
-    const lngEl = document.getElementById(`lng_${userId}`);
-    if (latEl && lngEl && latEl.value && lngEl.value) {
-        leafletMap.setView([parseFloat(latEl.value), parseFloat(lngEl.value)], 15);
-        const radiusEl = document.getElementById(`radius_slider_${userId}`);
-        if (radiusEl) document.getElementById('quickRadius').value = radiusEl.value;
-    }
-
-    document.getElementById('googleMap').scrollIntoView({ behavior: 'smooth' });
-}
-
-function applyLocationToUser() {
-    const userId = document.getElementById('quickUserSelect').value;
-    const lat = document.getElementById('pin_latitude').value;
-    const lng = document.getElementById('pin_longitude').value;
-    const radius = document.getElementById('quickRadius').value;
-    const locationName = document.getElementById('quickLocationName').value;
-
-    if (!userId) { alert('Please select a trainer.'); return; }
-    if (!lat || !lng) { alert('Please click on the map to select a location first.'); return; }
-
+    
     const latField = document.getElementById(`lat_${userId}`);
     const lngField = document.getElementById(`lng_${userId}`);
-
+    const locationField = document.getElementById(`pin_location_name_${userId}`);
+    
     if (latField && lngField) {
         latField.value = lat;
         lngField.value = lng;
-
-        const radiusField = document.getElementById(`radius_slider_${userId}`);
-        const radiusDisplay = document.getElementById(`radius_display_${userId}`);
-        if (radiusField) { radiusField.value = radius; }
-        if (radiusDisplay) { radiusDisplay.textContent = radius + ' meters'; }
-
-        const locationNameField = document.querySelector(`#edit-pin-form-${userId} input[name="pin_location_name"]`);
-        if (locationNameField && locationName) locationNameField.value = locationName;
-
-        alert('Location applied! Open the trainer\'s form and click Save.');
+        if (locationField && locationName) {
+            locationField.value = locationName;
+        }
+        
+        showTemporaryMessage(userId, '✅ Location applied! Click Save to confirm.', 'success');
+        updateMapMarkerForUser(userId);
+        
         document.getElementById('quickLocationSet').style.display = 'none';
-        activeUserId = null;
+        activeEditingUserId = null;
+        
+        if (selectedMarker) {
+            leafletMap.removeLayer(selectedMarker);
+            selectedMarker = null;
+        }
     }
 }
 
-// Show edit PIN form (for trainers only)
+// NEW: Search address and set for specific trainer
+function searchAndSetLocation(userId) {
+    const address = prompt('Enter an address or place name:', '');
+    if (!address) return;
+    
+    showTemporaryMessage(userId, '🔍 Searching for address...', 'info');
+    
+    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.length > 0) {
+                const lat = parseFloat(data[0].lat);
+                const lng = parseFloat(data[0].lon);
+                const displayName = data[0].display_name;
+                
+                const latField = document.getElementById(`lat_${userId}`);
+                const lngField = document.getElementById(`lng_${userId}`);
+                const locationField = document.getElementById(`pin_location_name_${userId}`);
+                
+                if (latField && lngField) {
+                    latField.value = lat.toFixed(6);
+                    lngField.value = lng.toFixed(6);
+                    if (locationField) {
+                        locationField.value = displayName;
+                    }
+                    
+                    updateMapMarkerForUser(userId);
+                    leafletMap.setView([lat, lng], 15);
+                    showTemporaryMessage(userId, '✅ Location found! Click Save to confirm.', 'success');
+                }
+            } else {
+                showTemporaryMessage(userId, '❌ Address not found. Please try again.', 'error');
+            }
+        })
+        .catch(() => {
+            showTemporaryMessage(userId, '❌ Search failed. Check your internet connection.', 'error');
+        });
+}
+
+// NEW: Update map marker for a specific trainer
+function updateMapMarkerForUser(userId) {
+    const latField = document.getElementById(`lat_${userId}`);
+    const lngField = document.getElementById(`lng_${userId}`);
+    
+    if (!latField || !lngField) return;
+    
+    const lat = parseFloat(latField.value);
+    const lng = parseFloat(lngField.value);
+    
+    if (isNaN(lat) || isNaN(lng)) return;
+    
+    if (userMarkers[userId]) {
+        leafletMap.removeLayer(userMarkers[userId]);
+    }
+    
+    const orangeIcon = L.icon({
+        iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-orange.png',
+        shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+        iconSize: [25, 41],
+        iconAnchor: [12, 41],
+        popupAnchor: [1, -34]
+    });
+    
+    const marker = L.marker([lat, lng], { 
+        icon: orangeIcon,
+        draggable: true
+    }).addTo(leafletMap)
+      .bindPopup(`<strong>Editing: ${userId}</strong><br>Drag to adjust location`)
+      .openPopup();
+    
+    marker.on('dragend', function(e) {
+        const newLat = e.target.getLatLng().lat;
+        const newLng = e.target.getLatLng().lng;
+        
+        latField.value = newLat.toFixed(6);
+        lngField.value = newLng.toFixed(6);
+        
+        fetch(`https://nominatim.openstreetmap.org/reverse?lat=${newLat}&lon=${newLng}&format=json`)
+            .then(r => r.json())
+            .then(data => {
+                const locationField = document.getElementById(`pin_location_name_${userId}`);
+                if (locationField && data.display_name) {
+                    locationField.value = data.display_name;
+                    showTemporaryMessage(userId, '📍 Location updated! Click Save to keep changes.', 'success');
+                }
+            })
+            .catch(() => {
+                showTemporaryMessage(userId, '⚠️ Location coordinates updated but name not found.', 'warning');
+            });
+    });
+    
+    userMarkers[userId] = marker;
+    leafletMap.setView([lat, lng], 15);
+}
+
+// NEW: Show temporary message
+function showTemporaryMessage(userId, message, type) {
+    const form = document.getElementById(`edit-pin-form-${userId}`);
+    if (!form) return;
+    
+    const existingMsg = form.querySelector('.temp-message');
+    if (existingMsg) existingMsg.remove();
+    
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `temp-message`;
+    msgDiv.style.cssText = `
+        padding: 8px 12px;
+        margin-bottom: 15px;
+        border-radius: 4px;
+        font-size: 13px;
+        animation: slideDown 0.3s ease-out;
+    `;
+    
+    if (type === 'success') {
+        msgDiv.style.backgroundColor = '#d1fae5';
+        msgDiv.style.color = '#065f46';
+        msgDiv.style.borderLeft = '4px solid #10b981';
+    } else if (type === 'error') {
+        msgDiv.style.backgroundColor = '#fee2e2';
+        msgDiv.style.color = '#991b1b';
+        msgDiv.style.borderLeft = '4px solid #ef4444';
+    } else {
+        msgDiv.style.backgroundColor = '#dbeafe';
+        msgDiv.style.color = '#1e40af';
+        msgDiv.style.borderLeft = '4px solid #3b82f6';
+    }
+    
+    msgDiv.innerHTML = message;
+    
+    const firstElement = form.firstChild;
+    form.insertBefore(msgDiv, firstElement);
+    
+    setTimeout(() => {
+        if (msgDiv) msgDiv.remove();
+    }, 3000);
+}
+
 function showEditPinForm(userId) {
-    // Hide all other forms first
     document.querySelectorAll('[id^="edit-pin-form-"]').forEach(form => {
         form.style.display = 'none';
     });
     
-    // Show the selected form
+    document.getElementById('quickLocationSet').style.display = 'none';
+    
+    if (userMarkers[userId]) {
+        leafletMap.removeLayer(userMarkers[userId]);
+        delete userMarkers[userId];
+    }
+    
     const form = document.getElementById(`edit-pin-form-${userId}`);
     if (form) {
         form.style.display = 'block';
         form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        activeEditingUserId = userId;
+        updateMapMarkerForUser(userId);
+        showTemporaryMessage(userId, '💡 Click on the map or drag the orange marker to set location', 'info');
     }
 }
 
-// Hide edit PIN form
 function hideEditPinForm(userId) {
     const form = document.getElementById(`edit-pin-form-${userId}`);
     if (form) {
         form.style.display = 'none';
     }
+    
+    if (userMarkers[userId]) {
+        leafletMap.removeLayer(userMarkers[userId]);
+        delete userMarkers[userId];
+    }
+    activeEditingUserId = null;
 }
 
-// Update radius display
 function updateRadiusDisplay(userId, value) {
     const display = document.getElementById(`radius_display_${userId}`);
     if (display) {
@@ -3212,7 +3415,6 @@ function updateRadiusDisplay(userId, value) {
     }
 }
 
-// Validate PIN form
 function validatePinForm(userId) {
     const lat = document.getElementById(`lat_${userId}`).value;
     const lng = document.getElementById(`lng_${userId}`).value;
@@ -3240,7 +3442,6 @@ function validatePinForm(userId) {
     return true;
 }
 
-// Bulk update functions
 function updateBulkRadiusValue(val) {
     document.getElementById('pin_radius').value = val;
     document.getElementById('bulk_radius_display').textContent = val + ' meters';
@@ -3251,37 +3452,29 @@ function updateBulkRadiusSlider(val) {
     document.getElementById('bulk_radius_display').textContent = val + ' meters';
 }
 
-// Tab switching function
 function switchTab(tabName) {
-    // Update URL without page reload
     const url = new URL(window.location.href);
     url.searchParams.set('tab', tabName);
     window.location.href = url.toString();
 }
 
-// Highlight user card
 function highlightUserCard(userId) {
-    // Remove highlight from all cards
     document.querySelectorAll('.user-card').forEach(card => {
         card.style.backgroundColor = '';
         card.style.borderColor = '';
         card.style.boxShadow = '';
     });
     
-    // Highlight the selected card
     const card = document.getElementById(`user-card-${userId}`);
     if (card) {
         card.style.backgroundColor = '#f0f9ff';
         card.style.borderColor = '#0d9488';
         card.style.borderWidth = '2px';
         card.style.boxShadow = '0 4px 12px rgba(13, 148, 136, 0.2)';
-        
-        // Scroll to card smoothly
         card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 }
 
-// Generate password
 function generatePassword() {
     const easyWords = [
         'Sun', 'Moon', 'Star', 'Tree', 'Book', 'Door', 'Bird', 'Fish', 'Cake', 'Ball',
@@ -3310,7 +3503,6 @@ function generatePassword() {
     return password;
 }
 
-// Check for duplicates
 async function checkDuplicateBeforeSubmit(userId, fullname, email) {
     try {
         const response = await fetch('user-management.php?ajax=check_duplicate', {
@@ -3329,21 +3521,7 @@ async function checkDuplicateBeforeSubmit(userId, fullname, email) {
     }
 }
 
-// Fetch programs for the selected trainer
-async function fetchTrainerPrograms(trainerId, currentSpecialization = '') {
-    try {
-        const response = await fetch(`user-management.php?ajax=fetch_trainer_programs&trainer_id=${trainerId}&specialization=${encodeURIComponent(currentSpecialization)}`);
-        const data = await response.json();
-        return data;
-    } catch (error) {
-        console.error('Error fetching programs:', error);
-        return { programs: [], assignedPrograms: [] };
-    }
-}
-
-// FIXED: Modal functions
 function openTrainerModal() {
-    console.log('Opening trainer modal');
     const modal = document.getElementById('trainerModalBackdrop');
     if (modal) {
         modal.style.display = 'flex';
@@ -3353,63 +3531,63 @@ function openTrainerModal() {
 function closeTrainerModal() {
     document.getElementById('trainerModalBackdrop').style.display = 'none';
     document.getElementById('trainerForm').reset();
-    document.getElementById('customSpecializationContainer').style.display = 'none';
-    document.getElementById('newCategoryContainer').style.display = 'none';
+    const customContainer = document.getElementById('customSpecializationContainer');
+    const newCategoryContainer = document.getElementById('newCategoryContainer');
+    if(customContainer) customContainer.style.display = 'none';
+    if(newCategoryContainer) newCategoryContainer.style.display = 'none';
     document.getElementById('add_fullname_error').style.display = 'none';
     document.getElementById('add_email_error').style.display = 'none';
 }
 
-// FIXED: Enhanced openEditUserModal function
 function openEditUserModal(userData) {
-    console.log('Opening edit modal for user:', userData);
-    
-    // Validate userData
     if (!userData || !userData.userId) {
         console.error('Invalid user data for edit modal');
         alert('Error: Invalid user data. Please try again.');
         return;
     }
     
-    // Set form values
     document.getElementById('edit_user_id').value = userData.userId;
     document.getElementById('edit_full_name').value = userData.fullName || '';
     document.getElementById('edit_email').value = userData.email || '';
     document.getElementById('edit_role_display').textContent = userData.role ? userData.role.charAt(0).toUpperCase() + userData.role.slice(1) : 'User';
     
-    // Handle specialization
-    const specializationSelect = document.getElementById('edit_specialization');
-    if (specializationSelect) {
-        let foundInOptions = false;
+    // Show/hide specialization based on role
+    const specializationGroup = document.getElementById('specialization_group');
+    if (userData.role === 'trainer') {
+        specializationGroup.style.display = 'block';
         
-        for (let i = 0; i < specializationSelect.options.length; i++) {
-            if (specializationSelect.options[i].value === userData.specialization) {
-                specializationSelect.selectedIndex = i;
-                foundInOptions = true;
-                break;
+        const specializationSelect = document.getElementById('edit_specialization');
+        if (specializationSelect) {
+            let foundInOptions = false;
+            
+            for (let i = 0; i < specializationSelect.options.length; i++) {
+                if (specializationSelect.options[i].value === userData.specialization) {
+                    specializationSelect.selectedIndex = i;
+                    foundInOptions = true;
+                    break;
+                }
             }
-        }
-        
-        if (!foundInOptions && userData.specialization) {
-            specializationSelect.value = 'custom';
-            const customInput = document.getElementById('edit_custom_specialization');
-            if (customInput) {
-                customInput.value = userData.specialization;
+            
+            if (!foundInOptions && userData.specialization) {
+                specializationSelect.value = 'custom';
+                const customInput = document.getElementById('edit_custom_specialization');
+                if (customInput) {
+                    customInput.value = userData.specialization;
+                }
+                document.getElementById('editCustomSpecializationContainer').style.display = 'block';
+            } else {
+                document.getElementById('editCustomSpecializationContainer').style.display = 'none';
             }
-            document.getElementById('editCustomSpecializationContainer').style.display = 'block';
-        } else {
-            document.getElementById('editCustomSpecializationContainer').style.display = 'none';
+            
+            document.getElementById('editNewCategoryContainer').style.display = 'none';
         }
-        
-        document.getElementById('editNewCategoryContainer').style.display = 'none';
+    } else {
+        specializationGroup.style.display = 'none';
     }
     
-    // Display the modal
     const modal = document.getElementById('editUserModalBackdrop');
     if (modal) {
         modal.style.display = 'flex';
-        console.log('Edit modal displayed');
-    } else {
-        console.error('Edit modal backdrop not found');
     }
 }
 
@@ -3420,6 +3598,42 @@ function closeEditUserModal() {
     document.getElementById('editNewCategoryContainer').style.display = 'none';
     document.getElementById('edit_fullname_error').style.display = 'none';
     document.getElementById('edit_email_error').style.display = 'none';
+}
+
+// Apply location to user from quick panel
+function applyLocationToUser() {
+    const userId = document.getElementById('quickUserSelect').value;
+    const lat = document.getElementById('pin_latitude').value;
+    const lng = document.getElementById('pin_longitude').value;
+    const radius = document.getElementById('quickRadius').value;
+    const locationName = document.getElementById('quickLocationName').value;
+
+    if (!userId) { alert('Please select a trainer.'); return; }
+    if (!lat || !lng) { alert('Please click on the map to select a location first.'); return; }
+
+    const latField = document.getElementById(`lat_${userId}`);
+    const lngField = document.getElementById(`lng_${userId}`);
+
+    if (latField && lngField) {
+        latField.value = lat;
+        lngField.value = lng;
+
+        const radiusField = document.getElementById(`radius_slider_${userId}`);
+        const radiusDisplay = document.getElementById(`radius_display_${userId}`);
+        if (radiusField) { radiusField.value = radius; }
+        if (radiusDisplay) { radiusDisplay.textContent = radius + ' meters'; }
+
+        const locationNameField = document.getElementById(`pin_location_name_${userId}`);
+        if (locationNameField && locationName) {
+            locationNameField.value = locationName;
+        }
+
+        alert('Location applied to trainer! Click "Update PIN" to save changes.');
+        document.getElementById('quickLocationSet').style.display = 'none';
+        activeEditingUserId = null;
+        
+        clearSelectedLocation();
+    }
 }
 
 // Make functions globally available
@@ -3437,15 +3651,16 @@ window.openTrainerModal = openTrainerModal;
 window.closeTrainerModal = closeTrainerModal;
 window.openEditUserModal = openEditUserModal;
 window.closeEditUserModal = closeEditUserModal;
-window.getCurrentLocation = getCurrentLocation;
 window.searchLocation = searchLocation;
 window.performSearch = performSearch;
-window.selectOnMap = selectOnMap;
-window.applyLocationToUser = applyLocationToUser;
+window.setCurrentMapLocation = setCurrentMapLocation;
+window.searchAndSetLocation = searchAndSetLocation;
+window.updateMapMarkerForUser = updateMapMarkerForUser;
 window.useSelectedLocation = useSelectedLocation;
 window.clearSelectedLocation = clearSelectedLocation;
 window.toggleCustomSpecialization = toggleCustomSpecialization;
 window.toggleEditCustomSpecialization = toggleEditCustomSpecialization;
+window.applyLocationToUser = applyLocationToUser;
 </script>
 
 </body>

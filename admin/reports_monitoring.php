@@ -50,11 +50,26 @@ if (!$conn) {
     die("Database connection failed: " . mysqli_connect_error());
 }
 
+// Fetch current signatory settings from database
+$signatorySettings = getSignatorySettings($conn);
+
+// Handle signatory update via AJAX
+if (isset($_POST['update_signatory']) && $_POST['update_signatory'] == '1') {
+    header('Content-Type: application/json');
+    $signatories = isset($_POST['signatories']) ? json_decode($_POST['signatories'], true) : [];
+    
+    if (saveSignatorySettings($conn, $signatories)) {
+        echo json_encode(['success' => true, 'message' => 'Signatory settings saved successfully']);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Failed to save signatory settings']);
+    }
+    exit();
+}
+
 // Fetch data for display based on current filters
 try {
     $traineeOutcomesData    = fetchTraineeOutcomes($conn, $dateFrom, $dateTo);
     $trainerAttendanceData  = fetchTrainerAttendance($conn, $dateFrom, $dateTo);
-    $traineeAttendanceData  = fetchTraineeAttendance($conn, $dateFrom, $dateTo);
     $trainerEvaluationData  = fetchTrainerEvaluations($conn, $dateFrom, $dateTo);
     $traineesDetailedData   = fetchTraineesDetailed($conn, $dateFrom, $dateTo);
     $certificateData        = fetchCertificateData($conn, $dateFrom, $dateTo);
@@ -109,29 +124,6 @@ function fetchTrainerAttendance($conn, $dateFrom, $dateTo) {
               WHERE u.role COLLATE utf8mb4_unicode_ci = 'trainer'
               GROUP BY u.id
               ORDER BY days_present DESC, u.fullname";
-    $stmt = $conn->prepare($query);
-    if (!$stmt) throw new Exception("Prepare failed: " . $conn->error);
-    $stmt->bind_param("ss", $dateFrom, $dateTo);
-    $stmt->execute();
-    return $stmt->get_result();
-}
-
-function fetchTraineeAttendance($conn, $dateFrom, $dateTo) {
-    $query = "SELECT 
-                u.fullname COLLATE utf8mb4_unicode_ci AS name,
-                p.name COLLATE utf8mb4_unicode_ci AS program,
-                e.attendance AS attendance_percentage,
-                COUNT(DISTINCT ar.attendance_date) AS days_present,
-                MAX(ar.attendance_date) AS last_attendance,
-                e.enrollment_status COLLATE utf8mb4_unicode_ci AS enrollment_status
-              FROM users u
-              JOIN enrollments e ON u.id = e.user_id
-              JOIN programs p ON e.program_id = p.id
-              LEFT JOIN attendance_records ar ON e.id = ar.enrollment_id
-                  AND ar.attendance_date BETWEEN ? AND ?
-              WHERE u.role COLLATE utf8mb4_unicode_ci = 'trainee'
-              GROUP BY u.id, e.id
-              ORDER BY e.attendance DESC, u.fullname";
     $stmt = $conn->prepare($query);
     if (!$stmt) throw new Exception("Prepare failed: " . $conn->error);
     $stmt->bind_param("ss", $dateFrom, $dateTo);
@@ -353,9 +345,67 @@ function fetchSingleCertificateData($conn, $user_id, $program_id) {
     return null;
 }
 
+// Function to get signatory settings
+function getSignatorySettings($conn) {
+    // Check if table exists
+    $table_check = $conn->query("SHOW TABLES LIKE 'certificate_signatory_settings'");
+    if ($table_check->num_rows == 0) {
+        // Create the table
+        $create_table = "CREATE TABLE IF NOT EXISTS certificate_signatory_settings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            signatory_name VARCHAR(255) NOT NULL,
+            signatory_title VARCHAR(255) NOT NULL,
+            signatory_order INT DEFAULT 0,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $conn->query($create_table);
+        
+        // Insert default signatories
+        $insert_defaults = "INSERT INTO certificate_signatory_settings (signatory_name, signatory_title, signatory_order) VALUES
+            ('ZENAIDA S. MANINGAS', 'PESO Manager', 1),
+            ('ROBERTO B. PEREZ', 'Municipal Vice Mayor', 2),
+            ('BARTOLOME R. RAMOS', 'Municipal Mayor', 3)";
+        $conn->query($insert_defaults);
+    }
+    
+    $query = "SELECT * FROM certificate_signatory_settings WHERE is_active = TRUE ORDER BY signatory_order ASC";
+    $result = $conn->query($query);
+    $signatories = [];
+    while ($row = $result->fetch_assoc()) {
+        $signatories[] = $row;
+    }
+    return $signatories;
+}
+
+// Function to save signatory settings
+function saveSignatorySettings($conn, $signatories) {
+    // Clear existing settings
+    $conn->query("TRUNCATE TABLE certificate_signatory_settings");
+    
+    // Insert new settings
+    $stmt = $conn->prepare("INSERT INTO certificate_signatory_settings (signatory_name, signatory_title, signatory_order) VALUES (?, ?, ?)");
+    $order = 1;
+    foreach ($signatories as $signatory) {
+        $name = $signatory['name'];
+        $title = $signatory['title'];
+        $stmt->bind_param("ssi", $name, $title, $order);
+        if (!$stmt->execute()) {
+            return false;
+        }
+        $order++;
+    }
+    $stmt->close();
+    return true;
+}
+
 // ── Certificate PDF ────────────────────────────────────────────────────────────
 
 function generateSingleCertificatePDF($data) {
+    global $conn;
+    $signatorySettings = getSignatorySettings($conn);
+    
     $pdf = new TCPDF('P', PDF_UNIT, 'A4', true, 'UTF-8', false);
     $pdf->SetCreator('Livelihood Program Management System');
     $pdf->SetAuthor('System Administrator');
@@ -434,16 +484,22 @@ function generateSingleCertificatePDF($data) {
     $pdf->Cell(0, 6, 'Employment Center, Santa Maria, Bulacan.', 0, 1, 'C');
     $pdf->Ln(15);
 
+    // Dynamic signatories from database
     $signatureY = 210; $leftX = 35; $signatureWidth = 70;
-    foreach ([
-        [$signatureY,      'ZENAIDA S. MANINGAS',  'PESO Manager'],
-        [$signatureY + 25, 'ROBERTO B. PEREZ',      'Municipal Vice Mayor'],
-        [$signatureY + 50, 'BARTOLOME R. RAMOS',    'Municipal Mayor'],
-    ] as [$y, $name, $title]) {
-        $pdf->SetXY($leftX, $y);
-        $pdf->SetFont('times', '', 10); $pdf->Cell($signatureWidth, 5, '____________________________', 0, 1, 'C');
-        $pdf->SetX($leftX); $pdf->SetFont('times', 'B', 11); $pdf->Cell($signatureWidth, 5, $name, 0, 1, 'C');
-        $pdf->SetX($leftX); $pdf->SetFont('times', '', 10); $pdf->Cell($signatureWidth, 5, $title, 0, 1, 'C');
+    $signatureSpacing = 25;
+    $currentY = $signatureY;
+    
+    foreach ($signatorySettings as $signatory) {
+        $pdf->SetXY($leftX, $currentY);
+        $pdf->SetFont('times', '', 10); 
+        $pdf->Cell($signatureWidth, 5, '____________________________', 0, 1, 'C');
+        $pdf->SetX($leftX); 
+        $pdf->SetFont('times', 'B', 11); 
+        $pdf->Cell($signatureWidth, 5, strtoupper($signatory['signatory_name']), 0, 1, 'C');
+        $pdf->SetX($leftX); 
+        $pdf->SetFont('times', '', 10); 
+        $pdf->Cell($signatureWidth, 5, $signatory['signatory_title'], 0, 1, 'C');
+        $currentY += $signatureSpacing;
     }
 
     $photoX = 135; $photoY = $signatureY + 10; $photoWidth = 45; $photoHeight = 55;
@@ -720,45 +776,6 @@ function generateAttendancePDF($pdf, $conn, $dateFrom, $dateTo, $subtab) {
         } else {
             $pdf->SetFont('helvetica', '', 10); $pdf->SetTextColor(231, 76, 60);
             $pdf->Cell(0, 10, 'No trainer attendance data found for the selected period.', 0, 1, 'C');
-            $pdf->SetTextColor(0, 0, 0);
-        }
-    } else {
-        $result = fetchTraineeAttendance($conn, $dateFrom, $dateTo);
-        if ($result && $result->num_rows > 0) {
-            $data = [];
-            while ($row = $result->fetch_assoc()) $data[] = $row;
-
-            $pdf->SetFont('helvetica', 'B', 10);
-            $pdf->SetFillColor(240, 240, 240);
-            $header = ['Trainee Name', 'Program', 'Attendance %', 'Days Present', 'Last Attendance', 'Status'];
-            $w      = [50, 50, 30, 30, 50, 30];
-            $align  = ['L', 'L', 'C', 'C', 'C', 'C'];
-            for ($i = 0; $i < count($header); $i++)
-                $pdf->Cell($w[$i], 10, $header[$i], 1, 0, $align[$i], true);
-            $pdf->Ln();
-
-            $pdf->SetFont('helvetica', '', 9);
-            $fill = false;
-            foreach ($data as $row) {
-                $pct = $row['attendance_percentage'];
-                $s   = $pct >= 80 ? 'Good' : ($pct >= 60 ? 'Fair' : 'Poor');
-                $pdf->SetFillColor($fill ? 245 : 255, $fill ? 245 : 255, $fill ? 245 : 255);
-                $pdf->Cell($w[0], 8, htmlspecialchars($row['name']), 'LR', 0, 'L', $fill);
-                $pdf->Cell($w[1], 8, htmlspecialchars($row['program']), 'LR', 0, 'L', $fill);
-                $pdf->Cell($w[2], 8, $pct . '%', 'LR', 0, 'C', $fill);
-                $pdf->Cell($w[3], 8, $row['days_present'] . ' days', 'LR', 0, 'C', $fill);
-                $pdf->Cell($w[4], 8, $row['last_attendance'] ? date('M d, Y', strtotime($row['last_attendance'])) : 'No record', 'LR', 0, 'C', $fill);
-                $pdf->Cell($w[5], 8, $s, 'LR', 0, 'C', $fill);
-                $pdf->Ln();
-                $fill = !$fill;
-            }
-            $pdf->Cell(array_sum($w), 0, '', 'T');
-            $pdf->Ln(10);
-            $pdf->SetFont('helvetica', 'B', 10);
-            $pdf->Cell(0, 8, 'Total Trainees: ' . count($data), 0, 1, 'R');
-        } else {
-            $pdf->SetFont('helvetica', '', 10); $pdf->SetTextColor(231, 76, 60);
-            $pdf->Cell(0, 10, 'No trainee attendance data found for the selected period.', 0, 1, 'C');
             $pdf->SetTextColor(0, 0, 0);
         }
     }
@@ -1142,41 +1159,421 @@ include '../components/header.php';
         .eligibility-missing      { background-color: #fff3cd; color: #856404; }
         .eligibility-not-passed   { background-color: #f8d7da; color: #721c24; }
         .eligibility-missing-both { background-color: #e2e3e5; color: #383d41; }
-        .certificate-container { width: 210mm; height: 297mm; background: #f5f0e8; position: relative; box-sizing: border-box; margin: 0 auto; }
-        .decorative-border { position: absolute; top:0;left:0;right:0;bottom:0; border: 35px solid transparent; border-image: repeating-linear-gradient(45deg,#2d8b8e 0px,#2d8b8e 10px,#d4a574 10px,#d4a574 20px,#2d8b8e 20px,#2d8b8e 30px,#f5f0e8 30px,#f5f0e8 40px) 35; pointer-events: none; z-index: 2; }
-        .inner-border { position: absolute; top:20px;left:20px;right:20px;bottom:20px; border: 15px solid; border-image: repeating-linear-gradient(0deg,#2d8b8e 0px,#2d8b8e 3px,#d4a574 3px,#d4a574 6px,#2d8b8e 6px,#2d8b8e 9px,#f5f0e8 9px,#f5f0e8 12px) 15; pointer-events: none; z-index: 2; }
-        .certificate-content { position: absolute; width:100%;height:100%;top:0;left:0;padding:50px 70px;z-index:1;box-sizing:border-box; }
-        .logos-row { display:flex;justify-content:center;align-items:center;gap:30px;margin:15px 0 20px 0; }
-        .logo-item { width:80px;height:80px; } .logo-item img { width:100%;height:100%;object-fit:contain; }
-        .header-top { text-align:center;font-size:16px;font-weight:bold;color:black;margin:15px 0 5px 0;text-transform:uppercase;letter-spacing:0.5px; }
-        .cooperation { text-align:center;font-size:14px;color:black;margin:5px 0; }
-        .tesda { text-align:center;font-size:14px;font-weight:bold;color:black;margin:5px 0;text-transform:uppercase; }
-        .training-center { text-align:center;font-size:20px;font-weight:bold;color:#2d8b8e;margin:8px 0 35px 0;text-transform:uppercase;letter-spacing:1px; }
-        .certificate-title { text-align:center;margin:0 0 35px 0; }
-        .certificate-title h1 { font-size:48px;margin:0;color:#2d8b8e;font-weight:bold;text-transform:uppercase;letter-spacing:6px;line-height:1; }
-        .awarded-to { text-align:center;margin:0 0 20px 0; } .awarded-to p { font-size:18px;margin:0;color:black; }
-        .trainee-name-container { text-align:center;margin:0 0 25px 0; }
-        .trainee-name { font-size:48px;color:black;font-weight:bold;text-transform:uppercase;letter-spacing:2px;line-height:1.1; }
-        .completion-text { text-align:center;margin:0 0 20px 0; } .completion-text p { font-size:16px;margin:0;color:black; }
-        .training-name-container { text-align:center;margin:0 0 30px 0; }
-        .training-name { font-size:36px;color:black;font-weight:bold;text-transform:uppercase;letter-spacing:2px;line-height:1.1; }
-        .given-date { text-align:center;margin:0 0 40px 0; } .given-date p { font-size:16px;margin:0;color:black;line-height:1.4; }
-        .signatures { position:absolute;bottom:60px;left:70px;right:70px; }
-        .signatures-row { display:flex;justify-content:space-between;align-items:flex-end; }
-        .left-signatures { display:flex;flex-direction:column;gap:35px;flex:1; }
-        .signature-block { text-align:center; }
-        .signature-line { border-bottom:2px solid black;width:280px;margin:0 auto 5px auto; }
-        .signature-name { font-size:15px;font-weight:bold;color:black;text-transform:uppercase; }
-        .signature-title { font-size:14px;color:black;margin:3px 0 0 0; }
-        .photo-signature-section { width:180px;display:flex;flex-direction:column;align-items:center;margin-left:40px; }
-        .photo-box { width:150px;height:180px;border:2px solid #888;background:white;display:flex;align-items:center;justify-content:center;margin-bottom:10px; }
-        .photo-signature-line { border-bottom:2px solid black;width:150px;margin:5px 0; }
-        .photo-signature-label { font-size:12px;color:black;text-align:center; }
-        .watermark { position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);opacity:0.06;z-index:0;pointer-events:none; }
-        .watermark img { width:500px;height:500px;object-fit:contain; }
-        .certificate-name { color:#00008B;font-size:2.2rem;font-weight:bold;margin:20px 0;text-transform:uppercase;letter-spacing:1px; }
-        .certificate-actions { display:flex;gap:10px;justify-content:center;margin-top:20px; }
-        * { box-sizing: border-box; }
+        
+        /* Modal styles for signatory editor */
+        .modal-signatory {
+            display: none;
+            position: fixed;
+            z-index: 10000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            animation: fadeIn 0.3s ease;
+        }
+        
+        .modal-content-signatory {
+            background-color: white;
+            margin: 5% auto;
+            padding: 0;
+            width: 90%;
+            max-width: 600px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            animation: slideIn 0.3s ease;
+        }
+        
+        .modal-header {
+            padding: 20px 25px;
+            background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
+            color: white;
+            border-radius: 12px 12px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-header h3 {
+            margin: 0;
+            font-size: 1.3rem;
+        }
+        
+        .close-modal {
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .close-modal:hover {
+            transform: scale(1.1);
+        }
+        
+        .modal-body {
+            padding: 25px;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+        
+        .modal-footer {
+            padding: 15px 25px;
+            background: #f8f9fa;
+            border-radius: 0 0 12px 12px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        
+        .signatory-item {
+            background: #f8f9fa;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        
+        .signatory-item label {
+            display: block;
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }
+        
+        .signatory-item input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            transition: border-color 0.2s;
+        }
+        
+        .signatory-item input:focus {
+            outline: none;
+            border-color: #3498db;
+            box-shadow: 0 0 0 2px rgba(52,152,219,0.1);
+        }
+        
+        .btn-save-signatory {
+            background: linear-gradient(135deg, #27ae60 0%, #229954 100%);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        
+        .btn-save-signatory:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(39,174,96,0.3);
+        }
+        
+        .btn-cancel {
+            background: #95a5a6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        
+        .btn-cancel:hover {
+            background: #7f8c8d;
+        }
+        
+        .btn-edit-signatory {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        
+        .btn-edit-signatory:hover {
+            background: #2980b9;
+            transform: translateY(-1px);
+        }
+        
+        .signature-preview {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f0f8ff;
+            border-radius: 8px;
+            border: 1px solid #d4e6f1;
+        }
+        
+        .signature-preview h4 {
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+        }
+        
+        .signature-preview-item {
+            padding: 8px;
+            margin-bottom: 8px;
+            border-bottom: 1px dashed #bdc3c7;
+        }
+        
+        .signature-preview-name {
+            font-weight: bold;
+            font-size: 14px;
+        }
+        
+        .signature-preview-title {
+            font-size: 12px;
+            color: #7f8c8d;
+        }
+
+        .certificate-container {
+            width: 210mm;
+            height: 297mm;
+            background: #f5f0e8;
+            position: relative;
+            box-sizing: border-box;
+            margin: 0 auto;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+        }
+        .decorative-border {
+            position: absolute;
+            top:0;left:0;right:0;bottom:0;
+            border: 35px solid transparent;
+            border-image: repeating-linear-gradient(45deg,#2d8b8e 0px,#2d8b8e 10px,#d4a574 10px,#d4a574 20px,#2d8b8e 20px,#2d8b8e 30px,#f5f0e8 30px,#f5f0e8 40px) 35;
+            pointer-events: none;
+            z-index: 2;
+        }
+        .inner-border {
+            position: absolute;
+            top:20px;left:20px;right:20px;bottom:20px;
+            border: 15px solid;
+            border-image: repeating-linear-gradient(0deg,#2d8b8e 0px,#2d8b8e 3px,#d4a574 3px,#d4a574 6px,#2d8b8e 6px,#2d8b8e 9px,#f5f0e8 9px,#f5f0e8 12px) 15;
+            pointer-events: none;
+            z-index: 2;
+        }
+        .certificate-content {
+            position: absolute;
+            width:100%;height:100%;
+            top:0;left:0;
+            padding:50px 70px;
+            z-index:1;
+            box-sizing:border-box;
+        }
+        .logos-row {
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            gap:30px;
+            margin:15px 0 20px 0;
+        }
+        .logo-item { width:80px;height:80px; }
+        .logo-item img { width:100%;height:100%;object-fit:contain; }
+        .header-top {
+            text-align:center;
+            font-size:16px;
+            font-weight:bold;
+            color:black;
+            margin:15px 0 5px 0;
+            text-transform:uppercase;
+            letter-spacing:0.5px;
+        }
+        .cooperation {
+            text-align:center;
+            font-size:14px;
+            color:black;
+            margin:5px 0;
+        }
+        .tesda {
+            text-align:center;
+            font-size:14px;
+            font-weight:bold;
+            color:black;
+            margin:5px 0;
+            text-transform:uppercase;
+        }
+        .training-center {
+            text-align:center;
+            font-size:20px;
+            font-weight:bold;
+            color:#2d8b8e;
+            margin:8px 0 35px 0;
+            text-transform:uppercase;
+            letter-spacing:1px;
+        }
+        .certificate-title {
+            text-align:center;
+            margin:0 0 35px 0;
+        }
+        .certificate-title h1 {
+            font-size:48px;
+            margin:0;
+            color:#2d8b8e;
+            font-weight:bold;
+            text-transform:uppercase;
+            letter-spacing:6px;
+            line-height:1;
+        }
+        .awarded-to {
+            text-align:center;
+            margin:0 0 20px 0;
+        }
+        .awarded-to p {
+            font-size:18px;
+            margin:0;
+            color:black;
+        }
+        .trainee-name-container {
+            text-align:center;
+            margin:0 0 25px 0;
+        }
+        .trainee-name {
+            font-size:48px;
+            color:black;
+            font-weight:bold;
+            text-transform:uppercase;
+            letter-spacing:2px;
+            line-height:1.1;
+        }
+        .completion-text {
+            text-align:center;
+            margin:0 0 20px 0;
+        }
+        .completion-text p {
+            font-size:16px;
+            margin:0;
+            color:black;
+        }
+        .training-name-container {
+            text-align:center;
+            margin:0 0 30px 0;
+        }
+        .training-name {
+            font-size:36px;
+            color:black;
+            font-weight:bold;
+            text-transform:uppercase;
+            letter-spacing:2px;
+            line-height:1.1;
+        }
+        .given-date {
+            text-align:center;
+            margin:0 0 40px 0;
+        }
+        .given-date p {
+            font-size:16px;
+            margin:0;
+            color:black;
+            line-height:1.4;
+        }
+        .signatures {
+            position:absolute;
+            bottom:60px;
+            left:70px;
+            right:70px;
+        }
+        .signatures-row {
+            display:flex;
+            justify-content:space-between;
+            align-items:flex-end;
+        }
+        .left-signatures {
+            display:flex;
+            flex-direction:column;
+            gap:35px;
+            flex:1;
+        }
+        .signature-block {
+            text-align:center;
+        }
+        .signature-line {
+            border-bottom:2px solid black;
+            width:280px;
+            margin:0 auto 5px auto;
+        }
+        .signature-name {
+            font-size:15px;
+            font-weight:bold;
+            color:black;
+            text-transform:uppercase;
+        }
+        .signature-title {
+            font-size:14px;
+            color:black;
+            margin:3px 0 0 0;
+        }
+        .photo-signature-section {
+            width:180px;
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            margin-left:40px;
+        }
+        .photo-box {
+            width:150px;
+            height:180px;
+            border:2px solid #888;
+            background:white;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            margin-bottom:10px;
+        }
+        .photo-signature-line {
+            border-bottom:2px solid black;
+            width:150px;
+            margin:5px 0;
+        }
+        .photo-signature-label {
+            font-size:12px;
+            color:black;
+            text-align:center;
+        }
+        .watermark {
+            position:absolute;
+            top:50%;
+            left:50%;
+            transform:translate(-50%,-50%);
+            opacity:0.06;
+            z-index:0;
+            pointer-events:none;
+        }
+        .watermark img {
+            width:500px;
+            height:500px;
+            object-fit:contain;
+        }
+        .certificate-name {
+            color:#00008B;
+            font-size:2.2rem;
+            font-weight:bold;
+            margin:20px 0;
+            text-transform:uppercase;
+            letter-spacing:1px;
+        }
+        .certificate-actions {
+            display:flex;
+            gap:10px;
+            justify-content:center;
+            margin-top:20px;
+        }
+        
+        @keyframes slideIn {
+            from {
+                transform: translateY(-50px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
 
         @media (max-width: 768px) {
             .main-tabs, .sub-tabs { flex-direction: column; }
@@ -1185,6 +1582,7 @@ include '../components/header.php';
             .export-btn { width: 100%; justify-content: center; }
             .section-header { flex-direction: column; align-items: flex-start; gap: 15px; }
             table { display: block; overflow-x: auto; font-size: 0.8rem; }
+            .certificate-container { transform: scale(0.6); margin: -100px auto; }
         }
     </style>
 </head>
@@ -1337,8 +1735,10 @@ include '../components/header.php';
                 <?php if ($certificateData && $certificateData->num_rows > 0): ?>
                 <button class="export-btn export-certificate" onclick="generateBulkCertificates(event, this)"><i class="fas fa-download"></i> Generate All Certificates</button>
                 <?php endif; ?>
+                <button class="export-btn" style="background-color: #3498db; color: white;" onclick="openSignatoryModal()"><i class="fas fa-edit"></i> Edit Signatory Settings</button>
             </div>
         </div>
+        
         <?php
         if ($certificateData && $certificateData->num_rows > 0):
             $programStats = []; $eligibleData = [];
@@ -1358,59 +1758,117 @@ include '../components/header.php';
             <div class="certificate-stat-card"><i class="fas fa-graduation-cap"></i><h3><?php echo count($programStats); ?></h3><p>Programs Completed</p></div>
             <div class="certificate-stat-card"><i class="fas fa-chart-bar"></i><h3><?php echo $maxCount; ?></h3><p>Most Completed: <?php echo substr($mostCommonProgram, 0, 20) . (strlen($mostCommonProgram) > 20 ? '...' : ''); ?></p></div>
         </div>
-        <div class="certificate-container" style="margin-bottom:30px;">
-            <div class="watermark"><img src="/trainee/SLOGO.jpg" alt="" onerror="this.style.display='none';"></div>
-            <div class="decorative-border"></div>
-            <div class="inner-border"></div>
-            <div class="certificate-content">
-                <div class="logos-row">
-                    <div class="logo-item"><img src="/trainee/SMBLOGO.jpg" alt="" onerror="this.style.display='none';"></div>
-                    <div class="logo-item"><img src="/trainee/SLOGO.jpg" alt="" onerror="this.style.display='none';"></div>
-                    <div class="logo-item"><img src="/trainee/TESDALOGO.png" alt="" onerror="this.style.display='none';"></div>
+        <?php endif; ?>
+        
+        <!-- Certificate Template Preview -->
+        <div style="margin-bottom: 30px;">
+            <h3 style="color: var(--primary-color); margin-bottom: 15px;"><i class="fas fa-eye"></i> Certificate Template Preview</h3>
+            <div class="certificate-container" style="margin: 0 auto;">
+                <div class="watermark">
+                    <img src="/trainee/SLOGO.jpg" alt="Watermark" onerror="this.style.display='none';">
                 </div>
-                <div class="header-top">MUNICIPALITY OF SANTA MARIA, BULACAN</div>
-                <div class="cooperation">IN COOPERATION WITH</div>
-                <div class="tesda">TECHNICAL EDUCATION & SKILLS DEVELOPMENT AUTHORITY (TESDA)-BULACAN</div>
-                <div class="training-center">SANTA MARIA LIVELIHOOD TRAINING CENTER</div>
-                <div class="certificate-title"><h1>CERTIFICATE OF TRAINING</h1></div>
-                <div class="awarded-to"><p>is awarded to</p></div>
-                <div class="trainee-name-container"><h3 class="certificate-name">[TRAINEE NAME]</h3></div>
-                <div class="completion-text"><p>For having satisfactorily completed the</p></div>
-                <div class="training-name-container"><div class="training-name">[PROGRAM NAME]</div></div>
-                <div class="given-date"><p>Given this [DATE] at Santa Maria Livelihood Training and</p><p>Employment Center, Santa Maria, Bulacan.</p></div>
-                <div class="signatures">
-                    <div class="signatures-row">
-                        <div class="left-signatures">
-                            <div class="signature-block"><div class="signature-line"></div><div class="signature-name">ZENAIDA S. MANINGAS</div><div class="signature-title">PESO Manager</div></div>
-                            <div class="signature-block"><div class="signature-line"></div><div class="signature-name">ROBERTO B. PEREZ</div><div class="signature-title">Municipal Vice Mayor</div></div>
-                            <div class="signature-block"><div class="signature-line"></div><div class="signature-name">BARTOLOME R. RAMOS</div><div class="signature-title">Municipal Mayor</div></div>
+                <div class="decorative-border"></div>
+                <div class="inner-border"></div>
+                <div class="certificate-content">
+                    <div class="logos-row">
+                        <div class="logo-item">
+                            <img src="/trainee/SMBLOGO.jpg" alt="Santa Maria Logo" onerror="this.style.display='none';">
                         </div>
-                        <div class="photo-signature-section"><div class="photo-box"></div><div class="photo-signature-line"></div><div class="photo-signature-label">Signature</div></div>
+                        <div class="logo-item">
+                            <img src="/trainee/SLOGO.jpg" alt="Training Center Logo" onerror="this.style.display='none';">
+                        </div>
+                        <div class="logo-item">
+                            <img src="/trainee/TESDALOGO.png" alt="TESDA Logo" onerror="this.style.display='none';">
+                        </div>
+                    </div>
+                    <div class="header-top">MUNICIPALITY OF SANTA MARIA, BULACAN</div>
+                    <div class="cooperation">IN COOPERATION WITH</div>
+                    <div class="tesda">TECHNICAL EDUCATION &amp; SKILLS DEVELOPMENT AUTHORITY (TESDA)-BULACAN</div>
+                    <div class="training-center">SANTA MARIA LIVELIHOOD TRAINING CENTER</div>
+                    <div class="certificate-title"><h1>CERTIFICATE OF TRAINING</h1></div>
+                    <div class="awarded-to"><p>is awarded to</p></div>
+                    <div class="trainee-name-container"><div class="trainee-name">[TRAINEE NAME]</div></div>
+                    <div class="completion-text"><p>For having satisfactorily completed the</p></div>
+                    <div class="training-name-container"><div class="training-name">[PROGRAM NAME]</div></div>
+                    <div class="given-date"><p>Given this [DATE] at Santa Maria Livelihood Training and</p><p>Employment Center, Santa Maria, Bulacan.</p></div>
+                    <div class="signatures">
+                        <div class="signatures-row">
+                            <div class="left-signatures">
+                                <?php foreach ($signatorySettings as $signatory): ?>
+                                <div class="signature-block">
+                                    <div class="signature-line"></div>
+                                    <div class="signature-name">[signatory-name]</div>
+                                    <div class="signature-title"><?php echo htmlspecialchars($signatory['signatory_title']); ?></div>
+                                </div>
+                                <?php endforeach; ?>
+                            </div>
+                            <div class="photo-signature-section">
+                                <div class="photo-box"></div>
+                                <div class="photo-signature-line"></div>
+                                <div class="photo-signature-label">Signature</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
-        <div class="certificate-actions">
-            <button class="export-btn export-certificate" onclick="generateBulkCertificates(event,this)" style="padding:12px 24px;font-size:1rem;"><i class="fas fa-download"></i> Generate All Certificates (<?php echo $totalCertificates; ?> files)</button>
+        
+        <!-- Current Signatory Preview -->
+        <div class="signature-preview">
+            <h4><i class="fas fa-signature"></i> Current Signatory Settings</h4>
+            <?php foreach ($signatorySettings as $index => $signatory): ?>
+            <div class="signature-preview-item">
+                <div class="signature-preview-name"><?php echo htmlspecialchars($signatory['signatory_name']); ?></div>
+                <div class="signature-preview-title"><?php echo htmlspecialchars($signatory['signatory_title']); ?></div>
+            </div>
+            <?php endforeach; ?>
         </div>
-        <?php endif; ?>
+        
         <h3 style="margin-top:30px;color:var(--primary-color);">Trainees Certificate Status</h3>
         <?php if ($allCompletedData && $allCompletedData->num_rows > 0): ?>
         <table>
-            <thead><tr><th>#</th><th>Trainee Name</th><th>Program</th><th>Completion Date</th><th>Assessment</th><th>Feedback</th><th>Status</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Trainee Name</th>
+                    <th>Program</th>
+                    <th>Completion Date</th>
+                    <th>Assessment</th>
+                    <th>Feedback</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
             <tbody>
-            <?php $counter = 1; $allCompletedData->data_seek(0); while ($row = $allCompletedData->fetch_assoc()): ?>
-            <tr>
-                <td><?php echo $counter++; ?></td>
-                <td><strong><?php echo htmlspecialchars($row['fullname']); ?></strong></td>
-                <td><?php echo htmlspecialchars($row['program_name']); ?></td>
-                <td><?php echo $row['completion_date']; ?></td>
-                <td><span class="status-badge <?php echo $row['assessment']=='passed'?'status-complete':'status-dropped'; ?>"><?php echo $row['assessment'] ? ucfirst($row['assessment']) : 'Not Set'; ?></span></td>
-                <td><span class="status-badge <?php echo $row['has_feedback']=='Yes'?'status-complete':'status-pending'; ?>"><?php echo $row['has_feedback']; ?></span></td>
-                <td><?php $sc = ['Eligible'=>'eligibility-eligible','Missing Feedback'=>'eligibility-missing','Assessment Not Passed'=>'eligibility-not-passed']; ?>
-                    <span class="status-badge <?php echo $sc[$row['eligibility_status']] ?? 'eligibility-missing-both'; ?>"><?php echo $row['eligibility_status']; ?></span></td>
-            </tr>
-            <?php endwhile; ?>
+                <?php 
+                $counter = 1; 
+                $allCompletedData->data_seek(0); 
+                while ($row = $allCompletedData->fetch_assoc()): 
+                ?>
+                <tr>
+                    <td><?php echo $counter++; ?></td>
+                    <td><strong><?php echo htmlspecialchars($row['fullname']); ?></strong></td>
+                    <td><?php echo htmlspecialchars($row['program_name']); ?></td>
+                    <td><?php echo $row['completion_date']; ?></td>
+                    <td>
+                        <span class="status-badge <?php echo $row['assessment']=='passed'?'status-complete':'status-dropped'; ?>">
+                            <?php echo $row['assessment'] ? ucfirst($row['assessment']) : 'Not Set'; ?>
+                        </span>
+                    </td>
+                    <td>
+                        <span class="status-badge <?php echo $row['has_feedback']=='Yes'?'status-complete':'status-pending'; ?>">
+                            <?php echo $row['has_feedback']; ?>
+                        </span>
+                    </td>
+                    <td>
+                        <?php 
+                        $sc = ['Eligible'=>'eligibility-eligible','Missing Feedback'=>'eligibility-missing','Assessment Not Passed'=>'eligibility-not-passed']; 
+                        ?>
+                        <span class="status-badge <?php echo $sc[$row['eligibility_status']] ?? 'eligibility-missing-both'; ?>">
+                            <?php echo $row['eligibility_status']; ?>
+                        </span>
+                    </td>
+                </tr>
+                <?php endwhile; ?>
             </tbody>
         </table>
         <div class="summary-section">
@@ -1442,7 +1900,6 @@ include '../components/header.php';
         <div style="margin-bottom:30px;">
             <div class="sub-tabs">
                 <button class="sub-tab active" data-subtab="trainer-attendance"><i class="fas fa-chalkboard-teacher"></i> Trainer Attendance</button>
-                <button class="sub-tab" data-subtab="trainee-attendance"><i class="fas fa-user-graduate"></i> Trainee Attendance</button>
             </div>
             <div id="trainer-attendance" class="sub-tab-content active">
                 <div style="margin-top:25px;">
@@ -1457,36 +1914,14 @@ include '../components/header.php';
                             <td><strong><?php echo htmlspecialchars($row['name']); ?></strong></td>
                             <td><?php echo !empty($row['programs_handled']) ? htmlspecialchars($row['programs_handled']) : '<span class="status-badge status-pending">No program assigned</span>'; ?></td>
                             <td><?php echo $d; ?> days</td>
-                            <td><?php echo $row['last_attendance'] ? date('M d, Y', strtotime($row['last_attendance'])) : 'No record'; ?></td>
+                            <td><?php echo $row['last_attendance'] ? date('M d, Y', strtotime($row['last_attendance'])) : 'No record'; ?>
+                                                        <td><?php echo $row['last_attendance'] ? date('M d, Y', strtotime($row['last_attendance'])) : 'No record'; ?></td>
                             <td><span class="status-badge <?php echo $sc; ?>"><?php echo $s; ?></span></td>
                         </tr>
                         <?php endwhile; ?>
                         </tbody>
                     </table>
                     <?php else: ?><div class="no-data"><i class="fas fa-chalkboard-teacher"></i><p>No trainer attendance data found.</p></div><?php endif; ?>
-                </div>
-            </div>
-            <div id="trainee-attendance" class="sub-tab-content">
-                <div style="margin-top:25px;">
-                    <?php if ($traineeAttendanceData && $traineeAttendanceData->num_rows > 0): ?>
-                    <table>
-                        <thead><tr><th>Trainee Name</th><th>Program</th><th>Attendance %</th><th>Days Present</th><th>Last Attendance</th><th>Status</th></tr></thead>
-                        <tbody>
-                        <?php while ($row = $traineeAttendanceData->fetch_assoc()):
-                            $pct=$row['attendance_percentage']; $s=$pct>=80?'Good':($pct>=60?'Fair':'Poor'); $sc=$pct>=80?'status-complete':($pct>=60?'status-ongoing':'status-dropped');
-                        ?>
-                        <tr>
-                            <td><strong><?php echo htmlspecialchars($row['name']); ?></strong></td>
-                            <td><?php echo htmlspecialchars($row['program']); ?></td>
-                            <td class="<?php echo $pct>=80?'attendance-high':($pct>=60?'attendance-medium':'attendance-low'); ?>"><?php echo $pct; ?>%</td>
-                            <td><?php echo $row['days_present']; ?> days</td>
-                            <td><?php echo $row['last_attendance'] ? date('M d, Y', strtotime($row['last_attendance'])) : 'No record'; ?></td>
-                            <td><span class="status-badge <?php echo $sc; ?>"><?php echo $s; ?></span></td>
-                        </tr>
-                        <?php endwhile; ?>
-                        </tbody>
-                    </table>
-                    <?php else: ?><div class="no-data"><i class="fas fa-user-graduate"></i><p>No trainee attendance data found.</p></div><?php endif; ?>
                 </div>
             </div>
         </div>
@@ -1523,7 +1958,168 @@ include '../components/header.php';
 
 </div><!-- /container -->
 
+<!-- Signatory Editor Modal -->
+<div id="signatoryModal" class="modal-signatory">
+    <div class="modal-content-signatory">
+        <div class="modal-header">
+            <h3><i class="fas fa-edit"></i> Edit Certificate Signatory Settings</h3>
+        </div>
+        <div class="modal-body">
+            <p style="color: #666; margin-bottom: 20px;">Edit the signatories that will appear on ALL certificates generated from this system.</p>
+            <div id="signatoryEditor">
+                <?php foreach ($signatorySettings as $index => $signatory): ?>
+                <div class="signatory-item" id="signatory-item-<?php echo $index; ?>">
+                    <label>Signatory <?php echo $index + 1; ?> Name:</label>
+                    <input type="text" class="signatory-name" data-index="<?php echo $index; ?>" value="<?php echo htmlspecialchars($signatory['signatory_name']); ?>" placeholder="Enter name">
+                    <label style="margin-top: 10px;">Title:</label>
+                    <input type="text" class="signatory-title" data-index="<?php echo $index; ?>" value="<?php echo htmlspecialchars($signatory['signatory_title']); ?>" placeholder="Enter title">
+                </div>
+                <?php endforeach; ?>
+            </div>
+            
+        </div>
+        <div class="modal-footer">
+            <button class="btn-cancel" onclick="closeSignatoryModal()">Cancel</button>
+            <button class="btn-save-signatory" onclick="saveSignatorySettings()">Save Changes</button>
+        </div>
+    </div>
+</div>
+
 <script>
+let signatoryCount = <?php echo count($signatorySettings); ?>;
+
+// Function to open signatory editor modal
+function openSignatoryModal() {
+    const modal = document.getElementById('signatoryModal');
+    modal.style.display = 'block';
+}
+
+// Function to close modal
+function closeSignatoryModal() {
+    const modal = document.getElementById('signatoryModal');
+    modal.style.display = 'none';
+}
+
+// Function to add a new signatory input
+function addSignatory() {
+    const editor = document.getElementById('signatoryEditor');
+    const newIndex = signatoryCount;
+    const html = `
+        <div class="signatory-item" id="signatory-item-${newIndex}">
+            <label>Signatory ${newIndex + 1} Name:</label>
+            <input type="text" class="signatory-name" data-index="${newIndex}" value="" placeholder="Enter name">
+            <label style="margin-top: 10px;">Title:</label>
+            <input type="text" class="signatory-title" data-index="${newIndex}" value="" placeholder="Enter title">
+        </div>
+    `;
+    editor.insertAdjacentHTML('beforeend', html);
+    signatoryCount++;
+}
+
+// Function to remove the last signatory
+function removeLastSignatory() {
+    if (signatoryCount <= 1) {
+        showNotification('At least one signatory is required', 'error');
+        return;
+    }
+    const lastItem = document.getElementById(`signatory-item-${signatoryCount - 1}`);
+    if (lastItem) {
+        lastItem.remove();
+        signatoryCount--;
+    }
+}
+
+// Function to save signatory settings
+function saveSignatorySettings() {
+    const signatories = [];
+    const nameInputs = document.querySelectorAll('.signatory-name');
+    const titleInputs = document.querySelectorAll('.signatory-title');
+    
+    for (let i = 0; i < nameInputs.length; i++) {
+        const name = nameInputs[i].value.trim();
+        const title = titleInputs[i].value.trim();
+        if (name && title) {
+            signatories.push({
+                name: name,
+                title: title
+            });
+        }
+    }
+    
+    if (signatories.length === 0) {
+        showNotification('Please add at least one signatory', 'error');
+        return;
+    }
+    
+    // Show loading state
+    const saveBtn = document.querySelector('.btn-save-signatory');
+    const originalText = saveBtn.innerHTML;
+    saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+    saveBtn.disabled = true;
+    
+    // Save via AJAX
+    fetch('reports_monitoring.php', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'update_signatory=1&signatories=' + encodeURIComponent(JSON.stringify(signatories))
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            showNotification('Signatory settings saved successfully!', 'success');
+            closeSignatoryModal();
+            // Reload the page to show updated signatory preview
+            setTimeout(() => {
+                location.reload();
+            }, 1500);
+        } else {
+            showNotification('Error: ' + data.message, 'error');
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        showNotification('Error saving signatory settings', 'error');
+    })
+    .finally(() => {
+        saveBtn.innerHTML = originalText;
+        saveBtn.disabled = false;
+    });
+}
+
+// Function to show notification
+function showNotification(message, type) {
+    const notification = document.createElement('div');
+    notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 15px 20px;
+        background: ${type === 'success' ? '#27ae60' : '#e74c3c'};
+        color: white;
+        border-radius: 8px;
+        z-index: 10001;
+        animation: slideIn 0.3s ease;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    `;
+    notification.innerHTML = `<i class="fas ${type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'}"></i> ${message}`;
+    document.body.appendChild(notification);
+    
+    setTimeout(() => {
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+    }, 3000);
+}
+
+// Close modal when clicking outside
+window.onclick = function(event) {
+    const modal = document.getElementById('signatoryModal');
+    if (event.target === modal) {
+        closeSignatoryModal();
+    }
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     // Main tabs
     document.querySelectorAll('.main-tab').forEach(tab => {

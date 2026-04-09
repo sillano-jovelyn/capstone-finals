@@ -21,6 +21,98 @@ if (isset($_GET['action']) && $_GET['action'] === 'logout') {
     exit();
 }
 
+// ── AJAX: get_signatories ─────────────────────────────────────────────────────
+// Handles: GET ?ajax=get_signatories&archive_id=X
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_signatories') {
+    header('Content-Type: application/json');
+    session_start(); // already started above but harmless
+
+    $db_file = __DIR__ . '/../db.php';
+    if (!file_exists($db_file)) { echo json_encode(['success'=>false,'message'=>'db.php not found']); exit(); }
+    require_once $db_file;
+    if (!isset($conn)||!$conn) { echo json_encode(['success'=>false,'message'=>'DB error']); exit(); }
+
+    if (!isset($_SESSION['user_id'])) { echo json_encode(['success'=>false,'message'=>'Unauthorized']); exit(); }
+
+    $archive_id = isset($_GET['archive_id']) ? (int)$_GET['archive_id'] : 0;
+    $uid        = (int)$_SESSION['user_id'];
+
+    // 1. Try frozen snapshot from archived_history
+    if ($archive_id > 0) {
+        $st = $conn->prepare("SELECT saved_signatories FROM archived_history WHERE id = ? AND user_id = ?");
+        $st->bind_param("ii", $archive_id, $uid);
+        $st->execute();
+        $row = $st->get_result()->fetch_assoc();
+        $st->close();
+        if ($row && !empty($row['saved_signatories'])) {
+            $sigs = json_decode($row['saved_signatories'], true);
+            if (is_array($sigs) && count($sigs) > 0) {
+                echo json_encode(['success'=>true,'source'=>'saved','signatories'=>$sigs]);
+                exit();
+            }
+        }
+    }
+
+    // 2. Fallback: current active settings
+    $res  = $conn->query("SELECT signatory_name, signatory_title FROM certificate_signatory_settings WHERE is_active=1 ORDER BY signatory_order ASC, id ASC");
+    $sigs = [];
+    if ($res) { while ($r = $res->fetch_assoc()) { $sigs[] = ['signatory_name'=>$r['signatory_name'],'signatory_title'=>$r['signatory_title']]; } }
+    echo json_encode(['success'=>true,'source'=>'current_settings','signatories'=>$sigs]);
+    exit();
+}
+
+// ── AJAX: save_archive_signatories ────────────────────────────────────────────
+// Handles: POST ?ajax=save_signatories  body: JSON {archive_id, signatories}
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'save_signatories' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+
+    $db_file = __DIR__ . '/../db.php';
+    if (!file_exists($db_file)) { echo json_encode(['success'=>false]); exit(); }
+    require_once $db_file;
+    if (!isset($conn)||!$conn) { echo json_encode(['success'=>false]); exit(); }
+
+    if (!isset($_SESSION['user_id'])) { echo json_encode(['success'=>false,'message'=>'Unauthorized']); exit(); }
+
+    $input      = json_decode(file_get_contents('php://input'), true);
+    $archive_id = isset($input['archive_id'])  ? (int)$input['archive_id']  : 0;
+    $signatories= isset($input['signatories']) ? $input['signatories']       : [];
+
+    if ($archive_id <= 0 || empty($signatories)) { echo json_encode(['success'=>false,'message'=>'Invalid input']); exit(); }
+
+    $uid = (int)$_SESSION['user_id'];
+
+    // Verify ownership & check if already saved
+    $chk = $conn->prepare("SELECT id, saved_signatories FROM archived_history WHERE id = ? AND user_id = ?");
+    $chk->bind_param("ii", $archive_id, $uid);
+    $chk->execute();
+    $existing = $chk->get_result()->fetch_assoc();
+    $chk->close();
+
+    if (!$existing) { echo json_encode(['success'=>false,'message'=>'Record not found']); exit(); }
+    if (!empty($existing['saved_signatories'])) { echo json_encode(['success'=>true,'message'=>'Already saved','already_exists'=>true]); exit(); }
+
+    // Sanitise
+    $clean = [];
+    foreach ($signatories as $sig) {
+        if (!empty($sig['signatory_name']) && !empty($sig['signatory_title'])) {
+            $clean[] = ['signatory_name'=>strip_tags($sig['signatory_name']),'signatory_title'=>strip_tags($sig['signatory_title'])];
+        }
+    }
+    if (empty($clean)) { echo json_encode(['success'=>false,'message'=>'No valid signatories']); exit(); }
+
+    $json = json_encode($clean);
+    // Only update if still NULL — never overwrite a frozen snapshot
+    $upd = $conn->prepare("UPDATE archived_history SET saved_signatories = ? WHERE id = ? AND user_id = ? AND saved_signatories IS NULL");
+    $upd->bind_param("sii", $json, $archive_id, $uid);
+    $upd->execute();
+    $affected = $upd->affected_rows;
+    $upd->close();
+
+    echo json_encode(['success'=>true,'saved'=>($affected>0)]);
+    exit();
+}
+
+
 // DATABASE CONNECTION
 $conn = null;
 try {
@@ -91,7 +183,6 @@ $_SESSION['trainee_id'] = $trainee_id;
 
 
 // HELPER FUNCTIONS
-//formatDate()
 function formatDate($dateStr) {
     if (empty($dateStr) || $dateStr === '0000-00-00') return 'N/A';
     try {
@@ -101,7 +192,6 @@ function formatDate($dateStr) {
     }
 }
 
-// formatDateTime()
 function formatDateTime($dateTimeStr) {
     if (empty($dateTimeStr) || $dateTimeStr === '0000-00-00 00:00:00') return 'N/A';
     try {
@@ -109,6 +199,45 @@ function formatDateTime($dateTimeStr) {
     } catch (Exception $e) {
         return $dateTimeStr;
     }
+}
+
+// ── Get signatories from certificate_signatory_SETTINGS (the editable/current table) ──
+// This is used for NEW completions only. Old records use their frozen saved_signatories.
+function getActiveSignatories($conn) {
+    $signatories = [];
+    $result = $conn->query(
+        "SELECT signatory_name, signatory_title
+         FROM certificate_signatory_settings
+         WHERE is_active = 1
+         ORDER BY signatory_order ASC, id ASC"
+    );
+    if ($result && $result->num_rows > 0) {
+        while ($row = $result->fetch_assoc()) {
+            $signatories[] = [
+                'signatory_name'  => $row['signatory_name'],
+                'signatory_title' => $row['signatory_title'],
+            ];
+        }
+    }
+    return $signatories;
+}
+
+// ── Freeze signatories into archive record — ONLY if not already saved ──
+// This is the core of the "old records stay the same" guarantee.
+function saveSignatoriesToArchive($conn, $archiveId, $signatories) {
+    if (!$archiveId || empty($signatories)) return false;
+
+    $signatoriesJson = json_encode($signatories);
+    // WHERE saved_signatories IS NULL ensures we NEVER overwrite an existing snapshot
+    $stmt = $conn->prepare(
+        "UPDATE archived_history
+         SET saved_signatories = ?
+         WHERE id = ? AND saved_signatories IS NULL"
+    );
+    $stmt->bind_param("si", $signatoriesJson, $archiveId);
+    $result = $stmt->execute();
+    $stmt->close();
+    return $result;
 }
 
 
@@ -133,7 +262,6 @@ $activeCheck->execute();
 $hasActiveProgram = ($activeCheck->get_result()->fetch_assoc()['cnt'] > 0);
 $activeCheck->close();
 
-// Does the trainee have a pending application?
 $pendingCheck = $conn->prepare(
     "SELECT COUNT(*) as cnt FROM enrollments WHERE user_id = ? AND enrollment_status = 'pending'"
 );
@@ -142,7 +270,6 @@ $pendingCheck->execute();
 $hasPendingApplications = ($pendingCheck->get_result()->fetch_assoc()['cnt'] > 0);
 $pendingCheck->close();
 
-// Does the trainee have any completed enrollment?
 $completedCheck = $conn->prepare(
     "SELECT COUNT(*) as cnt FROM enrollments WHERE user_id = ? AND enrollment_status = 'completed'"
 );
@@ -151,11 +278,8 @@ $completedCheck->execute();
 $hasCompletedProgram = ($completedCheck->get_result()->fetch_assoc()['cnt'] > 0);
 $completedCheck->close();
 
-// Is the trainee enrolled or have a pending app? (Used to lock available programs)
-$anyApprovedEnrolled = $hasActiveProgram;
-
-// Lock the "Available Programs" section if trainee is active or pending
-$disableAvailablePrograms = ($hasActiveProgram || $hasPendingApplications);
+$anyApprovedEnrolled       = $hasActiveProgram;
+$disableAvailablePrograms  = ($hasActiveProgram || $hasPendingApplications);
 
 
 //   LOAD ENROLLED PROGRAMS
@@ -197,27 +321,22 @@ $stmt->execute();
 $enrolledRes = $stmt->get_result();
 
 while ($row = $enrolledRes->fetch_assoc()) {
-    // Slot calculations 
-    $total_slots    = $row['total_slots'] ?? $row['slotsAvailable'] ?? 0;
-    $enrolled_count = $row['enrolled_count'] ?? 0;
+    $total_slots     = $row['total_slots'] ?? $row['slotsAvailable'] ?? 0;
+    $enrolled_count  = $row['enrolled_count'] ?? 0;
     $available_slots = max(0, $total_slots - $enrolled_count);
 
-    // Status booleans
-    $enrollment_status  = $row['enrollment_status'] ?? null;
-    $is_enrolled        = in_array($enrollment_status, ['approved', 'completed']);
-    $is_pending         = ($enrollment_status === 'pending');
+    $enrollment_status   = $row['enrollment_status'] ?? null;
+    $is_enrolled         = in_array($enrollment_status, ['approved', 'completed']);
+    $is_pending          = ($enrollment_status === 'pending');
     $is_completed_status = ($enrollment_status === 'completed');
+    $has_feedback        = ($row['has_feedback'] > 0);
 
-    //  Determine if the program is truly "completed" visually.
-    $has_feedback = ($row['has_feedback'] > 0);
-
-    $is_completed    = false;
+    $is_completed     = false;
     $show_certificate = false;
-    $is_from_history = false;
+    $is_from_history  = false;
     $is_past_end_date = false;
 
     if ($is_enrolled) {
-        // Check if the program's end date has already passed
         $end_date_raw = $row['scheduleEnd'] ?? null;
         if ($end_date_raw && $end_date_raw !== '0000-00-00') {
             try {
@@ -229,45 +348,37 @@ while ($row = $enrolledRes->fetch_assoc()) {
             }
         }
 
-        // FIX #1 core: even if enrollment_status = 'completed',
-        // without feedback → still show as active/ongoing
         if ($is_completed_status && $has_feedback) {
-            // Feedback done → truly completed
-            $is_completed    = true;
-            $is_from_history = true;
+            $is_completed     = true;
+            $is_from_history  = true;
             $show_certificate = true;
         } elseif ($is_completed_status && !$has_feedback) {
-            // Admin marked complete but trainee hasn't filled feedback yet
-            // → treat as still active/ongoing
-            $is_completed    = false;
-            $is_from_history = false;
+            $is_completed     = false;
+            $is_from_history  = false;
             $show_certificate = false;
         } elseif ($enrollment_status === 'approved' && $is_past_end_date && $has_feedback) {
-            // Edge case: approved, end date passed, feedback submitted
-            $is_completed    = true;
-            $is_from_history = true;
+            $is_completed     = true;
+            $is_from_history  = true;
             $show_certificate = true;
         }
-        // All other approved cases = active/ongoing
     }
 
-    // Build the full program row for use in templates
-    $row['available_slots']      = $available_slots;
-    $row['total_slots']          = $total_slots;
-    $row['enrolled_count']       = $enrolled_count;
-    $row['is_enrolled']          = $is_enrolled;
-    $row['is_pending']           = $is_pending;
-    $row['is_completed_status']  = $is_completed_status;
-    $row['has_enrollment']       = ($is_enrolled || $is_pending);
-    $row['is_completed']         = $is_completed;
-    $row['is_past_end_date']     = $is_past_end_date;
-    $row['show_certificate']     = $show_certificate;
-    $row['is_from_history']      = $is_from_history;
-    $row['has_feedback_value']   = $has_feedback;
-    $row['is_full']              = ($available_slots <= 0);
-    $row['enrolled_user_id']     = $user_id;
-    $row['is_archived']          = false;
-    $row['archive_id']           = null;
+    $row['available_slots']       = $available_slots;
+    $row['total_slots']           = $total_slots;
+    $row['enrolled_count']        = $enrolled_count;
+    $row['is_enrolled']           = $is_enrolled;
+    $row['is_pending']            = $is_pending;
+    $row['is_completed_status']   = $is_completed_status;
+    $row['has_enrollment']        = ($is_enrolled || $is_pending);
+    $row['is_completed']          = $is_completed;
+    $row['is_past_end_date']      = $is_past_end_date;
+    $row['show_certificate']      = $show_certificate;
+    $row['is_from_history']       = $is_from_history;
+    $row['has_feedback_value']    = $has_feedback;
+    $row['is_full']               = ($available_slots <= 0);
+    $row['enrolled_user_id']      = $user_id;
+    $row['is_archived']           = false;
+    $row['archive_id']            = null;
     $row['enrollment_percentage'] = ($total_slots > 0)
         ? round(($enrolled_count / $total_slots) * 100, 1)
         : 0;
@@ -298,7 +409,6 @@ $archivedQuery = "
         ah.enrollment_completed_at AS completion_date,
         ah.archived_at,
         ah.archive_trigger,
-        -- All feedback rating fields
         ah.trainer_expertise_rating,
         ah.trainer_communication_rating,
         ah.trainer_methods_rating,
@@ -318,7 +428,8 @@ $archivedQuery = "
         ah.system_answers_rating,
         ah.system_performance_rating,
         ah.feedback_comments,
-        ah.feedback_submitted_at
+        ah.feedback_submitted_at,
+        ah.saved_signatories
     FROM archived_history ah
     LEFT JOIN program_categories pc ON ah.program_category_id = pc.id
     WHERE ah.user_id = ?
@@ -331,7 +442,7 @@ $archivedStmt->execute();
 $archivedResult = $archivedStmt->get_result();
 
 while ($archiveRow = $archivedResult->fetch_assoc()) {
-    // --- Calculate if feedback was submitted and average rating ---
+
     $ratingFields = [
         'trainer_expertise_rating','trainer_communication_rating',
         'trainer_methods_rating','trainer_requests_rating',
@@ -344,7 +455,7 @@ while ($archiveRow = $archivedResult->fetch_assoc()) {
         'system_answers_rating','system_performance_rating',
     ];
 
-    $ratings    = [];
+    $ratings     = [];
     $hasFeedback = false;
     foreach ($ratingFields as $field) {
         if (!empty($archiveRow[$field]) && is_numeric($archiveRow[$field])) {
@@ -359,37 +470,57 @@ while ($archiveRow = $archivedResult->fetch_assoc()) {
         ? round(array_sum($ratings) / count($ratings), 1)
         : null;
 
-    // A certificate is shown if the record is completed AND assessment = Passed
     $certificateIssued = (
         $archiveRow['enrollment_status'] === 'completed' &&
         strtolower($archiveRow['assessment'] ?? '') === 'passed'
     );
 
-    // Build the archived program row in the same shape as enrolled programs
+    // ── SIGNATORY FREEZE LOGIC ────────────────────────────────────────────────
+    // Rule:
+    //   saved_signatories NOT NULL  → use the frozen snapshot (never changes)
+    //   saved_signatories IS NULL   → new completion: snapshot current settings & save
+    $saved_signatories = null;
+
+    if (!empty($archiveRow['saved_signatories'])) {
+        // Already frozen — decode and use as-is. Admin edits do NOT affect this.
+        $saved_signatories = json_decode($archiveRow['saved_signatories'], true);
+    } elseif ($certificateIssued) {
+        // First time viewing a newly-completed certificate — snapshot NOW
+        $saved_signatories = getActiveSignatories($conn);
+
+        // Persist the snapshot immediately so future views are also frozen
+        if (!empty($saved_signatories)) {
+            saveSignatoriesToArchive($conn, $archiveRow['archive_id'], $saved_signatories);
+            // Also update the local row so the JS gets the right data this request
+            $archiveRow['saved_signatories'] = json_encode($saved_signatories);
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     $archivedPrograms[] = [
-        'id'              => $archiveRow['program_id'] ?? $archiveRow['archive_id'],
-        'archive_id'      => $archiveRow['archive_id'],
-        'name'            => $archiveRow['program_name'] ?: 'Unknown Program',
-        'duration'        => $archiveRow['program_duration'],
-        'duration_unit'   => $archiveRow['program_duration_unit'] ?? 'Days',
-        'scheduleStart'   => $archiveRow['program_schedule_start'],
-        'scheduleEnd'     => $archiveRow['program_schedule_end'],
-        'trainer'         => $archiveRow['trainer'] ?? 'Unknown Trainer',
-        'category_name'   => $archiveRow['category_name'] ?? 'General',
-        'enrollment_status' => $archiveRow['enrollment_status'] ?? 'archived',
-        'attendance'      => $archiveRow['attendance'] ?? 0,
-        'assessment'      => $archiveRow['assessment'],
-        'completed_at'    => $archiveRow['completion_date'] ?? $archiveRow['archived_at'],
-        'archived_at'     => $archiveRow['archived_at'],
-        'archive_trigger' => $archiveRow['archive_trigger'],
+        'id'               => $archiveRow['program_id'] ?? $archiveRow['archive_id'],
+        'archive_id'       => $archiveRow['archive_id'],
+        'name'             => $archiveRow['program_name'] ?: 'Unknown Program',
+        'duration'         => $archiveRow['program_duration'],
+        'duration_unit'    => $archiveRow['program_duration_unit'] ?? 'Days',
+        'scheduleStart'    => $archiveRow['program_schedule_start'],
+        'scheduleEnd'      => $archiveRow['program_schedule_end'],
+        'trainer'          => $archiveRow['trainer'] ?? 'Unknown Trainer',
+        'category_name'    => $archiveRow['category_name'] ?? 'General',
+        'enrollment_status'=> $archiveRow['enrollment_status'] ?? 'archived',
+        'attendance'       => $archiveRow['attendance'] ?? 0,
+        'assessment'       => $archiveRow['assessment'],
+        'completed_at'     => $archiveRow['completion_date'] ?? $archiveRow['archived_at'],
+        'archived_at'      => $archiveRow['archived_at'],
+        'archive_trigger'  => $archiveRow['archive_trigger'],
 
-        'has_feedback'         => $hasFeedback,
-        'feedback_rating'      => $avgRating,
-        'feedback_comments'    => $archiveRow['feedback_comments'],
-        'feedback_submitted_at'=> $archiveRow['feedback_submitted_at'],
-        'feedback_details'     => $archiveRow,
+        'has_feedback'          => $hasFeedback,
+        'feedback_rating'       => $avgRating,
+        'feedback_comments'     => $archiveRow['feedback_comments'],
+        'feedback_submitted_at' => $archiveRow['feedback_submitted_at'],
+        'feedback_details'      => $archiveRow,
+        'saved_signatories'     => $saved_signatories, // frozen or freshly snapshotted
 
-        // These are set so the template/JS logic stays consistent
         'is_enrolled'          => false,
         'is_pending'           => false,
         'is_completed_status'  => ($archiveRow['enrollment_status'] === 'completed'),
@@ -398,23 +529,21 @@ while ($archiveRow = $archivedResult->fetch_assoc()) {
         'is_past_end_date'     => true,
         'show_certificate'     => $certificateIssued,
         'is_from_history'      => true,
-        'is_archived'          => true,   // KEY FLAG: marks this as archive record
+        'is_archived'          => true,
         'has_feedback_value'   => $hasFeedback,
         'enrolled_user_id'     => $user_id,
 
-        'total_slots'          => 0,
-        'available_slots'      => 0,
-        'enrolled_count'       => 0,
-        'enrollment_percentage'=> 0,
-        'is_full'              => false,
+        'total_slots'           => 0,
+        'available_slots'       => 0,
+        'enrolled_count'        => 0,
+        'enrollment_percentage' => 0,
+        'is_full'               => false,
     ];
 }
 $archivedStmt->close();
 
 
 //  LOAD AVAILABLE PROGRAMS
-// Programs the trainee has NOT enrolled in yet.
-// applying to programs starting TODAY for defense only
 $availablePrograms = [];
 $today = new DateTime();
 $today->setTime(0, 0, 0);
@@ -445,42 +574,35 @@ $stmtAvailable->execute();
 $availableRes = $stmtAvailable->get_result();
 
 while ($availableRow = $availableRes->fetch_assoc()) {
-    //  Hide programs whose start date was BEFORE today
     $hideProgram = false;
     if (!empty($availableRow['scheduleStart']) && $availableRow['scheduleStart'] !== '0000-00-00') {
         try {
             $schedStart = (new DateTime($availableRow['scheduleStart']))->setTime(0, 0, 0);
-            // Only hide if start date is STRICTLY before today
-            // (today's programs are still visible)
-            if ($schedStart < $today) {
-                $hideProgram = true;
-            }
-        } catch (Exception $e) {
-            $hideProgram = false;
-        }
+            if ($schedStart < $today) { $hideProgram = true; }
+        } catch (Exception $e) { $hideProgram = false; }
     }
     if ($hideProgram) continue;
 
-    $total_slots    = $availableRow['total_slots'] ?? $availableRow['slotsAvailable'] ?? 0;
-    $enrolled_count = $availableRow['enrolled_count'] ?? 0;
+    $total_slots     = $availableRow['total_slots'] ?? $availableRow['slotsAvailable'] ?? 0;
+    $enrolled_count  = $availableRow['enrolled_count'] ?? 0;
     $available_slots = max(0, $total_slots - $enrolled_count);
 
-    $availableRow['available_slots']      = $available_slots;
-    $availableRow['total_slots']          = $total_slots;
-    $availableRow['enrolled_count']       = $enrolled_count;
-    $availableRow['is_enrolled']          = false;
-    $availableRow['is_pending']           = false;
-    $availableRow['is_completed_status']  = false;
-    $availableRow['has_enrollment']       = false;
-    $availableRow['is_completed']         = false;
-    $availableRow['is_past_end_date']     = false;
-    $availableRow['show_certificate']     = false;
-    $availableRow['is_from_history']      = false;
-    $availableRow['is_archived']          = false;
-    $availableRow['archive_id']           = null;
-    $availableRow['has_feedback_value']   = false;
-    $availableRow['is_full']              = ($available_slots <= 0);
-    $availableRow['enrolled_user_id']     = null;
+    $availableRow['available_slots']       = $available_slots;
+    $availableRow['total_slots']           = $total_slots;
+    $availableRow['enrolled_count']        = $enrolled_count;
+    $availableRow['is_enrolled']           = false;
+    $availableRow['is_pending']            = false;
+    $availableRow['is_completed_status']   = false;
+    $availableRow['has_enrollment']        = false;
+    $availableRow['is_completed']          = false;
+    $availableRow['is_past_end_date']      = false;
+    $availableRow['show_certificate']      = false;
+    $availableRow['is_from_history']       = false;
+    $availableRow['is_archived']           = false;
+    $availableRow['archive_id']            = null;
+    $availableRow['has_feedback_value']    = false;
+    $availableRow['is_full']               = ($available_slots <= 0);
+    $availableRow['enrolled_user_id']      = null;
     $availableRow['enrollment_percentage'] = ($total_slots > 0)
         ? round(($enrolled_count / $total_slots) * 100, 1)
         : 0;
@@ -489,123 +611,38 @@ while ($availableRow = $availableRes->fetch_assoc()) {
 }
 $stmtAvailable->close();
 
-//hide program that already start
-/* $availablePrograms = [];
-
-// Get current date/time for comparison
-$currentDateTime = new DateTime();
-
-$availableQuery = "
-    SELECT p.id, p.name, p.duration, p.scheduleStart, p.scheduleEnd, p.trainer, p.total_slots, p.slotsAvailable,
-           pc.name as category_name,
-           (SELECT COUNT(*) FROM enrollments e2 WHERE e2.program_id = p.id AND e2.enrollment_status IN ('approved', 'completed')) as enrolled_count
-    FROM programs p
-    LEFT JOIN program_categories pc ON p.category_id = pc.id
-    WHERE p.id NOT IN (SELECT program_id FROM enrollments WHERE user_id = ?)
-    AND p.status = 'active'
-    AND p.show_on_index = 1
-    ORDER BY p.created_at DESC
-";
-
-$stmtAvailable = $conn->prepare($availableQuery);
-$stmtAvailable->bind_param("i", $user_id);
-$stmtAvailable->execute();
-$availableRes = $stmtAvailable->get_result();
-
-while ($availableRow = $availableRes->fetch_assoc()) {
-    // Check if scheduleStart has already started or passed
-    $hideProgram = false;
-    
-    if (!empty($availableRow['scheduleStart']) && $availableRow['scheduleStart'] !== '0000-00-00') {
-        try {
-            $scheduleStart = new DateTime($availableRow['scheduleStart']);
-            
-            // If schedule start is today or in the past, hide the program
-            if ($scheduleStart <= $currentDateTime) {
-                $hideProgram = true;
-            }
-        } catch (Exception $e) {
-            // If date parsing fails, don't hide (show by default)
-            $hideProgram = false;
-        }
-    }
-    
-    // Skip this program if schedule has already started
-    if ($hideProgram) {
-        continue;
-    }
-    
-    $total_slots = $availableRow['total_slots'] ?? $availableRow['slotsAvailable'] ?? 0;
-    $enrolled_count = $availableRow['enrolled_count'] ?? 0;
-    $available_slots = max(0, $total_slots - $enrolled_count);
-
-    $availableRow['available_slots'] = $available_slots;
-    $availableRow['total_slots'] = $total_slots;
-    $availableRow['enrolled_count'] = $enrolled_count;
-    $availableRow['is_enrolled'] = false;
-    $availableRow['is_pending'] = false;
-    $availableRow['is_completed_status'] = false;
-    $availableRow['has_enrollment'] = false;
-    $availableRow['is_completed'] = false;
-    $availableRow['is_past_end_date'] = false;
-    $availableRow['show_certificate'] = false;
-    $availableRow['is_from_history'] = false;
-    $availableRow['is_archived'] = false;
-    $availableRow['archive_id'] = null;
-    $availableRow['has_feedback_value'] = false;
-    $availableRow['is_full'] = ($available_slots <= 0);
-    $availableRow['enrolled_user_id'] = null;
-    $availableRow['enrollment_percentage'] = 0;
-    
-    if ($total_slots > 0) {
-        $availableRow['enrollment_percentage'] = round(($enrolled_count / $total_slots) * 100, 1);
-    }
-    $availablePrograms[] = $availableRow;
-}
-$stmtAvailable->close();
- */
 
 // MERGE ALL PROGRAMS
 $programs = array_merge($enrolledPrograms, $archivedPrograms, $availablePrograms);
 
-// Split for template use
 $myPrograms            = array_filter($programs, fn($p) => isset($p['enrolled_user_id']) && $p['enrolled_user_id'] == $user_id);
 $availableOnlyPrograms = array_filter($programs, fn($p) => !isset($p['enrolled_user_id']) || $p['enrolled_user_id'] != $user_id);
 
 
 // FILTER TAB COUNTS
-// Counts how many programs belong to each tab.
 $filter_counts = ['active' => 0, 'pending' => 0, 'completed' => 0];
 
 foreach ($programs as $program) {
     if ($program['is_archived'] === true) {
-        // Completed tab = ONLY archived_history records
-        // AND only if feedback was actually submitted
-        // (no feedback = trainee never finished = don't count as completed)
         if (!empty($program['has_feedback_value'])) {
             $filter_counts['completed']++;
         }
     } elseif ($program['is_pending'] === true) {
         $filter_counts['pending']++;
     } elseif ($program['is_enrolled'] === true) {
-        //  Count as ACTIVE if:
-        //   a) enrollment_status = 'approved' (normal active), OR
-        //   b) enrollment_status = 'completed' BUT feedback not yet submitted
         if ($program['is_completed'] === false && $program['is_archived'] !== true) {
             $filter_counts['active']++;
         }
     }
 }
 
-// Default active filter tab: first non-zero tab
 $defaultFilter = 'active';
-if ($filter_counts['active'] > 0)         $defaultFilter = 'active';
-elseif ($filter_counts['pending'] > 0)    $defaultFilter = 'pending';
-elseif ($filter_counts['completed'] > 0)  $defaultFilter = 'completed';
+if ($filter_counts['active'] > 0)        $defaultFilter = 'active';
+elseif ($filter_counts['pending'] > 0)   $defaultFilter = 'pending';
+elseif ($filter_counts['completed'] > 0) $defaultFilter = 'completed';
 
 
 //  NOTIFICATIONS
-// Loads up to 50 notifications for the user.
 $notifications    = [];
 $allNotifications = [];
 
@@ -622,13 +659,10 @@ $notifStmt->execute();
 $notifResult = $notifStmt->get_result();
 while ($row = $notifResult->fetch_assoc()) {
     $allNotifications[] = $row;
-    if (!$row['is_read']) {
-        $notifications[] = $row;
-    }
+    if (!$row['is_read']) { $notifications[] = $row; }
 }
 $notifStmt->close();
 
-// Debug helper (visible only in server error log)
 error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filter_counts['pending']}, Completed: {$filter_counts['completed']}");
 ?>
 <!DOCTYPE html>
@@ -805,156 +839,65 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
         .feedback-rating-grid { grid-template-columns: 1fr; }
     }
 
-    /*  CERTIFICATE PREVIEW STYLES */
+    /* ---- Certificate Styles ---- */
     .certificate-container {
-        width: 100%;
-        max-width: 210mm;
-        margin: 0 auto;
-        background: #f5f0e8;
-        position: relative;
-        box-sizing: border-box;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.1);
-        padding: 20px;
-        user-select: none;
-        -webkit-user-select: none;
-        -moz-user-select: none;
-        -ms-user-select: none;
+        width: 100%; max-width: 210mm; margin: 0 auto; background: #f5f0e8;
+        position: relative; box-sizing: border-box;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.1); padding: 20px;
+        user-select: none; -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none;
         pointer-events: none;
     }
-    .screenshot-protection-overlay {
-        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(255,255,255,0.001); z-index: 9999;
-        cursor: default; pointer-events: none;
-    }
-    .dynamic-watermark {
-        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-        pointer-events: none; z-index: 10000; overflow: hidden;
-    }
-    .watermark-text {
-        position: absolute; color: rgba(139,92,246,0.15); font-size: 24px;
-        font-weight: bold; white-space: nowrap; transform: rotate(-45deg);
-        text-transform: uppercase; letter-spacing: 5px;
-        animation: moveWatermark 20s linear infinite;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        border: 2px solid rgba(139,92,246,0.2); padding: 10px 30px; border-radius: 50px;
-    }
-    @keyframes moveWatermark {
-        0%   { transform: rotate(-45deg) translateX(-100%) translateY(-100%); }
-        100% { transform: rotate(-45deg) translateX(100%)  translateY(100%);  }
-    }
-    .watermark-text:nth-child(1) { animation-delay: 0s;    top: 10%; left: 10%; }
-    .watermark-text:nth-child(2) { animation-delay: 5s;    top: 30%; left: 30%; }
-    .watermark-text:nth-child(3) { animation-delay: 10s;   top: 50%; left: 50%; }
-    .watermark-text:nth-child(4) { animation-delay: 15s;   top: 70%; left: 70%; }
-    .watermark-text:nth-child(5) { animation-delay: 2.5s;  top: 90%; left: 90%; }
-    .decorative-border {
-        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-        border: 35px solid transparent;
-        border-image: repeating-linear-gradient(45deg,#2d8b8e 0px,#2d8b8e 10px,#d4a574 10px,#d4a574 20px,#2d8b8e 20px,#2d8b8e 30px,#f5f0e8 30px,#f5f0e8 40px) 35;
-        pointer-events: none; z-index: 2;
-    }
-    .inner-border {
-        position: absolute; top: 20px; left: 20px; right: 20px; bottom: 20px;
-        border: 15px solid;
-        border-image: repeating-linear-gradient(0deg,#2d8b8e 0px,#2d8b8e 3px,#d4a574 3px,#d4a574 6px,#2d8b8e 6px,#2d8b8e 9px,#f5f0e8 9px,#f5f0e8 12px) 15;
-        pointer-events: none; z-index: 2;
-    }
-    .certificate-content {
-        position: relative; width: 100%; height: 100%;
-        padding: 40px 50px; z-index: 1; filter: blur(0.3px);
-    }
-    .logos-row {
-        display: flex; justify-content: center; align-items: center;
-        gap: 30px; margin: 15px 0 20px 0; flex-wrap: wrap;
-    }
+    .screenshot-protection-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,0.001); z-index: 9999; cursor: default; pointer-events: none; }
+    .dynamic-watermark { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; z-index: 10000; overflow: hidden; }
+    .watermark-text { position: absolute; color: rgba(139,92,246,0.15); font-size: 24px; font-weight: bold; white-space: nowrap; transform: rotate(-45deg); text-transform: uppercase; letter-spacing: 5px; animation: moveWatermark 20s linear infinite; text-shadow: 2px 2px 4px rgba(0,0,0,0.1); border: 2px solid rgba(139,92,246,0.2); padding: 10px 30px; border-radius: 50px; }
+    @keyframes moveWatermark { 0% { transform: rotate(-45deg) translateX(-100%) translateY(-100%); } 100% { transform: rotate(-45deg) translateX(100%) translateY(100%); } }
+    .watermark-text:nth-child(1) { animation-delay: 0s;   top: 10%; left: 10%; }
+    .watermark-text:nth-child(2) { animation-delay: 5s;   top: 30%; left: 30%; }
+    .watermark-text:nth-child(3) { animation-delay: 10s;  top: 50%; left: 50%; }
+    .watermark-text:nth-child(4) { animation-delay: 15s;  top: 70%; left: 70%; }
+    .watermark-text:nth-child(5) { animation-delay: 2.5s; top: 90%; left: 90%; }
+    .decorative-border { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border: 35px solid transparent; border-image: repeating-linear-gradient(45deg,#2d8b8e 0px,#2d8b8e 10px,#d4a574 10px,#d4a574 20px,#2d8b8e 20px,#2d8b8e 30px,#f5f0e8 30px,#f5f0e8 40px) 35; pointer-events: none; z-index: 2; }
+    .inner-border { position: absolute; top: 20px; left: 20px; right: 20px; bottom: 20px; border: 15px solid; border-image: repeating-linear-gradient(0deg,#2d8b8e 0px,#2d8b8e 3px,#d4a574 3px,#d4a574 6px,#2d8b8e 6px,#2d8b8e 9px,#f5f0e8 9px,#f5f0e8 12px) 15; pointer-events: none; z-index: 2; }
+    .certificate-content { position: relative; width: 100%; height: 100%; padding: 40px 50px; z-index: 1; filter: blur(0.3px); }
+    .logos-row { display: flex; justify-content: center; align-items: center; gap: 30px; margin: 15px 0 20px 0; flex-wrap: wrap; }
     .logo-item { width: 80px; height: 80px; }
     .logo-item img { width: 100%; height: 100%; object-fit: contain; filter: grayscale(20%); }
-    .header-top {
-        text-align: center; font-size: 16px; font-weight: bold; color: black;
-        margin: 15px 0 5px 0; line-height: 1.2; text-transform: uppercase; letter-spacing: 0.5px;
-    }
+    .header-top { text-align: center; font-size: 16px; font-weight: bold; color: black; margin: 15px 0 5px 0; line-height: 1.2; text-transform: uppercase; letter-spacing: 0.5px; }
     .cooperation { text-align: center; font-size: 14px; color: black; margin: 5px 0; line-height: 1.2; }
-    .tesda {
-        text-align: center; font-size: 14px; font-weight: bold; color: black;
-        margin: 5px 0; line-height: 1.2; text-transform: uppercase;
-    }
-    .training-center {
-        text-align: center; font-size: 20px; font-weight: bold; color: #2d8b8e;
-        margin: 8px 0 35px 0; line-height: 1.2; text-transform: uppercase; letter-spacing: 1px;
-    }
+    .tesda { text-align: center; font-size: 14px; font-weight: bold; color: black; margin: 5px 0; line-height: 1.2; text-transform: uppercase; }
+    .training-center { text-align: center; font-size: 20px; font-weight: bold; color: #2d8b8e; margin: 8px 0 35px 0; line-height: 1.2; text-transform: uppercase; letter-spacing: 1px; }
     .certificate-title { text-align: center; margin: 0 0 35px 0; }
-    .certificate-title h1 {
-        font-size: 42px; margin: 0; color: #2d8b8e; font-weight: bold;
-        text-transform: uppercase; letter-spacing: 4px; line-height: 1;
-    }
+    .certificate-title h1 { font-size: 42px; margin: 0; color: #2d8b8e; font-weight: bold; text-transform: uppercase; letter-spacing: 4px; line-height: 1; }
     .awarded-to { text-align: center; margin: 0 0 20px 0; }
     .awarded-to p { font-size: 18px; margin: 0; color: black; line-height: 1.3; }
     .trainee-name-container { text-align: center; margin: 0 0 25px 0; }
-    .trainee-name {
-        font-size: 42px; color: black; font-weight: bold; text-transform: uppercase;
-        display: inline-block; letter-spacing: 2px; line-height: 1.1;
-        border-bottom: 2px solid #2d8b8e; padding-bottom: 5px;
-    }
+    .trainee-name { font-size: 42px; color: black; font-weight: bold; text-transform: uppercase; display: inline-block; letter-spacing: 2px; line-height: 1.1; border-bottom: 2px solid #2d8b8e; padding-bottom: 5px; }
     .completion-text { text-align: center; margin: 0 0 20px 0; }
     .completion-text p { font-size: 16px; margin: 0; color: black; line-height: 1.3; }
     .training-name-container { text-align: center; margin: 0 0 30px 0; }
-    .training-name {
-        font-size: 32px; color: black; font-weight: bold; text-transform: uppercase;
-        display: inline-block; letter-spacing: 2px; line-height: 1.1;
-        border-bottom: 2px solid #2d8b8e; padding-bottom: 5px;
-    }
+    .training-name { font-size: 32px; color: black; font-weight: bold; text-transform: uppercase; display: inline-block; letter-spacing: 2px; line-height: 1.1; border-bottom: 2px solid #2d8b8e; padding-bottom: 5px; }
     .given-date { text-align: center; margin: 0 0 40px 0; }
     .given-date p { font-size: 16px; margin: 0; color: black; line-height: 1.4; }
     .signatures { margin-top: 40px; }
-    .signatures-row {
-        display: flex; justify-content: space-between; align-items: flex-end;
-        position: relative; flex-wrap: wrap; gap: 20px;
-    }
+    .signatures-row { display: flex; justify-content: space-between; align-items: flex-end; position: relative; flex-wrap: wrap; gap: 20px; }
     .left-signatures { display: flex; flex-direction: column; gap: 35px; flex: 1; min-width: 300px; }
     .signature-block { text-align: center; }
     .signature-line { border-bottom: 2px solid black; width: 280px; margin: 0 auto 5px auto; height: 1px; }
     .signature-name { font-size: 15px; font-weight: bold; color: black; text-transform: uppercase; margin: 0; letter-spacing: 0.5px; line-height: 1.2; }
     .signature-title { font-size: 14px; color: black; margin: 3px 0 0 0; line-height: 1.2; }
     .photo-signature-section { width: 180px; display: flex; flex-direction: column; align-items: center; }
-    .photo-box {
-        width: 150px; height: 180px; border: 2px solid #888; background: white;
-        display: flex; align-items: center; justify-content: center; margin-bottom: 10px;
-    }
+    .photo-box { width: 150px; height: 180px; border: 2px solid #888; background: white; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; }
     .photo-box img { width: 100%; height: 100%; object-fit: cover; }
-    .photo-placeholder {
-        width: 100%; height: 100%;
-        background: linear-gradient(to bottom,#e8e8e8 0%,#f5f5f5 100%);
-        display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px;
-    }
+    .photo-placeholder { width: 100%; height: 100%; background: linear-gradient(to bottom,#e8e8e8 0%,#f5f5f5 100%); display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px; }
     .photo-signature-line { border-bottom: 2px solid black; width: 150px; margin: 5px 0; }
     .photo-signature-label { font-size: 12px; color: black; text-align: center; }
-    .non-official-watermark {
-        position: absolute; top: 50%; left: 50%;
-        transform: translate(-50%,-50%) rotate(-30deg);
-        font-size: 60px; font-weight: 900; color: rgba(255,0,0,0.15);
-        text-transform: uppercase; white-space: nowrap; pointer-events: none; z-index: 9998;
-        border: 5px solid rgba(255,0,0,0.2); padding: 20px 50px; border-radius: 20px;
-        letter-spacing: 10px; text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
-        animation: pulse 3s ease-in-out infinite;
-    }
-    @keyframes pulse {
-        0%,100% { opacity: 0.15; transform: translate(-50%,-50%) rotate(-30deg) scale(1); }
-        50%      { opacity: 0.25; transform: translate(-50%,-50%) rotate(-30deg) scale(1.05); }
-    }
-    .qr-watermark {
-        position: absolute; bottom: 20px; right: 20px; width: 80px; height: 80px;
-        background: rgba(0,0,0,0.1); border: 2px solid rgba(0,0,0,0.2);
-        display: flex; align-items: center; justify-content: center;
-        font-size: 10px; color: rgba(0,0,0,0.3); z-index: 9999; pointer-events: none; border-radius: 10px;
-    }
+    .non-official-watermark { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%) rotate(-30deg); font-size: 60px; font-weight: 900; color: rgba(255,0,0,0.15); text-transform: uppercase; white-space: nowrap; pointer-events: none; z-index: 9998; border: 5px solid rgba(255,0,0,0.2); padding: 20px 50px; border-radius: 20px; letter-spacing: 10px; text-shadow: 2px 2px 4px rgba(0,0,0,0.2); animation: pulse 3s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 0.15; transform: translate(-50%,-50%) rotate(-30deg) scale(1); } 50% { opacity: 0.25; transform: translate(-50%,-50%) rotate(-30deg) scale(1.05); } }
+    .qr-watermark { position: absolute; bottom: 20px; right: 20px; width: 80px; height: 80px; background: rgba(0,0,0,0.1); border: 2px solid rgba(0,0,0,0.2); display: flex; align-items: center; justify-content: center; font-size: 10px; color: rgba(0,0,0,0.3); z-index: 9999; pointer-events: none; border-radius: 10px; }
     .qr-watermark::before { content: 'UNOFFICIAL'; font-weight: bold; font-size: 8px; color: rgba(255,0,0,0.3); transform: rotate(-90deg); }
     .screenshot-restriction { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: transparent; z-index: 10; display: none; }
     .screenshot-restriction.active { display: block; }
-    .restriction-message {
-        position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-        background: rgba(0,0,0,0.8); color: white; padding: 1rem 2rem;
-        border-radius: 0.5rem; font-size: 1.1rem; text-align: center; animation: fadeInOut 2s ease;
-    }
+    .restriction-message { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: rgba(0,0,0,0.8); color: white; padding: 1rem 2rem; border-radius: 0.5rem; font-size: 1.1rem; text-align: center; animation: fadeInOut 2s ease; }
     @keyframes fadeInOut { 0%{opacity:0;} 20%{opacity:1;} 80%{opacity:1;} 100%{opacity:0;} }
     .btn-outline { background: transparent; border: 2px solid #0ea5e9; color: #0ea5e9; }
     .btn-outline:hover { background: #0ea5e9; color: white; }
@@ -972,7 +915,7 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
 <body>
 <div class="flex flex-col min-h-screen bg-gray-100">
 
-<!-- HEADER: Logo, system name, notifications, profile -->
+<!-- HEADER -->
 <header class="header-bar">
     <div class="header-left">
         <img src="../css/logo2.jpg" class="logo" alt="Logo" draggable="false">
@@ -1041,20 +984,17 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
 
 <div class="body-container">
 
-    <!-- SIDEBAR: Navigation -->
+    <!-- SIDEBAR -->
     <aside id="sidebar" class="sidebar">
         <button class="sidebar-btn active" onclick="location.href='dashboard.php'">Dashboard</button>
         <button class="sidebar-btn" onclick="location.href='training_progress.php'">My Training Progress</button>
     </aside>
 
-    <!--  MAIN CONTENT-->
+    <!-- MAIN CONTENT -->
     <main class="main-content">
-        <p class="welcome-text">
-            Welcome, <?php echo htmlspecialchars($username); ?>
-        </p>
+        <p class="welcome-text">Welcome, <?php echo htmlspecialchars($username); ?></p>
 
         <div id="dashboardView">
-            <!-- Page title & search -->
             <div class="view-header">
                 <h1 style="font-size:1.25rem;font-weight:700;margin-bottom:1rem;">Programs</h1>
                 <div class="search-container">
@@ -1064,7 +1004,6 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                 <p id="searchResults" style="display:none;color:#6b7280;font-size:0.875rem;margin-bottom:1rem;"></p>
             </div>
 
-            <!-- Top status banner depending on enrollment state -->
             <?php if ($hasActiveProgram): ?>
                 <div class="enrollment-status active-enrolled-status" style="margin-bottom:2rem;">
                     <p class="status-message"><i class="fas fa-info-circle"></i> You are currently enrolled in an active program. Complete it before applying to a new one.</p>
@@ -1084,7 +1023,6 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
             <?php endif; ?>
 
             <?php if (count($programs) === 0): ?>
-                <!-- Empty state when no programs exist at all -->
                 <div style="text-align:center;padding:3rem;">
                     <i class="fas fa-graduation-cap" style="font-size:3rem;color:#d1d5db;margin-bottom:1rem;display:block;"></i>
                     <h2>No Programs Yet</h2>
@@ -1147,8 +1085,8 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                         <?php else: ?>
                             <div class="programs-list" id="availableProgramsList">
                                 <?php foreach ($availableOnlyPrograms as $program):
-                                    $isFull     = $program['is_full'];
-                                    $isBlocked  = $disableAvailablePrograms || $isFull;
+                                    $isFull    = $program['is_full'];
+                                    $isBlocked = $disableAvailablePrograms || $isFull;
                                     $programName = htmlspecialchars($program['name']);
                                 ?>
                                     <?php if ($isBlocked): ?>
@@ -1203,7 +1141,7 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                 </div><!-- end #availableSection -->
 
 
-                <!--  MY PROGRAMS | filtered by: Active / Pending / Completed.-->
+                <!-- MY PROGRAMS -->
                 <div class="programs-section" id="myProgramsSection">
 
                     <!-- Filter Tabs -->
@@ -1250,17 +1188,16 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                             <div id="myProgramsList">
                                 <div class="programs-list">
                                 <?php foreach ($myPrograms as $program):
-                                    $isEnrolled       = $program['is_enrolled'] ?? false;
-                                    $isPending        = $program['is_pending'] ?? false;
+                                    $isEnrolled        = $program['is_enrolled'] ?? false;
+                                    $isPending         = $program['is_pending'] ?? false;
                                     $isCompletedStatus = $program['is_completed_status'] ?? false;
-                                    $isCompleted      = $program['is_completed'] ?? false;
-                                    $showCertificate  = $program['show_certificate'] ?? false;
-                                    $hasFeedback      = $program['has_feedback_value'] ?? false;
-                                    $isArchived       = $program['is_archived'] ?? false;
-                                    $feedbackRating   = $program['feedback_rating'] ?? null;
-                                    $archiveId        = $program['archive_id'] ?? null;
+                                    $isCompleted       = $program['is_completed'] ?? false;
+                                    $showCertificate   = $program['show_certificate'] ?? false;
+                                    $hasFeedback       = $program['has_feedback_value'] ?? false;
+                                    $isArchived        = $program['is_archived'] ?? false;
+                                    $feedbackRating    = $program['feedback_rating'] ?? null;
+                                    $archiveId         = $program['archive_id'] ?? null;
 
-                                   
                                     $cardClass   = 'enrolled-active';
                                     $statusBadge = 'ENROLLED';
                                     if ($isArchived) {
@@ -1270,12 +1207,9 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                                         $cardClass   = 'pending';
                                         $statusBadge = 'PENDING';
                                     } elseif ($isEnrolled && $isCompleted && $hasFeedback) {
-                                        // Truly completed: feedback submitted
                                         $cardClass   = 'completed';
                                         $statusBadge = 'COMPLETED';
                                     } elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback) {
-                                        // Admin marked complete but awaiting feedback — keep as active/blue
-                                        // Add a special badge to signal the trainee they need to answer feedback
                                         $cardClass   = 'enrolled-active';
                                         $statusBadge = 'NEEDS FEEDBACK';
                                     }
@@ -1291,10 +1225,6 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                                              onclick="showPendingModal(this)">
                                     <?php elseif ($isEnrolled): ?>
                                         <a href="<?php
-                                            // Routing logic for enrolled program cards:
-                                            // 1. Truly completed with cert  → generate certificate page
-                                            // 2. Admin marked complete, no feedback yet → go to feedback page so they can submit
-                                            // 3. Normal active program → go to training progress
                                             if ($isCompleted && $showCertificate) {
                                                 echo 'feedback_certificate.php?generate_certificate=1&program_id=' . $program['id'];
                                             } elseif ($isCompletedStatus && !$hasFeedback) {
@@ -1341,13 +1271,12 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                                                 <p><b>Attendance:</b> <?php echo $program['attendance'] ?? 0; ?>%</p>
                                                 <p><b>Assessment:</b> <?php echo !empty($program['assessment']) ? htmlspecialchars($program['assessment']) : 'N/A'; ?></p>
                                                 <p><b>Completed:</b> <?php echo formatDate($program['completed_at']); ?></p>
-                                                <?php if ($hasFeedback): // $hasFeedback is the bool computed from feedback_details ?>
+                                                <?php if ($hasFeedback): ?>
                                                     <p><b>Feedback:</b> Submitted <?php echo !empty($program['feedback_submitted_at']) ? 'on ' . formatDateTime($program['feedback_submitted_at']) : ''; ?></p>
                                                 <?php endif; ?>
                                             <?php elseif ($isPending): ?>
                                                 <p><b>Available Slots:</b> <?php echo $program['available_slots']; ?> / <?php echo $program['total_slots']; ?></p>
                                             <?php elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback): ?>
-                                                <!-- Admin marked complete, feedback still needed -->
                                                 <p><b>Attendance:</b> <?php echo $program['attendance'] ?? 0; ?>%</p>
                                                 <p><b>Assessment:</b> <?php echo !empty($program['assessment']) ? htmlspecialchars($program['assessment']) : 'Not yet assessed'; ?></p>
                                                 <p><b>Status:</b> <span style="color:#f97316;font-weight:600;">Awaiting Feedback</span></p>
@@ -1357,9 +1286,7 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                                                 <p><b>Status:</b> <?php echo htmlspecialchars($program['enrollment_status'] ?? 'N/A'); ?></p>
                                             <?php endif; ?>
 
-                                            <!-- Status hint banner at the bottom of each card -->
                                             <div class="enrollment-status <?php
-                                                
                                                 if ($isArchived) echo 'archived-status';
                                                 elseif ($isPending) echo 'pending-status';
                                                 elseif ($isEnrolled && $isCompletedStatus && !$hasFeedback) echo 'needs-feedback-banner';
@@ -1403,7 +1330,7 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
                 </div>
 
             </div>
-            <?php endif;  ?>
+            <?php endif; ?>
         </div>
     </main>
 </div>
@@ -1440,24 +1367,19 @@ error_log("Filter Counts — Active: {$filter_counts['active']}, Pending: {$filt
 
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 <script>
-// DATA FROM PHP
-const allProgramsData      = <?php echo json_encode(array_values($programs)); ?>;
-const myProgramsData       = allProgramsData.filter(p => p.enrolled_user_id == <?php echo $user_id; ?>);
+// ── DATA FROM PHP ─────────────────────────────────────────────────────────────
+const allProgramsData       = <?php echo json_encode(array_values($programs)); ?>;
+const myProgramsData        = allProgramsData.filter(p => p.enrolled_user_id == <?php echo $user_id; ?>);
 const availableProgramsData = allProgramsData.filter(p => !p.enrolled_user_id || p.enrolled_user_id != <?php echo $user_id; ?>);
 
-// Flags passed from PHP
-const hasActiveProgram      = <?php echo $hasActiveProgram ? 'true' : 'false'; ?>;
-const hasPendingApplications = <?php echo $hasPendingApplications ? 'true' : 'false'; ?>;
+const hasActiveProgram         = <?php echo $hasActiveProgram ? 'true' : 'false'; ?>;
+const hasPendingApplications   = <?php echo $hasPendingApplications ? 'true' : 'false'; ?>;
 const disableAvailablePrograms = <?php echo $disableAvailablePrograms ? 'true' : 'false'; ?>;
 
-// Track the currently active filter tab
 let currentFilter = '<?php echo $defaultFilter; ?>';
 
 
-
-// JS PART 2: UTILITY HELPERS\
-
-
+// ── UTILITIES ─────────────────────────────────────────────────────────────────
 function escapeHtml(text) {
     if (!text) return '';
     const div = document.createElement('div');
@@ -1465,30 +1387,75 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-
 function formatDate(dateStr) {
     if (!dateStr || dateStr === '0000-00-00') return 'N/A';
-    try {
-        return new Date(dateStr).toLocaleDateString('en-US', {
-            year: 'numeric', month: 'long', day: 'numeric'
-        });
-    } catch { return dateStr; }
+    try { return new Date(dateStr).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' }); }
+    catch { return dateStr; }
 }
-
 
 function formatDateTime(dateTimeStr) {
     if (!dateTimeStr || dateTimeStr === '0000-00-00 00:00:00') return 'N/A';
-    try {
-        return new Date(dateTimeStr).toLocaleDateString('en-US', {
-            year: 'numeric', month: 'long', day: 'numeric',
-            hour: '2-digit', minute: '2-digit'
-        });
-    } catch { return dateTimeStr; }
+    try { return new Date(dateTimeStr).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric', hour:'2-digit', minute:'2-digit' }); }
+    catch { return dateTimeStr; }
 }
 
 
-// NOTIFICATION FUNCTIONS
+// ── SIGNATORY HELPERS ─────────────────────────────────────────────────────────
+/**
+ * Loads signatories for a certificate.
+ *
+ * Priority:
+ *   1. program.saved_signatories already in JS data (frozen snapshot from PHP) → use it
+ *   2. Fetch from server via AJAX (handles new completions with NULL snapshot)
+ *      → server returns frozen snapshot OR current settings
+ *      → if it returned current settings (new completion), also saves them as frozen
+ *
+ * After resolution, updates the DOM element `signatures_<certificateId>`.
+ */
+function resolveAndRenderSignatories(program, certificateId) {
+    // 1. Already have a frozen snapshot from PHP → render immediately, done.
+    if (program.saved_signatories && program.saved_signatories.length > 0) {
+        renderSignatories(certificateId, program.saved_signatories);
+        return;
+    }
 
+    // 2. No snapshot yet → ask the server
+    const archiveId = program.archive_id || 0;
+    const programId = program.id || 0;
+
+    fetch(`dashboard.php?ajax=get_signatories&archive_id=${archiveId}&program_id=${programId}`)
+        .then(r => r.json())
+        .then(data => {
+            if (!data.success || !data.signatories || data.signatories.length === 0) return;
+
+            renderSignatories(certificateId, data.signatories);
+
+            // If the server returned live settings (no frozen copy yet), freeze them now
+            if (data.source === 'current_settings' && archiveId > 0) {
+                fetch('dashboard.php?ajax=save_signatories', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ archive_id: archiveId, signatories: data.signatories })
+                }).catch(err => console.error('Error saving snapshot:', err));
+            }
+        })
+        .catch(err => console.error('Error loading signatories:', err));
+}
+
+/** Renders signatory blocks into the DOM element identified by certificateId. */
+function renderSignatories(certificateId, signatories) {
+    const container = document.getElementById('signatures_' + certificateId);
+    if (!container) return;
+    container.innerHTML = signatories.map(sig => `
+        <div class="signature-block">
+            <div class="signature-line"></div>
+            <div class="signature-name">${escapeHtml(sig.signatory_name)}</div>
+            <div class="signature-title">${escapeHtml(sig.signatory_title)}</div>
+        </div>`).join('');
+}
+
+
+// ── NOTIFICATIONS ─────────────────────────────────────────────────────────────
 function loadNotifications() {
     fetch('notification.php?load=notifications')
         .then(r => r.json())
@@ -1500,7 +1467,6 @@ function loadNotifications() {
         })
         .catch(err => console.error('Notification error:', err));
 }
-
 
 function updateNotificationBadge(count) {
     const btn = document.querySelector('.notification-btn');
@@ -1515,11 +1481,9 @@ function updateNotificationBadge(count) {
     }
 }
 
-
 function updateNotificationDropdown(notifications, count) {
     const dropdown = document.getElementById('notificationDropdown');
     if (!dropdown) return;
-
     dropdown.innerHTML = `
         <div class="notification-header">
             Notifications
@@ -1528,33 +1492,23 @@ function updateNotificationDropdown(notifications, count) {
         <ul class="notification-list" id="notificationList"></ul>`;
 
     const list = document.getElementById('notificationList');
-    if (!notifications.length) {
-        list.innerHTML = '<li class="no-notifications">No notifications</li>';
-        return;
-    }
+    if (!notifications.length) { list.innerHTML = '<li class="no-notifications">No notifications</li>'; return; }
     notifications.forEach(n => {
-        const unread = !n.is_read;
         const li = document.createElement('li');
-        li.className = 'notification-item' + (unread ? ' unread' : '');
+        li.className = 'notification-item' + (!n.is_read ? ' unread' : '');
         li.setAttribute('data-id', n.id);
         li.setAttribute('data-read', n.is_read ? 'true' : 'false');
         li.innerHTML = `
-            <div class="notification-title">
-                ${escapeHtml(n.title)}
-                ${unread ? '<span class="new-badge" style="background:#3b82f6;color:white;padding:2px 6px;border-radius:3px;font-size:0.7rem;margin-left:5px;">NEW</span>' : ''}
-            </div>
+            <div class="notification-title">${escapeHtml(n.title)}${!n.is_read ? '<span class="new-badge" style="background:#3b82f6;color:white;padding:2px 6px;border-radius:3px;font-size:0.7rem;margin-left:5px;">NEW</span>' : ''}</div>
             <div class="notification-message">${escapeHtml(n.message)}</div>
             <div class="notification-time">${escapeHtml(n.created_at)}</div>`;
         li.addEventListener('click', function(e) {
             e.stopPropagation();
-            if (this.getAttribute('data-read') !== 'true') {
-                markAsRead(this.getAttribute('data-id'), this);
-            }
+            if (this.getAttribute('data-read') !== 'true') markAsRead(this.getAttribute('data-id'), this);
         });
         list.appendChild(li);
     });
 }
-
 
 function markAsRead(notificationId, element) {
     const fd = new FormData();
@@ -1570,10 +1524,8 @@ function markAsRead(notificationId, element) {
                 if (badge) badge.remove();
                 updateBadgeCountAfterRead();
             }
-        })
-        .catch(err => console.error('markAsRead error:', err));
+        });
 }
-
 
 function markAllAsRead() {
     const fd = new FormData();
@@ -1593,10 +1545,8 @@ function markAllAsRead() {
                 const markBtn = document.querySelector('.mark-all-btn');
                 if (markBtn) markBtn.style.display = 'none';
             }
-        })
-        .catch(err => console.error('markAllAsRead error:', err));
+        });
 }
-
 
 function updateBadgeCountAfterRead() {
     const badge = document.querySelector('.notification-badge');
@@ -1612,10 +1562,8 @@ function updateBadgeCountAfterRead() {
 }
 
 
-
-// JS PART 4: PROGRAM APPLICATION
+// ── PROGRAM APPLICATION ───────────────────────────────────────────────────────
 window.applyForProgram = function(programId, programName) {
-    // Guard: prevent applying if locked (also enforced server-side)
     if (hasActiveProgram || hasPendingApplications) {
         Swal.fire({
             title: 'Cannot Apply',
@@ -1628,7 +1576,6 @@ window.applyForProgram = function(programId, programName) {
         });
         return;
     }
-
     Swal.fire({
         title: 'Apply for Program',
         html: `Are you sure you want to apply for <strong>${escapeHtml(programName)}</strong>?`,
@@ -1640,13 +1587,9 @@ window.applyForProgram = function(programId, programName) {
         cancelButtonColor: '#6b7280'
     }).then(result => {
         if (!result.isConfirmed) return;
-
         Swal.fire({
-            title: 'Submitting...',
-            text: 'Please wait',
-            allowOutsideClick: false,
-            allowEscapeKey: false,
-            showConfirmButton: false,
+            title: 'Submitting...', text: 'Please wait',
+            allowOutsideClick: false, allowEscapeKey: false, showConfirmButton: false,
             didOpen: () => {
                 Swal.showLoading();
                 const fd = new FormData();
@@ -1656,44 +1599,33 @@ window.applyForProgram = function(programId, programName) {
                     .then(r => r.json())
                     .then(data => {
                         if (data.success) {
-                            Swal.fire({
-                                title: 'Success!',
-                                text: data.message,
-                                icon: 'success',
-                                confirmButtonColor: '#0ea5e9'
-                            }).then(() => location.reload());
+                            Swal.fire({ title: 'Success!', text: data.message, icon: 'success', confirmButtonColor: '#0ea5e9' })
+                                .then(() => location.reload());
                         } else {
                             Swal.fire({ title: 'Error', text: data.message, icon: 'error', confirmButtonColor: '#ef4444' });
                         }
                     })
-                    .catch(() => {
-                        Swal.fire({ title: 'Error', text: 'An error occurred. Please try again.', icon: 'error', confirmButtonColor: '#ef4444' });
-                    });
+                    .catch(() => Swal.fire({ title: 'Error', text: 'An error occurred. Please try again.', icon: 'error', confirmButtonColor: '#ef4444' }));
             }
         });
     });
 };
 
 
-// JS PART 5: PENDING MODAL
+// ── PENDING MODAL ─────────────────────────────────────────────────────────────
 window.showPendingModal = function(element) {
     const programId = element.getAttribute('data-program-id');
     const program   = myProgramsData.find(p => p.id == programId && p.is_pending);
-    if (!program) {
-        Swal.fire({ title: 'Error', text: 'Pending data not found.', icon: 'error' });
-        return;
-    }
+    if (!program) { Swal.fire({ title: 'Error', text: 'Pending data not found.', icon: 'error' }); return; }
     populatePendingModal(program);
     document.getElementById('pendingApplicationModal').classList.add('active');
     document.body.style.overflow = 'hidden';
 };
 
-
 window.closePendingModal = function() {
     document.getElementById('pendingApplicationModal').classList.remove('active');
     document.body.style.overflow = '';
 };
-
 
 function populatePendingModal(program) {
     document.getElementById('pendingModalTitle').textContent = program.name || 'Pending Application';
@@ -1734,15 +1666,12 @@ function populatePendingModal(program) {
 }
 
 
-//  ARCHIVED MODAL
+// ── ARCHIVED MODAL ────────────────────────────────────────────────────────────
 window.showArchivedModal = function(element) {
-    const archiveId     = element.getAttribute('data-archive-id');
-    const archivedProgram = allProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
-    if (!archivedProgram) {
-        Swal.fire({ title: 'Error', text: 'Archived data not found.', icon: 'error' });
-        return;
-    }
-    populateArchivedModal(archivedProgram);
+    const archiveId = element.getAttribute('data-archive-id');
+    const program   = allProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
+    if (!program) { Swal.fire({ title: 'Error', text: 'Archived data not found.', icon: 'error' }); return; }
+    populateArchivedModal(program);
     document.getElementById('archivedProgramModal').classList.add('active');
     document.body.style.overflow = 'hidden';
     enableScreenshotRestriction();
@@ -1753,65 +1682,36 @@ window.closeArchivedModal = function() {
     document.body.style.overflow = '';
 };
 
-// ---- Screenshot restriction (from original) ----
 function enableScreenshotRestriction() {
     document.addEventListener('contextmenu', function(e) {
         if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) {
-            e.preventDefault();
-            showRestrictionMessage('Screenshots are not allowed for security reasons.');
-            return false;
+            e.preventDefault(); showRestrictionMessage('Screenshots are not allowed for security reasons.'); return false;
         }
     });
     document.addEventListener('keyup', function(e) {
-        if (e.key === 'PrintScreen' && document.querySelector('.modal-overlay.active')) {
+        if (e.key === 'PrintScreen' && document.querySelector('.modal-overlay.active'))
             showRestrictionMessage('Screenshots are not allowed for security reasons.');
-        }
     });
     document.addEventListener('keydown', function(e) {
         if ((e.metaKey || e.ctrlKey) && e.shiftKey && ['S','s','4','3','5'].includes(e.key)) {
-            if (document.querySelector('.modal-overlay.active')) {
-                e.preventDefault();
-                showRestrictionMessage('Screenshots are not allowed for security reasons.');
-            }
+            if (document.querySelector('.modal-overlay.active')) { e.preventDefault(); showRestrictionMessage('Screenshots are not allowed for security reasons.'); }
         }
-        if (e.altKey && e.key === 'PrintScreen' && document.querySelector('.modal-overlay.active')) {
+        if (e.altKey && e.key === 'PrintScreen' && document.querySelector('.modal-overlay.active'))
             showRestrictionMessage('Screenshots are not allowed for security reasons.');
-        }
     });
     document.addEventListener('copy', function(e) {
-        if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) {
-            e.preventDefault();
-            showRestrictionMessage('Copying certificate content is not allowed.');
-        }
+        if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) { e.preventDefault(); showRestrictionMessage('Copying certificate content is not allowed.'); }
     });
-    document.addEventListener('dragstart', function(e) {
-        if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) {
-            e.preventDefault();
-        }
-    });
-    document.addEventListener('selectstart', function(e) {
-        if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) {
-            e.preventDefault();
-        }
-    });
+    document.addEventListener('dragstart', function(e) { if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) e.preventDefault(); });
+    document.addEventListener('selectstart', function(e) { if (e.target.closest('.certificate-container') || e.target.closest('.modal-overlay.active')) e.preventDefault(); });
     window.addEventListener('blur', function() {
-        if (document.querySelector('.modal-overlay.active')) {
-            const cert = document.querySelector('.certificate-container');
-            if (cert) { cert.style.filter = 'blur(5px)'; cert.style.transition = 'filter 0.3s'; }
-        }
+        if (document.querySelector('.modal-overlay.active')) { const cert = document.querySelector('.certificate-container'); if (cert) { cert.style.filter = 'blur(5px)'; cert.style.transition = 'filter 0.3s'; } }
     });
-    window.addEventListener('focus', function() {
-        const cert = document.querySelector('.certificate-container');
-        if (cert) { cert.style.filter = ''; cert.style.transition = 'filter 0.3s'; }
-    });
+    window.addEventListener('focus', function() { const cert = document.querySelector('.certificate-container'); if (cert) { cert.style.filter = ''; cert.style.transition = 'filter 0.3s'; } });
     document.addEventListener('visibilitychange', function() {
-        const cert = document.querySelector('.certificate-container');
-        if (!cert) return;
-        if (document.hidden && document.querySelector('.modal-overlay.active')) {
-            cert.style.filter = 'blur(5px)'; cert.style.opacity = '0.5';
-        } else {
-            cert.style.filter = ''; cert.style.opacity = '';
-        }
+        const cert = document.querySelector('.certificate-container'); if (!cert) return;
+        if (document.hidden && document.querySelector('.modal-overlay.active')) { cert.style.filter = 'blur(5px)'; cert.style.opacity = '0.5'; }
+        else { cert.style.filter = ''; cert.style.opacity = ''; }
     });
 }
 
@@ -1819,71 +1719,61 @@ function showRestrictionMessage(message) {
     const modal = document.getElementById('archivedProgramModal');
     if (!modal.classList.contains('active')) return;
     let overlay = modal.querySelector('.screenshot-restriction');
-    if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.className = 'screenshot-restriction';
-        modal.querySelector('.modal-container').appendChild(overlay);
-    }
+    if (!overlay) { overlay = document.createElement('div'); overlay.className = 'screenshot-restriction'; modal.querySelector('.modal-container').appendChild(overlay); }
     overlay.classList.add('active');
-    const msg = document.createElement('div');
-    msg.className = 'restriction-message';
-    msg.textContent = message;
-    overlay.appendChild(msg);
+    const msg = document.createElement('div'); msg.className = 'restriction-message'; msg.textContent = message; overlay.appendChild(msg);
     setTimeout(() => { msg.remove(); overlay.classList.remove('active'); }, 2000);
 }
-
 
 function populateArchivedModal(program) {
     const modalBody  = document.getElementById('modalBodyContent');
     const modalTitle = document.getElementById('modalProgramName');
-
     modalTitle.textContent = program.name || 'Archived Program';
 
-    // Generate a unique ID for this certificate instance
-    const certificateId = 'cert_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    // Unique ID for this certificate instance (for DOM targeting)
+    const certId = 'cert_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 
-    // ---- Feedback section ----
+    // ── Feedback section ──────────────────────────────────────────────────────
     let feedbackHtml = '';
     if (program.has_feedback && program.feedback_details) {
-        const ratings = program.feedback_details;
+        const r = program.feedback_details;
 
-        const trainerRatings = [
-            { name: 'Expertise',      value: ratings.trainer_expertise_rating },
-            { name: 'Communication',  value: ratings.trainer_communication_rating },
-            { name: 'Methods',        value: ratings.trainer_methods_rating },
-            { name: 'Requests',       value: ratings.trainer_requests_rating },
-            { name: 'Questions',      value: ratings.trainer_questions_rating },
-            { name: 'Instructions',   value: ratings.trainer_instructions_rating },
-            { name: 'Prioritization', value: ratings.trainer_prioritization_rating },
-            { name: 'Fairness',       value: ratings.trainer_fairness_rating }
-        ].filter(r => r.value);
+        const trainerR = [
+            { name:'Expertise',      value:r.trainer_expertise_rating },
+            { name:'Communication',  value:r.trainer_communication_rating },
+            { name:'Methods',        value:r.trainer_methods_rating },
+            { name:'Requests',       value:r.trainer_requests_rating },
+            { name:'Questions',      value:r.trainer_questions_rating },
+            { name:'Instructions',   value:r.trainer_instructions_rating },
+            { name:'Prioritization', value:r.trainer_prioritization_rating },
+            { name:'Fairness',       value:r.trainer_fairness_rating }
+        ].filter(x => x.value);
 
-        const programRatings = [
-            { name: 'Knowledge',   value: ratings.program_knowledge_rating },
-            { name: 'Process',     value: ratings.program_process_rating },
-            { name: 'Environment', value: ratings.program_environment_rating },
-            { name: 'Algorithms',  value: ratings.program_algorithms_rating },
-            { name: 'Preparation', value: ratings.program_preparation_rating }
-        ].filter(r => r.value);
+        const progR = [
+            { name:'Knowledge',   value:r.program_knowledge_rating },
+            { name:'Process',     value:r.program_process_rating },
+            { name:'Environment', value:r.program_environment_rating },
+            { name:'Algorithms',  value:r.program_algorithms_rating },
+            { name:'Preparation', value:r.program_preparation_rating }
+        ].filter(x => x.value);
 
-        const systemRatings = [
-            { name: 'Technology',   value: ratings.system_technology_rating },
-            { name: 'Workflow',     value: ratings.system_workflow_rating },
-            { name: 'Instructions', value: ratings.system_instructions_rating },
-            { name: 'Answers',      value: ratings.system_answers_rating },
-            { name: 'Performance',  value: ratings.system_performance_rating }
-        ].filter(r => r.value);
+        const sysR = [
+            { name:'Technology',   value:r.system_technology_rating },
+            { name:'Workflow',     value:r.system_workflow_rating },
+            { name:'Instructions', value:r.system_instructions_rating },
+            { name:'Answers',      value:r.system_answers_rating },
+            { name:'Performance',  value:r.system_performance_rating }
+        ].filter(x => x.value);
 
-        const ratingBlock = (title, list) => list.length === 0 ? '' : `
+        const ratingBlock = (title, list) => !list.length ? '' : `
             <div class="feedback-detail">
                 <h4 style="margin-bottom:1rem;color:#1c2a3a;">${title}</h4>
                 <div class="feedback-rating-grid">
-                    ${list.map(r => `
+                    ${list.map(x => `
                         <div class="rating-category">
-                            <div class="category-name">${r.name}</div>
-                            <div class="category-value">
-                                ${r.value}/5
-                                <span class="rating-stars">${'★'.repeat(r.value)}${'☆'.repeat(5 - r.value)}</span>
+                            <div class="category-name">${x.name}</div>
+                            <div class="category-value">${x.value}/5
+                                <span class="rating-stars">${'★'.repeat(x.value)}${'☆'.repeat(5-x.value)}</span>
                             </div>
                         </div>`).join('')}
                 </div>
@@ -1895,9 +1785,9 @@ function populateArchivedModal(program) {
                 <div class="rating-badge-large" style="margin-bottom:1rem;">
                     <i class="fas fa-star"></i> Overall Rating: ${program.feedback_rating}/5
                 </div>
-                ${ratingBlock('Trainer Evaluation', trainerRatings)}
-                ${ratingBlock('Program Evaluation', programRatings)}
-                ${ratingBlock('System Evaluation', systemRatings)}
+                ${ratingBlock('Trainer Evaluation', trainerR)}
+                ${ratingBlock('Program Evaluation', progR)}
+                ${ratingBlock('System Evaluation', sysR)}
                 ${program.feedback_comments ? `
                     <div class="feedback-detail">
                         <h4 style="margin-bottom:0.5rem;color:#1c2a3a;">Additional Comments</h4>
@@ -1912,17 +1802,18 @@ function populateArchivedModal(program) {
             </div>`;
     }
 
-    // ---- Certificate preview ----
+    // ── Certificate preview ───────────────────────────────────────────────────
     const traineeName = "<?php echo htmlspecialchars(strtoupper($trainee_fullname ?? 'TRAINEE NAME')); ?>";
     let certificateHtml = '';
 
     if (program.show_certificate && program.has_feedback && program.assessment === 'Passed') {
         const completionDate = program.completed_at
-            ? new Date(program.completed_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+            ? new Date(program.completed_at).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' })
             : 'N/A';
 
+        // Render a loading placeholder — signatories filled in after DOM is ready
         certificateHtml = `
-            <div class="certificate-container" id="certificatePreview_${certificateId}">
+            <div class="certificate-container" id="certificatePreview_${certId}">
                 <div class="screenshot-protection-overlay"></div>
                 <div class="dynamic-watermark">
                     <div class="watermark-text">UNOFFICIAL COPY</div>
@@ -1937,9 +1828,9 @@ function populateArchivedModal(program) {
                 <div class="inner-border"></div>
                 <div class="certificate-content">
                     <div class="logos-row">
-                        <div class="logo-item"><img src="/trainee/SMBLOGO.jpg"   alt="Santa Maria Logo"      onerror="this.style.display='none';" draggable="false"></div>
-                        <div class="logo-item"><img src="/trainee/SLOGO.jpg"     alt="Training Center Logo"  onerror="this.style.display='none';" draggable="false"></div>
-                        <div class="logo-item"><img src="/trainee/TESDALOGO.png" alt="TESDA Logo"            onerror="this.style.display='none';" draggable="false"></div>
+                        <div class="logo-item"><img src="/trainee/SMBLOGO.jpg"   alt="Santa Maria Logo"     onerror="this.style.display='none';" draggable="false"></div>
+                        <div class="logo-item"><img src="/trainee/SLOGO.jpg"     alt="Training Center Logo" onerror="this.style.display='none';" draggable="false"></div>
+                        <div class="logo-item"><img src="/trainee/TESDALOGO.png" alt="TESDA Logo"           onerror="this.style.display='none';" draggable="false"></div>
                     </div>
                     <div class="header-top">MUNICIPALITY OF SANTA MARIA, BULACAN</div>
                     <div class="cooperation">IN COOPERATION WITH</div>
@@ -1960,21 +1851,10 @@ function populateArchivedModal(program) {
                     </div>
                     <div class="signatures">
                         <div class="signatures-row">
-                            <div class="left-signatures">
-                                <div class="signature-block">
-                                    <div class="signature-line"></div>
-                                    <div class="signature-name">ZENAIDA S. MANINGAS</div>
-                                    <div class="signature-title">PESO Manager</div>
-                                </div>
-                                <div class="signature-block">
-                                    <div class="signature-line"></div>
-                                    <div class="signature-name">ROBERTO B. PEREZ</div>
-                                    <div class="signature-title">Municipal Vice Mayor</div>
-                                </div>
-                                <div class="signature-block">
-                                    <div class="signature-line"></div>
-                                    <div class="signature-name">BARTOLOME R. RAMOS</div>
-                                    <div class="signature-title">Municipal Mayor</div>
+                            <!-- Signatories injected here by resolveAndRenderSignatories() -->
+                            <div class="left-signatures" id="signatures_${certId}">
+                                <div style="text-align:center;color:#9ca3af;padding:1rem;">
+                                    <i class="fas fa-spinner fa-spin"></i> Loading signatories...
                                 </div>
                             </div>
                             <div class="photo-signature-section">
@@ -1988,6 +1868,7 @@ function populateArchivedModal(program) {
             </div>`;
     }
 
+    // ── Assemble modal body ───────────────────────────────────────────────────
     modalBody.innerHTML = `
         <div class="modal-section">
             <h3><i class="fas fa-info-circle"></i> Program Information</h3>
@@ -2021,45 +1902,40 @@ function populateArchivedModal(program) {
                 <i class="fas fa-times"></i> Close
             </button>
         </div>`;
+
+    // ── After DOM is inserted, resolve and render the signatories ─────────────
+    if (certificateHtml) {
+        setTimeout(() => resolveAndRenderSignatories(program, certId), 50);
+    }
 }
 
-// ---- Certificate print function (from original) ----
 window.printCertificate = function(certificateId) {
     const certificate = document.getElementById(certificateId);
     if (!certificate) return;
     const printWindow = window.open('', '_blank');
-    printWindow.document.write(`
-        <html><head><title>Certificate of Training</title>
+    printWindow.document.write(`<html><head><title>Certificate of Training</title>
         <style>
-            body { margin:0; padding:0; background:white; }
-            .certificate-container { width:100%; max-width:210mm; margin:0 auto; position:relative; }
-            .non-official-watermark { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%) rotate(-30deg); font-size:60px; font-weight:900; color:rgba(255,0,0,0.15); text-transform:uppercase; white-space:nowrap; pointer-events:none; z-index:9998; border:5px solid rgba(255,0,0,0.2); padding:20px 50px; border-radius:20px; letter-spacing:10px; }
-            .dynamic-watermark { position:absolute; top:0; left:0; right:0; bottom:0; pointer-events:none; z-index:10000; overflow:hidden; }
-            .watermark-text { position:absolute; color:rgba(139,92,246,0.15); font-size:24px; font-weight:bold; white-space:nowrap; transform:rotate(-45deg); text-transform:uppercase; letter-spacing:5px; animation:moveWatermark 20s linear infinite; border:2px solid rgba(139,92,246,0.2); padding:10px 30px; border-radius:50px; }
-            @keyframes moveWatermark { 0%{transform:rotate(-45deg) translateX(-100%) translateY(-100%);} 100%{transform:rotate(-45deg) translateX(100%) translateY(100%);} }
-            @media print { body{margin:0;padding:0;} .certificate-container{margin:0;} }
+            body{margin:0;padding:0;background:white;}
+            .certificate-container{width:100%;max-width:210mm;margin:0 auto;position:relative;}
+            .non-official-watermark{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:60px;font-weight:900;color:rgba(255,0,0,0.15);text-transform:uppercase;white-space:nowrap;pointer-events:none;z-index:9998;border:5px solid rgba(255,0,0,0.2);padding:20px 50px;border-radius:20px;letter-spacing:10px;}
+            .dynamic-watermark{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:10000;overflow:hidden;}
+            .watermark-text{position:absolute;color:rgba(139,92,246,0.15);font-size:24px;font-weight:bold;white-space:nowrap;transform:rotate(-45deg);text-transform:uppercase;letter-spacing:5px;animation:moveWatermark 20s linear infinite;border:2px solid rgba(139,92,246,0.2);padding:10px 30px;border-radius:50px;}
+            @keyframes moveWatermark{0%{transform:rotate(-45deg) translateX(-100%) translateY(-100%);}100%{transform:rotate(-45deg) translateX(100%) translateY(100%);}}
+            @media print{body{margin:0;padding:0;}.certificate-container{margin:0;}}
         </style></head><body>${certificate.outerHTML}</body></html>`);
     printWindow.document.close();
     printWindow.focus();
     setTimeout(() => printWindow.print(), 500);
 };
 
-// ---- Certificate download placeholder (from original) ----
 window.downloadCertificate = function() {
-    Swal.fire({
-        title: 'Download Feature',
-        text: 'PDF download will be available soon. You can print the certificate for now.',
-        icon: 'info',
-        confirmButtonColor: '#8b5cf6'
-    });
+    Swal.fire({ title: 'Download Feature', text: 'PDF download will be available soon. You can print the certificate for now.', icon: 'info', confirmButtonColor: '#8b5cf6' });
 };
 
 
-// FILTER FUNCTION
+// ── FILTER ────────────────────────────────────────────────────────────────────
 function applyMyProgramsFilter(filterType) {
     currentFilter = filterType;
-
-    // Highlight the active tab button
     document.querySelectorAll('.filter-btn').forEach(btn => {
         btn.classList.remove('active');
         if (btn.getAttribute('data-filter') === filterType) btn.classList.add('active');
@@ -2072,34 +1948,20 @@ function applyMyProgramsFilter(filterType) {
     cards.forEach(card => {
         const programId = parseInt(card.getAttribute('data-program-id'));
         const archiveId = card.getAttribute('data-archive-id');
-
-        // Find the matching program from our JS data
         let program = null;
-        if (archiveId) {
-            program = myProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
-        }
-        if (!program) {
-            program = myProgramsData.find(p => p.id === programId);
-        }
-
+        if (archiveId) program = myProgramsData.find(p => p.archive_id == archiveId && p.is_archived);
+        if (!program)  program = myProgramsData.find(p => p.id === programId);
         if (!program) { card.style.display = 'none'; return; }
 
-        // Determine if the card matches the current filter tab
         let show = false;
         if (filterType === 'active') {
-            // ACTIVE = is_enrolled AND is_completed=false AND not archived.
-            show = program.is_enrolled === true &&
-                   program.is_completed === false &&
-                   program.is_archived !== true;
+            show = program.is_enrolled === true && program.is_completed === false && program.is_archived !== true;
         } else if (filterType === 'pending') {
             show = program.is_pending === true && program.is_archived !== true;
         } else if (filterType === 'completed') {
-            // COMPLETED = ONLY archived_history records AND feedback must be submitted.
-            // If archived but no feedback, the trainee never truly finished — hidden here.
             show = program.is_archived === true && program.has_feedback_value === true;
         }
 
-        // Also apply search filter if query exists
         if (show && searchQuery) {
             const name     = (program.name || '').toLowerCase();
             const category = (program.category_name || '').toLowerCase();
@@ -2111,23 +1973,18 @@ function applyMyProgramsFilter(filterType) {
         if (show) visibleCount++;
     });
 
-    // Update the "My Programs" count badge
     const badge = document.getElementById('myProgramsCount');
     if (badge) badge.textContent = visibleCount + ' program' + (visibleCount !== 1 ? 's' : '');
 }
 
 
-
+// ── INIT ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
-
-    // Start notification polling
     loadNotifications();
-    setInterval(loadNotifications, 30000); // refresh every 30s
-
-    // Apply the default filter tab
+    setInterval(loadNotifications, 30000);
     setTimeout(() => applyMyProgramsFilter(currentFilter), 100);
 
-    // ---- Search input ----
+    // Search
     const searchInput = document.getElementById('searchQuery');
     const clearBtn    = document.getElementById('clearSearch');
 
@@ -2136,27 +1993,20 @@ document.addEventListener('DOMContentLoaded', function() {
             const q = this.value.trim().toLowerCase();
             if (clearBtn) clearBtn.style.display = q ? 'block' : 'none';
 
-            // Filter available programs
             let availableVisible = 0;
             document.querySelectorAll('#availableProgramsList .program-card').forEach(card => {
-                const programId = parseInt(card.getAttribute('data-program-id'));
-                const program   = availableProgramsData.find(p => p.id === programId);
-                const show = !program || !q || [program.name, program.category_name, program.trainer]
-                    .some(s => (s || '').toLowerCase().includes(q));
+                const program = availableProgramsData.find(p => p.id === parseInt(card.getAttribute('data-program-id')));
+                const show = !program || !q || [program.name, program.category_name, program.trainer].some(s => (s||'').toLowerCase().includes(q));
                 card.style.display = show ? '' : 'none';
                 if (show) availableVisible++;
             });
             const availBadge = document.getElementById('availableCount');
             if (availBadge) availBadge.textContent = availableVisible + ' program' + (availableVisible !== 1 ? 's' : '');
 
-            // Re-apply my programs filter with new search term
             applyMyProgramsFilter(currentFilter);
 
             const resultsEl = document.getElementById('searchResults');
-            if (resultsEl) {
-                resultsEl.style.display = q ? 'block' : 'none';
-                resultsEl.textContent   = q ? `Search results for "${q}"` : '';
-            }
+            if (resultsEl) { resultsEl.style.display = q ? 'block' : 'none'; resultsEl.textContent = q ? `Search results for "${q}"` : ''; }
         });
     }
 
@@ -2164,7 +2014,6 @@ document.addEventListener('DOMContentLoaded', function() {
         clearBtn.addEventListener('click', () => {
             if (searchInput) searchInput.value = '';
             clearBtn.style.display = 'none';
-            // Reset available programs visibility
             document.querySelectorAll('#availableProgramsList .program-card').forEach(c => c.style.display = '');
             const availBadge = document.getElementById('availableCount');
             if (availBadge) availBadge.textContent = availableProgramsData.length + ' program' + (availableProgramsData.length !== 1 ? 's' : '');
@@ -2174,7 +2023,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // ---- Filter tab buttons ----
+    // Filter tabs
     document.querySelectorAll('.filter-btn').forEach(btn => {
         btn.addEventListener('click', function(e) {
             e.preventDefault();
@@ -2182,7 +2031,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
-    // ---- Profile dropdown toggle ----
+    // Profile dropdown
     const profileBtn      = document.getElementById('profileBtn');
     const profileDropdown = document.getElementById('profileDropdown');
     if (profileBtn) {
@@ -2193,7 +2042,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // ---- Notification dropdown toggle ----
+    // Notification dropdown
     const notificationBtn      = document.getElementById('notificationBtn');
     const notificationDropdown = document.getElementById('notificationDropdown');
     if (notificationBtn) {
@@ -2204,77 +2053,54 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // ---- Close dropdowns when clicking elsewhere ----
+    // Close dropdowns on outside click
     document.addEventListener('click', e => {
-        if (profileBtn && !profileBtn.contains(e.target) && !profileDropdown.contains(e.target)) {
+        if (profileBtn && !profileBtn.contains(e.target) && !profileDropdown.contains(e.target))
             profileDropdown.style.display = 'none';
-        }
-        if (notificationBtn && !notificationBtn.contains(e.target) && !notificationDropdown.contains(e.target)) {
+        if (notificationBtn && !notificationBtn.contains(e.target) && !notificationDropdown.contains(e.target))
             notificationDropdown.style.display = 'none';
-        }
     });
 
-    // ---- Mobile sidebar toggle ----
+    // Mobile sidebar
     const mobileMenuBtn = document.getElementById('mobileMenuBtn');
     const sidebar       = document.getElementById('sidebar');
-    const overlay       = document.createElement('div');
-    overlay.className   = 'sidebar-overlay';
-    Object.assign(overlay.style, {
-        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.5)', zIndex: 998, display: 'none'
-    });
-    document.body.appendChild(overlay);
+    const sidebarOverlay = document.createElement('div');
+    sidebarOverlay.className = 'sidebar-overlay';
+    Object.assign(sidebarOverlay.style, { position:'fixed', top:0, left:0, right:0, bottom:0, background:'rgba(0,0,0,0.5)', zIndex:998, display:'none' });
+    document.body.appendChild(sidebarOverlay);
 
     function toggleSidebar() {
         const isOpen = sidebar.classList.contains('mobile-open');
         sidebar.classList.toggle('mobile-open', !isOpen);
-        overlay.style.display = isOpen ? 'none' : 'block';
+        sidebarOverlay.style.display = isOpen ? 'none' : 'block';
         document.body.style.overflow = isOpen ? '' : 'hidden';
     }
-
     if (mobileMenuBtn) mobileMenuBtn.addEventListener('click', toggleSidebar);
-    overlay.addEventListener('click', toggleSidebar);
+    sidebarOverlay.addEventListener('click', toggleSidebar);
     window.addEventListener('resize', () => {
         if (window.innerWidth > 768) {
             sidebar.classList.remove('mobile-open');
-            overlay.style.display = 'none';
+            sidebarOverlay.style.display = 'none';
             document.body.style.overflow = '';
         }
     });
 
-    // ---- Close modals on ESC or backdrop click ----
-    document.addEventListener('keydown', e => {
-        if (e.key === 'Escape') { closeArchivedModal(); closePendingModal(); }
-    });
-    document.getElementById('archivedProgramModal').addEventListener('click', function(e) {
-        if (e.target === this) closeArchivedModal();
-    });
-    document.getElementById('pendingApplicationModal').addEventListener('click', function(e) {
-        if (e.target === this) closePendingModal();
-    });
+    // Close modals on ESC / backdrop click
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeArchivedModal(); closePendingModal(); } });
+    document.getElementById('archivedProgramModal').addEventListener('click', function(e) { if (e.target === this) closeArchivedModal(); });
+    document.getElementById('pendingApplicationModal').addEventListener('click', function(e) { if (e.target === this) closePendingModal(); });
 });
-
 
 
 function confirmLogout() {
     Swal.fire({
-        title: 'Confirm Logout',
-        text: 'Are you sure you want to logout?',
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonText: 'Yes, Logout',
-        cancelButtonText: 'Cancel',
-        confirmButtonColor: '#d33',
-        cancelButtonColor: '#6b7280'
-    }).then(result => {
-        if (result.isConfirmed) window.location.href = '?action=logout';
-    });
+        title: 'Confirm Logout', text: 'Are you sure you want to logout?', icon: 'question',
+        showCancelButton: true, confirmButtonText: 'Yes, Logout', cancelButtonText: 'Cancel',
+        confirmButtonColor: '#d33', cancelButtonColor: '#6b7280'
+    }).then(result => { if (result.isConfirmed) window.location.href = '?action=logout'; });
 }
 
-
-function goToProfile() {
-    window.location.href = 'profile.php';
-}
+function goToProfile() { window.location.href = 'profile.php'; }
 </script>
 </body>
 </html>

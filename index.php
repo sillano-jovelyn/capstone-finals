@@ -260,7 +260,7 @@ if (isset($_SESSION['pending_enrollment']) && is_array($_SESSION['pending_enroll
     /* Optional overlay to improve text readability */
     .homepage {
         min-height: 100vh;
-        background: rgba(28, 42, 58, 0.85); /* Dark blue overlay with transparency */
+
     }
 
     /* Manila date display */

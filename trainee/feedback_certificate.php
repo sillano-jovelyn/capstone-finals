@@ -94,7 +94,7 @@ if (isset($_POST['submit_feedback'])) {
                     'trainer_communication'  => intval($_POST['trainer_communication']  ?? 3),
                     'trainer_methods'        => intval($_POST['trainer_methods']        ?? 3),
                     'trainer_requests'       => intval($_POST['trainer_requests']       ?? 3),
-                    'trainer_questions'      => intval($_POST['trainer_questions']      ?? 3),
+                    'trainer_questions'      => intval($_POST['trainer_questions']       ?? 3),
                     'trainer_instructions'   => intval($_POST['trainer_instructions']   ?? 3),
                     'trainer_prioritization' => intval($_POST['trainer_prioritization'] ?? 3),
                     'trainer_fairness'       => intval($_POST['trainer_fairness']       ?? 3),
@@ -190,18 +190,6 @@ if (isset($_POST['submit_feedback'])) {
 
                     // =========================================================
                     // UPDATE archived_history WITH FEEDBACK RATINGS
-                    //
-                    // This handles TWO scenarios:
-                    //
-                    // 1. NORMAL FLOW: The trigger above already inserted the
-                    //    archive row, but may have joined feedback before it
-                    //    was committed. This UPDATE guarantees ratings are saved.
-                    //
-                    // 2. LATE FEEDBACK: The row was previously archived with
-                    //    NULL ratings (e.g. program ended before feedback was
-                    //    submitted). This fills in those NULL columns now.
-                    //
-                    // Matching on user_id + enrollment_id covers both cases.
                     // =========================================================
                     if ($enrollment_id) {
                         $update_archive_sql = "UPDATE archived_history SET
@@ -341,6 +329,98 @@ if (isset($_GET['generate_certificate'])) {
 
     if (!$has_feedback) {
         die("Certificate not available. Please submit feedback first.");
+    }
+
+    // ==========================================
+    // LOAD SIGNATORIES — priority order:
+    //   1. archived_history.saved_signatories  (snapshot saved at completion time)
+    //   2. certificate_signatory.edited_signatory  (per-user custom override)
+    //   3. certificate_signatory_settings          (live admin-managed list)
+    //   4. certificate_signatory_templates         (original default fallback)
+    // ==========================================
+    $signatories = [];
+
+    // 1. Try saved_signatories from archived_history first (historical snapshot)
+    $arch_sig_stmt = $conn->prepare(
+        "SELECT saved_signatories
+         FROM archived_history
+         WHERE user_id = ? AND original_program_id = ?
+         AND saved_signatories IS NOT NULL
+         AND saved_signatories != ''
+         ORDER BY archived_at DESC
+         LIMIT 1"
+    );
+    $arch_sig_stmt->bind_param("ii", $user_id, $program_id);
+    $arch_sig_stmt->execute();
+    $arch_sig_row = $arch_sig_stmt->get_result()->fetch_assoc();
+    $arch_sig_stmt->close();
+
+    if ($arch_sig_row) {
+        $decoded = json_decode($arch_sig_row['saved_signatories'], true);
+        if (is_array($decoded) && count($decoded) > 0) {
+            $signatories = $decoded;
+        }
+    }
+
+    // 2. If no archived snapshot, check for a per-user edited signatory
+    if (empty($signatories)) {
+        $sig_stmt = $conn->prepare(
+            "SELECT edited_signatory, original_signatory
+             FROM certificate_signatory
+             WHERE user_id = ?
+             ORDER BY updated_at DESC
+             LIMIT 1"
+        );
+        $sig_stmt->bind_param("i", $user_id);
+        $sig_stmt->execute();
+        $sig_row = $sig_stmt->get_result()->fetch_assoc();
+        $sig_stmt->close();
+
+        if ($sig_row) {
+            $json_source = !empty($sig_row['edited_signatory'])
+                ? $sig_row['edited_signatory']
+                : $sig_row['original_signatory'];
+
+            $decoded = json_decode($json_source, true);
+            if (is_array($decoded) && count($decoded) > 0) {
+                $signatories = $decoded;
+            }
+        }
+    }
+
+    // 3. If still empty, load from certificate_signatory_settings (admin-managed)
+    if (empty($signatories)) {
+        $settings_result = $conn->query(
+            "SELECT signatory_name, signatory_title
+             FROM certificate_signatory_settings
+             WHERE is_active = 1
+             ORDER BY signatory_order ASC"
+        );
+        if ($settings_result && $settings_result->num_rows > 0) {
+            while ($row = $settings_result->fetch_assoc()) {
+                $signatories[] = [
+                    'signatory_name'  => $row['signatory_name'],
+                    'signatory_title' => $row['signatory_title'],
+                ];
+            }
+        }
+    }
+
+    // 4. Final fallback — certificate_signatory_templates (original defaults)
+    if (empty($signatories)) {
+        $tpl_result = $conn->query(
+            "SELECT signatory_name, signatory_title
+             FROM certificate_signatory_templates
+             ORDER BY id ASC"
+        );
+        if ($tpl_result) {
+            while ($row = $tpl_result->fetch_assoc()) {
+                $signatories[] = [
+                    'signatory_name'  => $row['signatory_name'],
+                    'signatory_title' => $row['signatory_title'],
+                ];
+            }
+        }
     }
 
     // Get user full name
@@ -590,7 +670,7 @@ if (isset($_GET['generate_certificate'])) {
                 </div>
                 <div class="header-top">MUNICIPALITY OF SANTA MARIA, BULACAN</div>
                 <div class="cooperation">IN COOPERATION WITH</div>
-                <div class="tesda">TECHNICAL EDUCATION & SKILLS DEVELOPMENT AUTHORITY (TESDA)-BULACAN</div>
+                <div class="tesda">TECHNICAL EDUCATION &amp; SKILLS DEVELOPMENT AUTHORITY (TESDA)-BULACAN</div>
                 <div class="training-center">SANTA MARIA LIVELIHOOD TRAINING CENTER</div>
                 <div class="certificate-title"><h1>CERTIFICATE OF TRAINING</h1></div>
                 <div class="awarded-to"><p>is awarded to</p></div>
@@ -605,24 +685,37 @@ if (isset($_GET['generate_certificate'])) {
                     <p>Given this <?php echo $formatted_date; ?> at Santa Maria Livelihood Training and</p>
                     <p>Employment Center, Santa Maria, Bulacan.</p>
                 </div>
+
+                <!-- DYNAMIC SIGNATORIES -->
                 <div class="signatures">
                     <div class="signatures-row">
                         <div class="left-signatures">
-                            <div class="signature-block">
-                                <div class="signature-line"></div>
-                                <div class="signature-name">ZENAIDA S. MANINGAS</div>
-                                <div class="signature-title">PESO Manager</div>
-                            </div>
-                            <div class="signature-block">
-                                <div class="signature-line"></div>
-                                <div class="signature-name">ROBERTO B. PEREZ</div>
-                                <div class="signature-title">Municipal Vice Mayor</div>
-                            </div>
-                            <div class="signature-block">
-                                <div class="signature-line"></div>
-                                <div class="signature-name">BARTOLOME R. RAMOS</div>
-                                <div class="signature-title">Municipal Mayor</div>
-                            </div>
+                            <?php if (!empty($signatories)): ?>
+                                <?php foreach ($signatories as $sig): ?>
+                                <div class="signature-block">
+                                    <div class="signature-line"></div>
+                                    <div class="signature-name"><?php echo htmlspecialchars(strtoupper($sig['signatory_name'])); ?></div>
+                                    <div class="signature-title"><?php echo htmlspecialchars($sig['signatory_title']); ?></div>
+                                </div>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <!-- Hardcoded emergency fallback (should never reach here) -->
+                                <div class="signature-block">
+                                    <div class="signature-line"></div>
+                                    <div class="signature-name">ZENAIDA S. MANINGAS</div>
+                                    <div class="signature-title">PESO Manager</div>
+                                </div>
+                                <div class="signature-block">
+                                    <div class="signature-line"></div>
+                                    <div class="signature-name">ROBERTO B. PEREZ</div>
+                                    <div class="signature-title">Municipal Vice Mayor</div>
+                                </div>
+                                <div class="signature-block">
+                                    <div class="signature-line"></div>
+                                    <div class="signature-name">BARTOLOME R. RAMOS</div>
+                                    <div class="signature-title">Municipal Mayor</div>
+                                </div>
+                            <?php endif; ?>
                         </div>
                         <div class="photo-signature-section">
                             <div class="photo-box"><div class="photo-placeholder"></div></div>
@@ -631,6 +724,8 @@ if (isset($_GET['generate_certificate'])) {
                         </div>
                     </div>
                 </div>
+                <!-- END DYNAMIC SIGNATORIES -->
+
             </div>
         </div>
 
