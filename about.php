@@ -1133,7 +1133,7 @@
                     <div class="step-number">1</div>
                     <div class="step-content">
                         <h4>Find a Program You Love </h4>
-                        <p>Browse through fun programs like cooking, gardening, or computer classes. See pictures, read descriptions, and pick what interests you!</p>
+                        <p>Browse through fun programs like cooking, gardening, or computer classes. Pick what interests you!</p>
                     </div>
                 </div>
                 
@@ -1141,7 +1141,7 @@
                     <div class="step-number">2</div>
                     <div class="step-content">
                         <h4>Easy Sign-Up</h4>
-                        <p>Click the "Join" button and fill in simple information. No complicated forms! We'll guide you every step of the way.</p>
+                        <p>Click the "Apply" button, no complicated forms! We'll guide you every step of the way.</p>
                     </div>
                 </div>
                 
@@ -1279,26 +1279,6 @@
                     <p>Stuck? Need help? Our support team is just a click away, ready to assist you.</p>
                 </div>
             </div>
-        </section>
-
-
-  
-
-        <!-- FINAL CTA -->
-        <section class="cta-section">
-            <h2>Ready to Start Your Learning Adventure? </h2>
-            <p>Join hundreds of happy learners who have discovered new passions, made friends, and gained valuable skills through our community programs.</p>
-            <div class="cta-buttons">
-                <a href="login.php" class="btn btn-primary">
-                    <i class="fas fa-sign-in-alt"></i> Login & Explore
-                </a>
-                <a href="register-trainee.php" class="btn btn-secondary">
-                    <i class="fas fa-user-plus"></i> Create Account
-                </a>
-            </div>
-            <p style="margin-top: 2rem; font-size: 1rem; opacity: 0.9;">
-                <i class="fas fa-info-circle"></i> Need help getting started? Call us at (02) 123-4567 or visit our office!
-            </p>
         </section>
 
     </div>
