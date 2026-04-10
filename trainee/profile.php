@@ -4,6 +4,13 @@ session_start();
 // Include db.php from the root directory
 include __DIR__ . '/../db.php';
 
+// Include PHPMailer
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\SMTP;
+use PHPMailer\PHPMailer\Exception;
+
+require_once __DIR__ . '/../vendor/autoload.php'; // Adjust path if needed
+
 // ============= ADDED: Check for auto-edit mode from revision =============
 $auto_edit_mode = false;
 if (isset($_SESSION['auto_edit_mode']) && $_SESSION['auto_edit_mode'] === true) {
@@ -30,6 +37,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         uploadDocuments($conn, $user_id);
     } elseif ($_POST['action'] === 'delete_document') {
         deleteDocument($conn, $user_id);
+    }
+}
+
+// ============================================
+// FUNCTION TO SEND EMAIL USING PHPMailer
+// ============================================
+function sendEmailWithPHPMailer($to_email, $to_name, $subject, $html_content) {
+    // SMTP Configuration - UPDATE THESE VALUES WITH YOUR EMAIL SETTINGS
+    $mail = new PHPMailer(true);
+    
+    try {
+        // Server settings
+        $mail->isSMTP();                                            // Send using SMTP
+        $mail->Host       = 'smtp.gmail.com';                       // Set the SMTP server to send through (Gmail example)
+        $mail->SMTPAuth   = true;                                   // Enable SMTP authentication
+        $mail->Username   = 'lems.superadmn@gmail.com';                 // SMTP username (YOUR EMAIL)
+        $mail->Password   = 'gubivcizhhkewkda';                    // SMTP password (USE APP PASSWORD for Gmail)
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;         // Enable TLS encryption
+        $mail->Port       = 587;                                    // TCP port to connect to
+        
+        // Alternative SMTP settings for different providers:
+        // Gmail: Host=smtp.gmail.com, Port=587, SMTPSecure=STARTTLS
+        // Outlook: Host=smtp-mail.outlook.com, Port=587, SMTPSecure=STARTTLS
+        // Yahoo: Host=smtp.mail.yahoo.com, Port=587, SMTPSecure=STARTTLS
+        // Custom domain: Contact your hosting provider for SMTP details
+        
+        // Recipients
+        $mail->setFrom('noreply@lems-system.com', 'LEMS System');
+        $mail->addAddress($to_email, $to_name);                     // Add a recipient
+        
+        // Content
+        $mail->isHTML(true);                                        // Set email format to HTML
+        $mail->Subject = $subject;
+        $mail->Body    = $html_content;
+        $mail->AltBody = strip_tags($html_content);                 // Plain text alternative
+        
+        $mail->send();
+        return true;
+    } catch (Exception $e) {
+        // Log error but don't stop the process
+        error_log("PHPMailer Error: " . $mail->ErrorInfo);
+        return false;
     }
 }
 
@@ -306,7 +355,9 @@ function uploadDocuments($conn, $user_id) {
     exit;
 }
 
-// Function to change password
+// ============================================
+// UPDATED: CHANGE PASSWORD WITH PHPMailer EMAIL NOTIFICATION (INCLUDES NEW PASSWORD)
+// ============================================
 function changePassword($conn, $user_id) {
     $current_password = $_POST['current_password'];
     $new_password = $_POST['new_password'];
@@ -325,26 +376,239 @@ function changePassword($conn, $user_id) {
         exit;
     }
     
-    // Get current password hash
-    $query = "SELECT password FROM trainees WHERE user_id = '$user_id'";
+    // Get current password hash and email
+    $query = "SELECT password, email, firstname, lastname FROM trainees WHERE user_id = '$user_id'";
     $result = $conn->query($query);
     
     if ($result->num_rows > 0) {
         $row = $result->fetch_assoc();
         $current_hash = $row['password'];
+        $user_email = $row['email'];
+        $user_name = $row['firstname'] . ' ' . $row['lastname'];
         
-        // Verify current password (assuming passwords are hashed)
+        // Verify current password
         if (password_verify($current_password, $current_hash)) {
             // Hash new password
             $new_password_hash = password_hash($new_password, PASSWORD_DEFAULT);
             
-            // Update both trainees and users tables if they're linked
+            // Update both trainees and users tables
             $update_trainees = "UPDATE trainees SET password = '$new_password_hash' WHERE user_id = '$user_id'";
             $update_users = "UPDATE users SET password = '$new_password_hash' WHERE id = '$user_id'";
             
-            // Execute both queries
             if ($conn->query($update_trainees) && $conn->query($update_users)) {
-                $_SESSION['message'] = "Password changed successfully!";
+                // Send email notification using PHPMailer with the NEW PASSWORD included
+                $subject = "Password Changed Successfully - LEMS System";
+                $html_message = '
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta charset="UTF-8">
+                        <title>Password Changed Notification</title>
+                        <style>
+                            body {
+                                font-family: Arial, sans-serif;
+                                line-height: 1.6;
+                                color: #333;
+                                background-color: #f4f4f4;
+                                margin: 0;
+                                padding: 20px;
+                            }
+                            .email-container {
+                                max-width: 600px;
+                                margin: 0 auto;
+                                background: white;
+                                border-radius: 10px;
+                                overflow: hidden;
+                                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                            }
+                            .email-header {
+                                background: linear-gradient(135deg, #0d9488, #0f766e);
+                                padding: 30px 20px;
+                                text-align: center;
+                            }
+                            .email-header h1 {
+                                color: white;
+                                margin: 0;
+                                font-size: 24px;
+                            }
+                            .email-header p {
+                                color: rgba(255,255,255,0.9);
+                                margin: 10px 0 0;
+                            }
+                            .email-body {
+                                padding: 30px;
+                            }
+                            .alert-box {
+                                background: #f0fdfa;
+                                border-left: 4px solid #0d9488;
+                                padding: 15px;
+                                margin: 20px 0;
+                                border-radius: 5px;
+                            }
+                            .alert-box p {
+                                margin: 0;
+                            }
+                            .alert-box strong {
+                                color: #0d9488;
+                            }
+                            .password-box {
+                                background: #fff3cd;
+                                border: 2px solid #ffc107;
+                                border-radius: 8px;
+                                padding: 20px;
+                                margin: 20px 0;
+                                text-align: center;
+                            }
+                            .password-box .password-value {
+                                font-size: 24px;
+                                font-weight: bold;
+                                font-family: monospace;
+                                background: white;
+                                padding: 10px 20px;
+                                border-radius: 5px;
+                                display: inline-block;
+                                letter-spacing: 2px;
+                                color: #d9534f;
+                                border: 1px solid #ffc107;
+                                margin-top: 10px;
+                            }
+                            .security-warning {
+                                background: #f8d7da;
+                                border-left: 4px solid #dc3545;
+                                padding: 15px;
+                                margin: 20px 0;
+                                border-radius: 5px;
+                            }
+                            .security-warning p {
+                                margin: 0;
+                                color: #721c24;
+                            }
+                            .security-warning strong {
+                                color: #dc3545;
+                            }
+                            .info-box {
+                                background: #f8f9fa;
+                                padding: 15px;
+                                border-radius: 8px;
+                                margin: 20px 0;
+                                border: 1px solid #e0e0e0;
+                            }
+                            .info-box p {
+                                margin: 8px 0;
+                            }
+                            .security-tips {
+                                background: #fff8e7;
+                                border-left: 4px solid #f39c12;
+                                padding: 15px;
+                                margin: 20px 0;
+                                border-radius: 5px;
+                            }
+                            .security-tips ul {
+                                margin: 10px 0;
+                                padding-left: 20px;
+                            }
+                            .security-tips li {
+                                margin: 5px 0;
+                            }
+                            .email-footer {
+                                background: #f8f9fa;
+                                padding: 20px;
+                                text-align: center;
+                                font-size: 12px;
+                                color: #666;
+                                border-top: 1px solid #e0e0e0;
+                            }
+                            .button {
+                                display: inline-block;
+                                padding: 12px 24px;
+                                background: #0d9488;
+                                color: white;
+                                text-decoration: none;
+                                border-radius: 6px;
+                                margin: 20px 0;
+                            }
+                            .text-center {
+                                text-align: center;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="email-container">
+                            <div class="email-header">
+                                <h1>🔐 Password Changed</h1>
+                                <p>LEMS - Livelihood Empowerment Management System</p>
+                            </div>
+                            <div class="email-body">
+                                <p>Dear <strong>' . htmlspecialchars($user_name) . '</strong>,</p>
+                                
+                                <p>This email confirms that your password for the <strong>LEMS System</strong> has been successfully changed.</p>
+                                
+                                <div class="alert-box">
+                                    <p>✅ <strong>Your password was changed on:</strong> ' . date('F j, Y \a\t g:i A') . '</p>
+                                </div>
+                                
+                                <div class="password-box">
+                                    <p><strong>🔑 Your New Password:</strong></p>
+                                    <div class="password-value">' . htmlspecialchars($new_password) . '</div>
+                                    <p style="font-size: 12px; margin-top: 10px; color: #856404;">
+                                        <i class="fas fa-exclamation-triangle"></i> Please save this password in a secure location.
+                                    </p>
+                                </div>
+                                
+                                <div class="security-warning">
+                                    <p><strong>⚠️ IMPORTANT SECURITY NOTICE:</strong></p>
+                                    <p>This email contains your actual password. For security reasons, we strongly recommend that you:</p>
+                                    <ul style="margin: 10px 0 0 20px;">
+                                        <li>Delete this email after reading</li>
+                                        <li>Do not forward this email to anyone</li>
+                                        <li>Change your password again after logging in if you feel this email was compromised</li>
+                                    </ul>
+                                </div>
+                                
+                                <div class="info-box">
+                                    <p><strong>📧 Account Details:</strong></p>
+                                    <p>• Email: ' . htmlspecialchars($user_email) . '</p>
+                                    <p>• User ID: ' . htmlspecialchars($user_id) . '</p>
+                                    <p>• Password last changed: ' . date('F j, Y') . '</p>
+                                </div>
+                                
+                                <div class="security-tips">
+                                    <p><strong>🔒 Important Security Tips:</strong></p>
+                                    <ul>
+                                        <li>Never share your password with anyone, including system administrators.</li>
+                                        <li>Use a strong, unique password that you don\'t use on other websites.</li>
+                                        <li>Consider using a password manager to store your credentials securely.</li>
+                                        <li>If you didn\'t make this change, contact the administrator immediately.</li>
+                                    </ul>
+                                </div>
+                                
+                                <div class="text-center">
+                                    <a href="' . (isset($_SERVER['HTTPS']) ? "https://" : "http://") . $_SERVER['HTTP_HOST'] . '/lems/login.php" class="button">
+                                        Login to Your Account
+                                    </a>
+                                </div>
+                                
+                                <p style="margin-top: 20px;">If you have any questions or concerns, please don\'t hesitate to contact our support team.</p>
+                                <p>Best regards,<br><strong>LEMS System Administrator</strong></p>
+                            </div>
+                            <div class="email-footer">
+                                <p><strong>⚠️ CONFIDENTIALITY NOTICE:</strong> This email contains your password. Please delete it after saving.</p>
+                                <p>This is an automated notification from the LEMS System. Please do not reply to this email.</p>
+                                <p>&copy; ' . date('Y') . ' LEMS - All Rights Reserved</p>
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                ';
+                
+                // Send email using PHPMailer
+                $email_sent = sendEmailWithPHPMailer($user_email, $user_name, $subject, $html_message);
+                
+                if ($email_sent) {
+                    $_SESSION['message'] = "Password changed successfully! A confirmation email with your new password has been sent to your registered email address.";
+                } else {
+                    $_SESSION['message'] = "Password changed successfully! (Note: Email notification could not be sent. Please check your email settings.)";
+                }
                 $_SESSION['message_type'] = "success";
             } else {
                 $_SESSION['error'] = "Failed to change password: " . $conn->error;
@@ -784,6 +1048,26 @@ $show_auto_delete_warning = true;
             font-weight: 700;
             color: #1f2937;
             margin-bottom: 16px;
+        }
+
+        /* NEW: Trainee ID Badge */
+        .trainee-id-badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #0d9488, #0f766e);
+            color: white;
+            padding: 6px 16px;
+            border-radius: 30px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            font-family: monospace;
+            letter-spacing: 0.5px;
+            box-shadow: 0 2px 8px rgba(13, 148, 136, 0.3);
+        }
+
+        .trainee-id-badge i {
+            margin-right: 8px;
+            font-size: 14px;
         }
 
         .profile-badge-container {
@@ -1919,8 +2203,6 @@ $show_auto_delete_warning = true;
                                 <li>When done - your application will automatically return to pending status</li>
                             </ul>
                         </div>
-                        
-                       
                     </div>
                 </div>
             <?php endif; ?>
@@ -1932,6 +2214,11 @@ $show_auto_delete_warning = true;
                     <div class="profile-main">
                         <div class="profile-identity">
                             <h2><?php echo htmlspecialchars($trainee['fullname'] ?? 'User'); ?></h2>
+                            
+                            <!-- NEW: Trainee ID Badge displayed here -->
+                            <div class="trainee-id-badge">
+                                <i class="fas fa-id-card"></i> <?php echo htmlspecialchars($trainee['trainee_id'] ?? 'N/A'); ?>
+                            </div>
                             
                             <div class="profile-badge-container">
                                 <span class="profile-badge">
@@ -2293,7 +2580,7 @@ $show_auto_delete_warning = true;
                                         
                                         <div class="inline-upload-header">
                                             <i class="fas fa-vote-yea" style="color: #2ecc71; font-size: 18px;"></i>
-                                            <strong>Voter's Certificate</strong>
+                                            <strong>Voter\'s Certificate</strong>
                                             <?php if (!empty($voters_cert_docs)): ?>
                                                 <span class="current-file-badge">
                                                     <i class="fas fa-check-circle"></i> Current document

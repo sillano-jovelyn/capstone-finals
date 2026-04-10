@@ -103,6 +103,7 @@ date_default_timezone_set('Asia/Manila');
 $currentPrograms = [];
 $history = [];
 
+// FIX: Added ac.project_passing_percentage and ac.project_total_max to the query
 $query = "
     SELECT 
         e.id AS enrollment_id,
@@ -122,11 +123,14 @@ $query = "
         COALESCE(ac.project_submitted_by_trainee, 0) as project_submitted_by_trainee,
         ac.project_submitted_at,
         ac.project_score,
+        ac.project_max_score,
         ac.project_notes,
         ac.project_title_override,
         ac.project_instruction,
         ac.project_rubrics,
         ac.overall_result,
+        COALESCE(ac.project_passing_percentage, 75) as project_passing_percentage,
+        COALESCE(NULLIF(ac.project_total_max, 0), NULLIF(ac.project_max_score, 0), 100) as project_total_max,
         (SELECT COUNT(*) FROM attendance_records ar WHERE ar.enrollment_id = e.id AND ar.status = 'present') as sessions_attended,
         (SELECT COUNT(*) FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = p.id) as has_feedback,
         f.submitted_at as feedback_submitted_at
@@ -172,6 +176,13 @@ while ($row = $result->fetch_assoc()) {
     if ($project_score === null || $project_score === '') {
         $project_score = null;
     }
+
+    // FIX: Fetch real values from DB instead of hardcoding
+    $project_passing_percentage = $row['project_passing_percentage'] ?? 75;
+    // FIX: project_total_max falls back to project_max_score (set by bulk), then 100
+    $project_total_max = (!empty($row['project_total_max']) && $row['project_total_max'] > 0)
+        ? $row['project_total_max']
+        : ((!empty($row['project_max_score']) && $row['project_max_score'] > 0) ? $row['project_max_score'] : 100);
   
     // ==========================================
     // HANDLE PROJECT SUBMISSION
@@ -230,27 +241,19 @@ while ($row = $result->fetch_assoc()) {
     
     $move_to_history = $program_has_ended;
     
-    // ==========================================
-    // FIX: Certificate/Feedback button logic
-    // Certificate only shows if: assessment passed AND feedback submitted
-    // Feedback button shows if: assessment passed AND feedback NOT yet submitted
-    // ==========================================
     $show_feedback_button = false;
     $show_certificate_button = false;
     
     if ($program_has_started) {
         if ($assessment_done && $assessment_passed) {
             if ($has_feedback) {
-                $show_certificate_button = true;  // Both done = show certificate
+                $show_certificate_button = true;
             } else {
-                $show_feedback_button = true;     // Needs feedback first
+                $show_feedback_button = true;
             }
         }
     }
     
-    // ==========================================
-    // FIX: Status display — added 'Awaiting Feedback' state
-    // ==========================================
     $status = 'Upcoming';
     if ($program_not_started) {
         $status = 'Not Started Yet';
@@ -261,9 +264,9 @@ while ($row = $result->fetch_assoc()) {
             if (!$assessment_passed) {
                 $status = 'Failed';
             } elseif ($assessment_passed && !$has_feedback) {
-                $status = 'Awaiting Feedback'; // FIX: was 'Completed' even without feedback
+                $status = 'Awaiting Feedback';
             } else {
-                $status = 'Completed'; // Truly completed: passed + feedback submitted
+                $status = 'Completed';
             }
         } else {
             $status = 'Ended - Waiting for Assessment';
@@ -306,7 +309,10 @@ while ($row = $result->fetch_assoc()) {
         "project_submitted" => $row['project_submitted_by_trainee'],
         "project_submitted_at" => $row['project_submitted_at'],
         "project_score" => $project_score,
-        "project_notes" => $row['project_notes']
+        "project_notes" => $row['project_notes'],
+        // FIX: Store the real values from DB
+        "project_passing_percentage" => $project_passing_percentage,
+        "project_total_max" => $project_total_max,
     ];
     
     if ($move_to_history) {
@@ -754,7 +760,6 @@ function formatDateTime($dateTimeStr) {
             border-left: 4px solid #10b981;
         }
 
-        /* FIX: New style for awaiting feedback in history */
         .awaiting-feedback-program {
             background-color: #fffbeb;
             border-left: 4px solid #f59e0b;
@@ -787,12 +792,7 @@ function formatDateTime($dateTimeStr) {
         .status-ended { background: #f3e8ff; color: #6b21a8; }
         .status-completed { background: #d1fae5; color: #065f46; }
         .status-failed { background: #fee2e2; color: #991b1b; }
-
-        /* FIX: New badge for awaiting feedback status */
-        .status-awaiting-feedback {
-            background: #fff3cd;
-            color: #856404;
-        }
+        .status-awaiting-feedback { background: #fff3cd; color: #856404; }
 
         /* Attendance progress bar */
         .attendance-progress-container { margin: 1rem 0; }
@@ -848,7 +848,6 @@ function formatDateTime($dateTimeStr) {
             border-left: 5px solid #10b981;
         }
 
-        /* FIX: Specific styling for feedback-required section */
         .feedback-required-section {
             margin-top: 1.5rem;
             padding: 1.5rem;
@@ -1212,7 +1211,6 @@ function formatDateTime($dateTimeStr) {
                                 <?php elseif ($program['assessment_done'] && !$program['assessment_passed']): ?>
                                     <span class="program-status status-failed">Failed</span>
                                 <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
-                                    <!-- FIX: Awaiting Feedback badge for current programs -->
                                     <span class="program-status status-awaiting-feedback">Awaiting Feedback</span>
                                 <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
                                     <span class="program-status status-completed">Completed</span>
@@ -1259,7 +1257,7 @@ function formatDateTime($dateTimeStr) {
                                 <div class="project-section">
                                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
                                         <h4 style="color: #0ea5e9; margin: 0; display: flex; align-items: center; gap: 10px;">
-                                            <i class="fas fa-project-diagram"></i> Project Output (100 pts)
+                                            <i class="fas fa-project-diagram"></i> Project Output (<?php echo $program['project_total_max']; ?> pts)
                                         </h4>
                                         <?php if ($program['project_submitted']): ?>
                                             <span style="background: #28a745; color: white; padding: 5px 15px; border-radius: 50px; font-size: 14px;">
@@ -1412,7 +1410,18 @@ function formatDateTime($dateTimeStr) {
                                         </div>
                                     <?php endif; ?>
 
-                                    <?php if (!empty($program['project_score']) && $program['project_score'] !== null && $program['project_score'] > 0): ?>
+                                    <?php
+                                    // FIX: Use real project_total_max and project_passing_percentage from DB
+                                    $proj_score      = $program['project_score'];
+                                    $proj_total_max  = $program['project_total_max'];
+                                    $proj_pass_pct   = $program['project_passing_percentage'];
+                                    $proj_earned_pct = ($proj_total_max > 0 && $proj_score !== null)
+                                                        ? ($proj_score / $proj_total_max) * 100
+                                                        : 0;
+                                    $proj_is_passed  = ($proj_earned_pct >= $proj_pass_pct);
+                                    ?>
+
+                                    <?php if ($proj_score !== null && $proj_score > 0): ?>
                                         <div style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
                                             <h5 style="color: #0ea5e9; margin-bottom: 15px;">
                                                 <i class="fas fa-clipboard-check"></i> Trainer's Evaluation
@@ -1421,12 +1430,19 @@ function formatDateTime($dateTimeStr) {
                                             <div style="display: flex; gap: 20px; flex-wrap: wrap; align-items: center; margin-bottom: 15px;">
                                                 <div style="background: white; padding: 15px 25px; border-radius: 10px; border-left: 4px solid #0ea5e9;">
                                                     <div style="font-size: 12px; color: #666;">Project Score</div>
+                                                    <!-- FIX: Show real total max, not hardcoded 100 -->
                                                     <div style="font-size: 24px; font-weight: 700; color: #0ea5e9;">
-                                                        <?php echo number_format($program['project_score'], 2); ?>/100
+                                                        <?php echo number_format($proj_score, 2); ?>/<?php echo $proj_total_max; ?>
+                                                    </div>
+                                                    <!-- FIX: Show actual passing rate from DB -->
+                                                    <div style="font-size: 11px; color: #888; margin-top: 4px;">
+                                                        Passing rate: <?php echo $proj_pass_pct; ?>%
+                                                        (<?php echo number_format($proj_total_max * $proj_pass_pct / 100, 2); ?> pts)
                                                     </div>
                                                 </div>
                                                 
-                                                <?php if ($program['project_score'] >= 75): ?>
+                                                <!-- FIX: Pass/fail uses real percentage threshold, not hardcoded 75 -->
+                                                <?php if ($proj_is_passed): ?>
                                                     <span style="background: #28a745; color: white; padding: 8px 20px; border-radius: 50px;">
                                                         <i class="fas fa-check-circle"></i> PASSED
                                                     </span>
@@ -1444,7 +1460,7 @@ function formatDateTime($dateTimeStr) {
                                                 </div>
                                             <?php endif; ?>
                                         </div>
-                                    <?php elseif ($program['project_submitted'] && (empty($program['project_score']) || $program['project_score'] == 0)): ?>
+                                    <?php elseif ($program['project_submitted'] && ($proj_score === null || $proj_score == 0)): ?>
                                         <div style="margin-top: 20px; padding: 20px; background: #fff3cd; border-radius: 10px; border-left: 4px solid #ffc107;">
                                             <h5 style="color: #856404; margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
                                                 <i class="fas fa-clock"></i> Awaiting Evaluation
@@ -1457,11 +1473,6 @@ function formatDateTime($dateTimeStr) {
                                 </div>
                             <?php endif; ?>
                             
-                            <!-- ==========================================
-                                 FIX: Certificate / Feedback section
-                                 - show_certificate_button = passed + feedback submitted
-                                 - show_feedback_button     = passed + feedback NOT submitted
-                            ========================================== -->
                             <?php if ($program['show_certificate_button']): ?>
                                 <div class="certificate-section">
                                     <div class="certificate-title">
@@ -1487,7 +1498,6 @@ function formatDateTime($dateTimeStr) {
                                 </div>
 
                             <?php elseif ($program['show_feedback_button']): ?>
-                                <!-- FIX: Use amber/yellow styling to match "awaiting feedback" -->
                                 <div class="feedback-required-section">
                                     <div class="feedback-title">
                                         <i class="fas fa-comment-dots"></i> Feedback Required
@@ -1531,14 +1541,22 @@ function formatDateTime($dateTimeStr) {
                     
                     <?php foreach ($history as $program): ?>
                         <?php
-                        // FIX: Determine correct card style for history entries
                         if ($program['assessment_done'] && !$program['assessment_passed']) {
                             $historyCardClass = 'failed-program';
                         } elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']) {
-                            $historyCardClass = 'awaiting-feedback-program'; // FIX: amber card while feedback pending
+                            $historyCardClass = 'awaiting-feedback-program';
                         } else {
-                            $historyCardClass = 'history-program'; // green = fully done
+                            $historyCardClass = 'history-program';
                         }
+
+                        // FIX: Reuse same variables for history card evaluation display
+                        $h_proj_score     = $program['project_score'];
+                        $h_proj_total_max = $program['project_total_max'];
+                        $h_proj_pass_pct  = $program['project_passing_percentage'];
+                        $h_proj_earned_pct = ($h_proj_total_max > 0 && $h_proj_score !== null)
+                                              ? ($h_proj_score / $h_proj_total_max) * 100
+                                              : 0;
+                        $h_proj_is_passed = ($h_proj_earned_pct >= $h_proj_pass_pct);
                         ?>
                         <div class="program-card <?php echo $historyCardClass; ?>">
                             <h3 class="program-name">
@@ -1546,7 +1564,6 @@ function formatDateTime($dateTimeStr) {
                                 <?php if ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
                                     <span class="program-status status-completed">Completed</span>
                                 <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
-                                    <!-- FIX: Show Awaiting Feedback badge instead of Completed -->
                                     <span class="program-status status-awaiting-feedback">Awaiting Feedback</span>
                                 <?php elseif ($program['assessment_done'] && !$program['assessment_passed']): ?>
                                     <span class="program-status status-failed">Failed</span>
@@ -1574,9 +1591,39 @@ function formatDateTime($dateTimeStr) {
                                     <span style="color: #6b7280;">Not assessed</span>
                                 <?php endif; ?>
                             </p>
+
+                            <!-- FIX: Show project score in history with correct max and passing rate -->
+                            <?php if ($program['show_project'] && $h_proj_score !== null && $h_proj_score > 0): ?>
+                                <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 10px; border-left: 4px solid #0ea5e9;">
+                                    <h5 style="color: #0ea5e9; margin-bottom: 10px;">
+                                        <i class="fas fa-clipboard-check"></i> Project Score
+                                    </h5>
+                                    <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
+                                        <div style="background: white; padding: 10px 20px; border-radius: 8px; border-left: 3px solid #0ea5e9;">
+                                            <div style="font-size: 11px; color: #666;">Score</div>
+                                            <!-- FIX: Use real max, not 100 -->
+                                            <div style="font-size: 20px; font-weight: 700; color: #0ea5e9;">
+                                                <?php echo number_format($h_proj_score, 2); ?>/<?php echo $h_proj_total_max; ?>
+                                            </div>
+                                            <div style="font-size: 11px; color: #888;">
+                                                Passing: <?php echo $h_proj_pass_pct; ?>%
+                                            </div>
+                                        </div>
+                                        <!-- FIX: Pass/fail uses real threshold -->
+                                        <?php if ($h_proj_is_passed): ?>
+                                            <span style="background: #28a745; color: white; padding: 6px 16px; border-radius: 50px; font-size: 13px;">
+                                                <i class="fas fa-check-circle"></i> PASSED
+                                            </span>
+                                        <?php else: ?>
+                                            <span style="background: #dc3545; color: white; padding: 6px 16px; border-radius: 50px; font-size: 13px;">
+                                                <i class="fas fa-times-circle"></i> FAILED
+                                            </span>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                            <?php endif; ?>
                             
                             <?php if ($program['assessment_done'] && $program['assessment_passed'] && $program['has_feedback']): ?>
-                                <!-- FIX: Only show certificate if feedback is also submitted -->
                                 <div style="margin-top: 15px;">
                                     <button class="certificate-btn view-certificate-btn" onclick="location.href='feedback_certificate.php?generate_certificate=1&program_id=<?php echo $program['program_id']; ?>'">
                                         <i class="fas fa-certificate"></i> View Certificate
@@ -1584,7 +1631,6 @@ function formatDateTime($dateTimeStr) {
                                 </div>
 
                             <?php elseif ($program['assessment_done'] && $program['assessment_passed'] && !$program['has_feedback']): ?>
-                                <!-- FIX: Show feedback button in history if not yet submitted -->
                                 <div class="feedback-required-section" style="margin-top: 15px;">
                                     <div class="feedback-title">
                                         <i class="fas fa-comment-dots"></i> Feedback Required
