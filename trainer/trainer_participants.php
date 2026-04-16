@@ -21,7 +21,6 @@ require_once __DIR__ . '/../db.php';
 // DB FUNCTIONS
 // ============================================================
 
-// Function to check if user has feedback for a program
 function hasUserFeedback($conn, $user_id, $program_id) {
     $s = $conn->prepare("SELECT COUNT(*) as count FROM feedback WHERE user_id = ? AND program_id = ?");
     $s->bind_param("si", $user_id, $program_id);
@@ -43,17 +42,13 @@ function getTrainerProgram($conn, $trainer_name) {
     return $program;
 }
 
-// FIXED: Certified count now matches the certified filter criteria
 function getTraineeCountsByStatus($conn, $program_id) {
     $out = ['total'=>0, 'ongoing'=>0, 'certified'=>0, 'failed'=>0, 'dropout'=>0, 'pending_feedback'=>0];
     
-    // Total (all non-rejected)
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND e.enrollment_status!='rejected'");
     $s->bind_param("i", $program_id); $s->execute();
     $out['total'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // FIXED: Certified - Count trainees who are passed/certified AND have submitted feedback
-    // This matches the certified filter criteria
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e 
                         WHERE e.program_id=? 
                         AND (e.assessment='Passed' OR e.enrollment_status='certified')
@@ -61,24 +56,20 @@ function getTraineeCountsByStatus($conn, $program_id) {
     $s->bind_param("i", $program_id); $s->execute();
     $out['certified'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Pending Feedback - Trainees who passed but haven't submitted feedback yet
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND (e.assessment='Passed' OR e.enrollment_status='certified') AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = e.user_id AND f.program_id = e.program_id)");
     $s->bind_param("i", $program_id); $s->execute();
     $out['pending_feedback'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Ongoing - All approved trainees who are not passed/certified/failed
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e 
                         WHERE e.program_id=? AND e.enrollment_status='approved' 
                         AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))");
     $s->bind_param("i", $program_id); $s->execute();
     $out['ongoing'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Failed
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND e.assessment='Failed' AND e.enrollment_status!='rejected'");
     $s->bind_param("i", $program_id); $s->execute();
     $out['failed'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
     
-    // Dropout
     $s = $conn->prepare("SELECT COUNT(DISTINCT e.user_id) c FROM enrollments e WHERE e.program_id=? AND e.enrollment_status='rejected'");
     $s->bind_param("i", $program_id); $s->execute();
     $out['dropout'] = $s->get_result()->fetch_assoc()['c'] ?? 0;
@@ -104,7 +95,6 @@ function getCurrentProgramDay($s) {
     return $sd->diff($t)->days+1;
 }
 
-// FIXED: Get trainees with consistent status display
 function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
     $today = date('Y-m-d');
     $q = "SELECT e.id as enrollment_id, e.applied_at, e.enrollment_status, e.attendance, e.assessment, e.failure_notes,
@@ -120,15 +110,12 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
           JOIN programs p ON e.program_id = p.id
           WHERE e.program_id = ?";
     
-    // FIXED: Filter conditions to match the status definitions
     if ($filter === 'ongoing') {
-        // Regular ongoing trainees (not passed/certified/failed) + pending feedback trainees
         $q .= " AND ((e.enrollment_status='approved' 
                 AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed')))
                 OR ((e.assessment='Passed' OR e.enrollment_status='certified') 
                 AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id)))";
     } elseif ($filter === 'certified') {
-        // FIXED: Only show as certified if they have feedback AND are passed/certified
         $q .= " AND (e.assessment='Passed' OR e.enrollment_status='certified')";
         $q .= " AND EXISTS (SELECT 1 FROM feedback f WHERE f.user_id = t.user_id AND f.program_id = p.id)";
     } elseif ($filter === 'failed') {
@@ -152,7 +139,6 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
     foreach ($rows as &$r) {
         $r['total_days'] = calculateProgramDuration($r['scheduleStart'], $r['scheduleEnd'], $r['duration'], $r['durationUnit']);
         
-        // FIXED: Determine the correct status display
         if ($r['enrollment_status'] === 'rejected') {
             $r['status_display'] = 'dropout';
             $r['status_text'] = 'Dropout';
@@ -173,12 +159,10 @@ function getTraineesByTrainerProgram($conn, $program_id, $filter='ongoing') {
             $r['status_text'] = 'Ongoing';
         }
         
-        // Set assessment display
         if (!isset($r['assessment_display'])) {
             $r['assessment_display'] = $r['assessment'] ?? 'Not yet graded';
         }
         
-        // Set assessment class
         if (!isset($r['assessment_class'])) {
             if ($r['assessment'] === 'Passed' || $r['enrollment_status'] === 'certified') {
                 $r['assessment_class'] = 'assessment-passed';
@@ -209,24 +193,17 @@ function recalculateAttendancePercentage($conn, $eid) {
     return $pct;
 }
 
-/**
- * Mark attendance for ONE enrollment on ONE date.
- * Returns false (and does NOT insert) if a record for that date already exists.
- */
 function markDailyAttendance($conn, $eid, $date, $status, $marked_by) {
-    // Guard: ineligible statuses
     $g=$conn->prepare("SELECT assessment,enrollment_status FROM enrollments WHERE id=?");
     $g->bind_param("i",$eid); $g->execute();
     $e=$g->get_result()->fetch_assoc();
     if (!$e) return false;
     if (in_array($e['enrollment_status'],['certified','rejected']) || in_array($e['assessment'],['Passed','Failed'])) return false;
 
-    // Guard: already marked today — NEVER overwrite
     $ck=$conn->prepare("SELECT id FROM attendance_records WHERE enrollment_id=? AND attendance_date=? LIMIT 1");
     $ck->bind_param("is",$eid,$date); $ck->execute();
-    if ($ck->get_result()->num_rows>0) return false; // already marked, skip silently
+    if ($ck->get_result()->num_rows>0) return false;
 
-    // Insert
     $ins=$conn->prepare("INSERT INTO attendance_records (enrollment_id,attendance_date,status,marked_by,created_at) VALUES (?,?,?,?,NOW())");
     $ins->bind_param("isss",$eid,$date,$status,$marked_by);
     $ok=$ins->execute();
@@ -239,7 +216,6 @@ function markAllTraineesAttendanceToday($conn, $program_id, $status, $marked_by,
     if (!isTodayWithinProgramSchedule($schedStart,$schedEnd)) return ['success_count'=>0,'error_count'=>0,'message'=>'Outside program schedule'];
     if (!hasProgramStarted($schedStart))                      return ['success_count'=>0,'error_count'=>0,'message'=>'Program has not started yet'];
 
-    // Unmarked ongoing only
     $s=$conn->prepare("SELECT e.id as eid FROM enrollments e LEFT JOIN attendance_records ar ON e.id=ar.enrollment_id AND ar.attendance_date=? 
                        WHERE e.program_id=? AND e.enrollment_status='approved' 
                        AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
@@ -247,7 +223,6 @@ function markAllTraineesAttendanceToday($conn, $program_id, $status, $marked_by,
     $s->bind_param("si",$today,$program_id); $s->execute();
     $rows=$s->get_result()->fetch_all(MYSQLI_ASSOC);
 
-    // Count already-marked ongoing
     $sk=$conn->prepare("SELECT COUNT(*) c FROM enrollments e JOIN attendance_records ar ON e.id=ar.enrollment_id 
                         WHERE e.program_id=? AND e.enrollment_status='approved' 
                         AND (e.assessment IS NULL OR e.assessment='' OR e.assessment='Not yet graded' OR e.assessment='Pending' OR e.assessment NOT IN ('Passed','Failed'))
@@ -269,7 +244,6 @@ function updateTraineeAssessment($conn, $eid, $assessment, $failure_notes=null) 
     $uid=$e['user_id'];
     $pid=$e['program_id'];
     
-    // Check if user has feedback when trying to mark as Passed/Certified
     if ($assessment === 'Passed') {
         $hasFeedback = hasUserFeedback($conn, $uid, $pid);
         if (!$hasFeedback) {
@@ -317,28 +291,17 @@ function markAllTraineesPassed($conn, $program_id, $marked_by) {
     $s->bind_param("i", $program_id); $s->execute();
     $rows = $s->get_result()->fetch_all(MYSQLI_ASSOC);
     
-    $ok = 0;
-    $err = 0;
-    $skipped = 0;
+    $ok = 0; $err = 0; $skipped = 0;
     
     foreach ($rows as $r) { 
-        // Check if user has feedback before marking as passed
         if (hasUserFeedback($conn, $r['user_id'], $program_id)) {
-            if (updateTraineeAssessment($conn, $r['eid'], 'Passed', null)) {
-                $ok++; 
-            } else {
-                $err++;
-            }
+            if (updateTraineeAssessment($conn, $r['eid'], 'Passed', null)) { $ok++; } else { $err++; }
         } else {
             $skipped++;
         }
     }
     
-    return [
-        'success_count' => $ok, 
-        'error_count' => $err,
-        'skipped_count' => $skipped
-    ];
+    return ['success_count' => $ok, 'error_count' => $err, 'skipped_count' => $skipped];
 }
 
 function markTraineeAsDropout($conn, $eid, $reason, $marked_by) {
@@ -394,7 +357,6 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['ajax'])) {
         if (!isTodayWithinProgramSchedule($e['scheduleStart'],$e['scheduleEnd'])) { echo json_encode(['success'=>false,'message'=>'Today is outside program schedule.']); exit; }
         if (hasProgramEnded($e['scheduleEnd']))           { echo json_encode(['success'=>false,'message'=>'Program has already ended.']); exit; }
 
-        // Check if already marked — return special flag
         $ck=$conn->prepare("SELECT id,status FROM attendance_records WHERE enrollment_id=? AND attendance_date=? LIMIT 1");
         $ck->bind_param("is",$eid,$today); $ck->execute();
         $existing=$ck->get_result()->fetch_assoc();
@@ -481,8 +443,10 @@ foreach ($trainees as $tr) {
     else                                                 $unmarked_count++;
 }
 
-// Check if bulk comprehensive button should be disabled
 $bulk_comprehensive_disabled = !$program_started || $program_ended;
+
+// ── FIX: Block all action buttons when program has not started ──
+$actions_blocked = !$program_started;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -547,14 +511,11 @@ tbody tr:hover{background:#f8f9fa;}
 .assessment-passed{background:#d4edda;color:#155724;}
 .assessment-failed{background:#f8d7da;color:#721c24;}
 .assessment-pending{background:#fff3cd;color:#856404;}
-
-/* TODAY'S STATUS badge */
 .att-badge{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:700;}
 .att-badge.present{background:#d1fae5;color:#065f46;border:1.5px solid #6ee7b7;}
 .att-badge.absent{background:#fee2e2;color:#7f1d1d;border:1.5px solid #fca5a5;}
 .att-badge.unmarked{background:#f3f4f6;color:#6b7280;border:1.5px solid #d1d5db;}
 .att-badge.certified{background:#d4edda;color:#155724;border:1.5px solid #a3d8a3;}
-
 .progress-bar{width:100%;height:8px;background:#e0e0e0;border-radius:10px;overflow:hidden;}
 .progress-fill{height:100%;background:linear-gradient(90deg,#4A90E2,#357ABD);border-radius:10px;transition:width .3s;}
 .progress-text{font-size:12px;color:#666;margin-top:4px;font-weight:500;}
@@ -565,75 +526,24 @@ tbody tr:hover{background:#f8f9fa;}
 .btn-warning{background:#ffc107;color:#212529;} .btn-warning:hover{background:#e0a800;}
 .btn-outline{background:transparent;border:1px solid #4A90E2;color:#4A90E2;} .btn-outline:hover{background:#4A90E2;color:#fff;}
 .btn:disabled,.btn.disabled{opacity:.45;cursor:not-allowed !important;pointer-events:none;}
-
-/* ATTENDANCE ACTION BUTTONS */
 .attendance-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
-
-.att-btn{
-    display:inline-flex;align-items:center;gap:5px;
-    padding:6px 13px;border:none;border-radius:5px;
-    font-size:12px;font-weight:700;cursor:pointer;
-    transition:all .18s;
-}
-
-/* Default (unmarked) states */
+.att-btn{display:inline-flex;align-items:center;gap:5px;padding:6px 13px;border:none;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;transition:all .18s;}
 .att-btn.present{background:#d1fae5;color:#065f46;border:1.5px solid #6ee7b7;}
 .att-btn.absent {background:#fee2e2;color:#7f1d1d;border:1.5px solid #fca5a5;}
 .att-btn.present:hover:not(:disabled):not(.locked){background:#a7f3d0;}
 .att-btn.absent:hover:not(:disabled):not(.locked) {background:#fecaca;}
-
-/* ACTIVE = recorded status */
 .att-btn.present.active{background:#059669;color:#fff;border-color:#047857;}
 .att-btn.absent.active {background:#dc2626;color:#fff;border-color:#b91c1c;}
-
-/* LOCKED - attendance already saved for today */
-.att-btn.locked {
-    pointer-events: none !important;
-    cursor: default !important;
-    opacity: 0.65;
-}
-
-.att-btn.locked:not(.active) {
-    opacity: 0.35;
-    filter: grayscale(80%);
-}
-
-.att-btn.locked.active {
-    opacity: 1;
-    filter: none;
-    box-shadow: 0 0 0 2px rgba(74, 144, 226, 0.3);
-}
-
-/* Disabled buttons shouldn't show pointer */
-.att-btn:disabled {
-    cursor: not-allowed !important;
-    opacity: 0.65;
-}
-
-/* Label shown below buttons after locking */
-.lock-label {
-    display: block;
-    font-size: 10.5px;
-    color: #9ca3af;
-    margin-top: 6px;
-    font-style: italic;
-    line-height: 1.3;
-    background: #f3f4f6;
-    padding: 2px 8px;
-    border-radius: 4px;
-    text-align: center;
-}
-
-.lock-label i {
-    margin-right: 3px;
-    font-size: 9px;
-}
-
+.att-btn.locked{pointer-events:none !important;cursor:default !important;opacity:0.65;}
+.att-btn.locked:not(.active){opacity:0.35;filter:grayscale(80%);}
+.att-btn.locked.active{opacity:1;filter:none;box-shadow:0 0 0 2px rgba(74,144,226,0.3);}
+.att-btn:disabled{cursor:not-allowed !important;opacity:0.65;}
+.lock-label{display:block;font-size:10.5px;color:#9ca3af;margin-top:6px;font-style:italic;line-height:1.3;background:#f3f4f6;padding:2px 8px;border-radius:4px;text-align:center;}
+.lock-label i{margin-right:3px;font-size:9px;}
 .attendance-summary{display:flex;gap:15px;margin-top:10px;flex-wrap:wrap;}
 .summary-item{padding:10px 15px;border-radius:8px;background:#f8f9fa;min-width:120px;text-align:center;}
 .summary-label{font-size:12px;color:#6b7280;margin-bottom:4px;}
 .summary-value{font-size:18px;font-weight:700;color:#1f2937;}
-
 .modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;padding:20px;}
 .modal-content{background:#fff;padding:30px;border-radius:12px;max-width:600px;width:100%;max-height:90vh;overflow-y:auto;}
 .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:15px;border-bottom:2px solid #e0e0e0;}
@@ -645,524 +555,56 @@ tbody tr:hover{background:#f8f9fa;}
 .detail-value{color:#333;font-size:15px;}
 .empty-state{text-align:center;padding:60px 20px;color:#999;}
 .empty-state i{font-size:48px;margin-bottom:16px;color:#ddd;}
-@media(max-width:768px){.main-container{flex-direction:column;}.sidebar{width:100%;min-height:auto;display:flex;overflow-x:auto;}.sidebar-btn{flex:1;margin-bottom:0;margin-right:8px;}.main-content{padding:16px;}}
+.btn-bulk{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:10px 20px;border:none;border-radius:8px;font-weight:600;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:all 0.3s;text-decoration:none;font-size:14px;}
+.btn-bulk:hover:not(.disabled){transform:translateY(-2px);box-shadow:0 5px 15px rgba(102,126,234,0.4);}
+.btn-bulk.disabled{opacity:0.5;cursor:not-allowed;pointer-events:none;}
+.btn-bulk i{font-size:16px;}
+.feedback-required{background:#cff3ff;color:#0369a1;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;margin-left:5px;}
 
-/* Bulk Assessment Button Styles */
-.btn-bulk {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    padding: 10px 20px;
-    border: none;
-    border-radius: 8px;
-    font-weight: 600;
-    display: inline-flex;
+/* ── NOT-STARTED OVERLAY BANNER ─────────────────────────── */
+.not-started-notice {
+    display: flex;
     align-items: center;
-    gap: 8px;
-    cursor: pointer;
-    transition: all 0.3s;
-    text-decoration: none;
-    font-size: 14px;
+    gap: 10px;
+    background: #fff8e1;
+    border: 1.5px solid #f59e0b;
+    color: #92400e;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 12px;
 }
-.btn-bulk:hover:not(.disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 5px 15px rgba(102,126,234,0.4);
+.not-started-notice i { color: #f59e0b; font-size: 16px; }
+
+/* ── BLOCKED BUTTON TOOLTIP WRAPPER ─────────────────────── */
+.btn-blocked-wrap {
+    position: relative;
+    display: inline-flex;
 }
-.btn-bulk.disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+.btn-blocked-wrap .blocked-tip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1f2937;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 5px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+    z-index: 99;
     pointer-events: none;
 }
-.btn-bulk i {
-    font-size: 16px;
-}
+.btn-blocked-wrap:hover .blocked-tip { display: block; }
 
-/* Feedback Required Badge */
-.feedback-required {
-    background: #cff3ff;
-    color: #0369a1;
-    padding: 2px 8px;
-    border-radius: 12px;
-    font-size: 10px;
-    font-weight: 600;
-    margin-left: 5px;
-}
-
-/* Mobile View Styles - Add to existing CSS */
-
-/* Tablet and Mobile Breakpoints */
-@media (max-width: 1024px) {
-    .main-container {
-        flex-direction: column;
-    }
-    
-    .sidebar {
-        width: 100%;
-        min-height: auto;
-        display: flex;
-        overflow-x: auto;
-        padding: 12px;
-        gap: 8px;
-        position: sticky;
-        top: 0;
-        z-index: 20;
-        background: #344152;
-    }
-    
-    .sidebar-btn {
-        flex: 0 0 auto;
-        width: auto;
-        margin-bottom: 0;
-        white-space: nowrap;
-        padding: 10px 16px;
-    }
-    
-    .main-content {
-        padding: 16px;
-        overflow-x: auto;
-    }
-}
-
-@media (max-width: 768px) {
-    /* Header adjustments */
-    .header {
-        padding: 0 12px;
-    }
-    
-    .system-name {
-        font-size: 13px;
-        white-space: normal;
-        line-height: 1.3;
-        max-width: 140px;
-    }
-    
-    .logo {
-        width: 32px;
-        height: 32px;
-    }
-    
-    .profile-btn span {
-        display: none;
-    }
-    
-    .profile-btn i:first-child {
-        font-size: 20px;
-    }
-    
-    .profile-btn {
-        padding: 8px 10px;
-    }
-    
-    /* Page Header */
-    .page-header {
-        padding: 12px 16px;
-        margin-bottom: 16px;
-    }
-    
-    .page-title {
-        font-size: 20px;
-    }
-    
-    .attendance-summary {
-        gap: 10px;
-        margin-top: 12px;
-    }
-    
-    .summary-item {
-        padding: 6px 10px;
-        min-width: 90px;
-    }
-    
-    .summary-value {
-        font-size: 14px;
-    }
-    
-    .summary-label {
-        font-size: 10px;
-    }
-    
-    /* Status Banners */
-    .status-banner, .today-banner {
-        padding: 10px 16px;
-        font-size: 13px;
-        margin-bottom: 16px;
-        flex-wrap: wrap;
-        text-align: center;
-    }
-    
-    .status-banner i, .today-banner i {
-        font-size: 14px;
-    }
-    
-    /* Filter Container */
-    .filter-container {
-        padding: 12px 16px;
-        flex-direction: column;
-        align-items: stretch;
-        gap: 12px;
-        margin-bottom: 16px;
-    }
-    
-    .filter-group {
-        flex-wrap: wrap;
-        justify-content: center;
-    }
-    
-    .filter-label {
-        font-size: 12px;
-        width: 100%;
-        text-align: center;
-        margin-bottom: 6px;
-    }
-    
-    .filter-btn {
-        padding: 6px 12px;
-        font-size: 12px;
-        flex: 1;
-        text-align: center;
-    }
-    
-    /* Quick Actions */
-    .filter-group:last-child .btn,
-    .filter-group:last-child .btn-bulk {
-        font-size: 12px;
-        padding: 8px 12px;
-        width: 100%;
-        justify-content: center;
-    }
-    
-    .btn-bulk {
-        font-size: 12px;
-        padding: 8px 12px;
-    }
-    
-    /* Table Card */
-    .table-card {
-        border-radius: 12px;
-        overflow-x: auto;
-    }
-    
-    .table-header {
-        padding: 12px 16px;
-        font-size: 14px;
-    }
-    
-    .table-header span {
-        display: block;
-        margin-top: 4px;
-        margin-left: 0 !important;
-        font-size: 12px;
-    }
-    
-    .table-container {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-    }
-    
-    table {
-        min-width: 700px;
-    }
-    
-    th, td {
-        padding: 10px 12px;
-        font-size: 12px;
-    }
-    
-    th {
-        font-size: 11px;
-        white-space: nowrap;
-    }
-    
-    /* Status Badges */
-    .status-badge {
-        padding: 3px 8px;
-        font-size: 10px;
-        white-space: nowrap;
-    }
-    
-    .assessment-badge {
-        padding: 3px 8px;
-        font-size: 10px;
-    }
-    
-    .att-badge {
-        padding: 4px 8px;
-        font-size: 10px;
-        white-space: nowrap;
-    }
-    
-    /* Attendance Buttons */
-    .attendance-actions {
-        flex-direction: column;
-        gap: 6px;
-    }
-    
-    .att-btn {
-        padding: 5px 10px;
-        font-size: 11px;
-        width: 100%;
-        justify-content: center;
-    }
-    
-    .lock-label {
-        font-size: 9px;
-        margin-top: 4px;
-    }
-    
-    /* Action Buttons in Table */
-    td:last-child div {
-        flex-direction: column;
-        gap: 6px;
-    }
-    
-    td:last-child .btn {
-        padding: 5px 8px;
-        font-size: 10px;
-        width: 100%;
-        justify-content: center;
-    }
-    
-    /* Progress Bar */
-    .progress-bar {
-        height: 6px;
-    }
-    
-    .progress-text {
-        font-size: 10px;
-    }
-    
-    /* Modal for Mobile */
-    .modal-content {
-        padding: 20px;
-        max-width: 95%;
-        margin: 16px;
-    }
-    
-    .modal-header h3 {
-        font-size: 18px;
-    }
-    
-    .detail-label {
-        font-size: 12px;
-    }
-    
-    .detail-value {
-        font-size: 13px;
-    }
-    
-    .detail-row {
-        margin-bottom: 12px;
-        padding-bottom: 10px;
-    }
-    
-    /* Empty State */
-    .empty-state {
-        padding: 40px 16px;
-    }
-    
-    .empty-state i {
-        font-size: 36px;
-    }
-    
-    .empty-state h3 {
-        font-size: 16px;
-    }
-    
-    .empty-state p {
-        font-size: 13px;
-    }
-}
-
-@media (max-width: 480px) {
-    /* Extra small devices */
-    .header {
-        height: 55px;
-    }
-    
-    .system-name {
-        font-size: 11px;
-        max-width: 110px;
-    }
-    
-    .logo {
-        width: 28px;
-        height: 28px;
-    }
-    
-    .main-content {
-        padding: 12px;
-    }
-    
-    .page-header {
-        padding: 10px 12px;
-    }
-    
-    .page-title {
-        font-size: 18px;
-    }
-    
-    .attendance-summary {
-        flex-wrap: wrap;
-        gap: 8px;
-    }
-    
-    .summary-item {
-        min-width: calc(50% - 8px);
-        flex: 1;
-        padding: 8px;
-    }
-    
-    .filter-btn {
-        padding: 5px 10px;
-        font-size: 11px;
-    }
-    
-    .filter-group {
-        gap: 6px;
-    }
-    
-    .table-header {
-        padding: 10px 12px;
-        font-size: 13px;
-    }
-    
-    th, td {
-        padding: 8px 10px;
-        font-size: 11px;
-    }
-    
-    .status-banner, .today-banner {
-        padding: 8px 12px;
-        font-size: 12px;
-    }
-    
-    .btn-bulk, .btn {
-        font-size: 11px;
-        padding: 6px 10px;
-    }
-    
-    .modal-content {
-        padding: 16px;
-        max-height: 85vh;
-    }
-    
-    .modal-header {
-        margin-bottom: 12px;
-        padding-bottom: 10px;
-    }
-}
-
-/* Landscape mode on mobile */
-@media (max-width: 768px) and (orientation: landscape) {
-    .sidebar {
-        overflow-x: auto;
-        padding: 8px;
-    }
-    
-    .sidebar-btn {
-        padding: 8px 12px;
-        font-size: 12px;
-    }
-    
-    .main-content {
-        padding: 12px;
-    }
-    
-    .table-container {
-        max-height: 400px;
-    }
-}
-
-/* Touch-friendly adjustments */
-@media (hover: none) and (max-width: 768px) {
-    .sidebar-btn, 
-    .filter-btn, 
-    .btn, 
-    .att-btn,
-    .dropdown-item {
-        min-height: 44px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    
-    .sidebar-btn {
-        min-height: 44px;
-    }
-    
-    .att-btn {
-        min-height: 36px;
-    }
-    
-    /* Improve tap targets */
-    button, 
-    .btn, 
-    .att-btn,
-    .filter-btn {
-        cursor: pointer;
-        -webkit-tap-highlight-color: transparent;
-    }
-}
-
-/* Improve scrolling on tables */
-@media (max-width: 768px) {
-    .table-container {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-        scrollbar-width: thin;
-    }
-    
-    table {
-        width: 100%;
-        min-width: 680px;
-    }
-    
-    /* Sticky first column for better mobile UX (optional) */
-    th:first-child,
-    td:first-child {
-        position: sticky;
-        left: 0;
-        background: white;
-        z-index: 5;
-        box-shadow: 2px 0 5px -2px rgba(0,0,0,0.1);
-    }
-    
-    thead th:first-child {
-        background: #f8f9fa;
-        z-index: 10;
-    }
-    
-    tbody tr:hover td:first-child {
-        background: #f8f9fa;
-    }
-}
-
-/* Compact mode for very small screens */
-@media (max-width: 380px) {
-    .filter-btn {
-        font-size: 10px;
-        padding: 4px 8px;
-    }
-    
-    .btn, .btn-bulk {
-        font-size: 10px;
-        padding: 5px 8px;
-    }
-    
-    .summary-value {
-        font-size: 12px;
-    }
-    
-    .att-badge {
-        font-size: 9px;
-        padding: 3px 6px;
-    }
-    
-    .status-badge {
-        font-size: 9px;
-        padding: 2px 6px;
-    }
-}
-
+@media(max-width:768px){.main-container{flex-direction:column;}.sidebar{width:100%;min-height:auto;display:flex;overflow-x:auto;}.sidebar-btn{flex:1;margin-bottom:0;margin-right:8px;}.main-content{padding:16px;}}
+@media (max-width: 1024px) {.main-container{flex-direction:column;}.sidebar{width:100%;min-height:auto;display:flex;overflow-x:auto;padding:12px;gap:8px;position:sticky;top:0;z-index:20;background:#344152;}.sidebar-btn{flex:0 0 auto;width:auto;margin-bottom:0;white-space:nowrap;padding:10px 16px;}.main-content{padding:16px;overflow-x:auto;}}
+@media (max-width: 768px) {.header{padding:0 12px;}.system-name{font-size:13px;white-space:normal;line-height:1.3;max-width:140px;}.logo{width:32px;height:32px;}.profile-btn span{display:none;}.profile-btn i:first-child{font-size:20px;}.profile-btn{padding:8px 10px;}.page-header{padding:12px 16px;margin-bottom:16px;}.page-title{font-size:20px;}.attendance-summary{gap:10px;margin-top:12px;}.summary-item{padding:6px 10px;min-width:90px;}.summary-value{font-size:14px;}.summary-label{font-size:10px;}.status-banner,.today-banner{padding:10px 16px;font-size:13px;margin-bottom:16px;flex-wrap:wrap;text-align:center;}.filter-container{padding:12px 16px;flex-direction:column;align-items:stretch;gap:12px;margin-bottom:16px;}.filter-group{flex-wrap:wrap;justify-content:center;}.filter-label{font-size:12px;width:100%;text-align:center;margin-bottom:6px;}.filter-btn{padding:6px 12px;font-size:12px;flex:1;text-align:center;}.table-card{border-radius:12px;overflow-x:auto;}.table-header{padding:12px 16px;font-size:14px;}.table-container{overflow-x:auto;-webkit-overflow-scrolling:touch;}table{min-width:700px;}th,td{padding:10px 12px;font-size:12px;}th{font-size:11px;white-space:nowrap;}.status-badge{padding:3px 8px;font-size:10px;white-space:nowrap;}.assessment-badge{padding:3px 8px;font-size:10px;}.att-badge{padding:4px 8px;font-size:10px;white-space:nowrap;}.attendance-actions{flex-direction:column;gap:6px;}.att-btn{padding:5px 10px;font-size:11px;width:100%;justify-content:center;}.lock-label{font-size:9px;margin-top:4px;}.modal-content{padding:20px;max-width:95%;margin:16px;}.modal-header h3{font-size:18px;}.detail-label{font-size:12px;}.detail-value{font-size:13px;}.detail-row{margin-bottom:12px;padding-bottom:10px;}.empty-state{padding:40px 16px;}.empty-state i{font-size:36px;}}
+@media (max-width: 480px) {.main-content{padding:12px;}.page-header{padding:10px 12px;}.page-title{font-size:18px;}.attendance-summary{flex-wrap:wrap;gap:8px;}.summary-item{min-width:calc(50% - 8px);flex:1;padding:8px;}.filter-btn{padding:5px 10px;font-size:11px;}.filter-group{gap:6px;}.table-header{padding:10px 12px;font-size:13px;}th,td{padding:8px 10px;font-size:11px;}.status-banner,.today-banner{padding:8px 12px;font-size:12px;}.modal-content{padding:16px;max-height:85vh;}.modal-header{margin-bottom:12px;padding-bottom:10px;}}
+@media (max-width: 768px) {.table-container{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:thin;}table{width:100%;min-width:680px;}th:first-child,td:first-child{position:sticky;left:0;background:white;z-index:5;box-shadow:2px 0 5px -2px rgba(0,0,0,0.1);}thead th:first-child{background:#f8f9fa;z-index:10;}tbody tr:hover td:first-child{background:#f8f9fa;}}
 </style>
 </head>
 <body>
@@ -1190,7 +632,7 @@ tbody tr:hover{background:#f8f9fa;}
 <div class="main-container">
   <aside class="sidebar">
     <a href="/trainer/dashboard" class="sidebar-btn"><i class="fas fa-home"></i> Dashboard</a>
-    <a href="/trainer/trainer_participants"  class="sidebar-btn active"><i class="fas fa-users"></i> Trainer Participants</a>
+    <a href="/trainer/trainer_participants" class="sidebar-btn active"><i class="fas fa-users"></i> Trainer Participants</a>
   </aside>
 
   <main class="main-content">
@@ -1226,6 +668,14 @@ tbody tr:hover{background:#f8f9fa;}
       <?php endif; ?>
     </div>
 
+    <?php if ($actions_blocked): ?>
+    <div class="not-started-notice">
+      <i class="fas fa-lock"></i>
+      All attendance, assessment, and dropout actions are locked until the program starts on
+      <strong style="margin-left:4px;"><?= (new DateTime($trainer_program['scheduleStart']))->format('F j, Y') ?></strong>.
+    </div>
+    <?php endif; ?>
+
     <div class="filter-container">
       <div class="filter-group">
         <span class="filter-label">Status:</span>
@@ -1236,15 +686,21 @@ tbody tr:hover{background:#f8f9fa;}
       </div>
       <div class="filter-group">
         <span class="filter-label">Quick Actions:</span>
-        <button class="btn btn-success" onclick="bulkAttendance('present')" <?= (!$program_started||$program_ended||!$within_schedule)?'disabled':'' ?>>
+
+        <!-- Mark All Present — blocked if not started, not in schedule, or ended -->
+        <button class="btn btn-success" onclick="bulkAttendance('present')"
+          <?= (!$program_started||$program_ended||!$within_schedule)?'disabled title="'.(!$program_started?'Program has not started yet':($program_ended?'Program has ended':'Outside schedule')).'"':'' ?>>
           <i class="fas fa-check-circle"></i> Mark All Present</button>
-        <button class="btn btn-danger"  onclick="bulkAttendance('absent')"  <?= (!$program_started||$program_ended||!$within_schedule)?'disabled':'' ?>>
+
+        <!-- Mark All Absent — same guard -->
+        <button class="btn btn-danger" onclick="bulkAttendance('absent')"
+          <?= (!$program_started||$program_ended||!$within_schedule)?'disabled title="'.(!$program_started?'Program has not started yet':($program_ended?'Program has ended':'Outside schedule')).'"':'' ?>>
           <i class="fas fa-times-circle"></i> Mark All Absent</button>
-        
-        <!-- Bulk Assessment - Disabled if program hasn't started -->
-        <a href="<?= $bulk_comprehensive_disabled ? 'javascript:void(0)' : 'bulk_comprehensive_assessment.php?program_id=' . $program_id . '&tab=practical' ?>" 
+
+        <!-- Bulk Comprehensive Assessment — blocked if not started or ended -->
+        <a href="<?= $bulk_comprehensive_disabled ? 'javascript:void(0)' : 'bulk_comprehensive_assessment.php?program_id=' . $program_id . '&tab=practical' ?>"
            class="btn-bulk <?= $bulk_comprehensive_disabled ? 'disabled' : '' ?>"
-           onclick="<?= $bulk_comprehensive_disabled ? 'showDisabledAlert()' : '' ?>">
+           onclick="<?= $bulk_comprehensive_disabled ? 'showDisabledAlert(); return false;' : '' ?>">
           <i class="fas fa-users-cog"></i> Bulk Comprehensive Assessment
         </a>
       </div>
@@ -1271,33 +727,32 @@ tbody tr:hover{background:#f8f9fa;}
             $total_d    = $tr['total_days']??1;
             $pct        = $tr['attendance']??0;
 
-            // Use pre-calculated status from getTraineesByTrainerProgram
             $st = $tr['status_display'];
             $status_display_text = $tr['status_text'];
-            
-            // Use pre-calculated assessment display
             $ass_display = $tr['assessment_display'] ?? ($tr['assessment'] ?? 'Not yet graded');
             $ass_cls = $tr['assessment_class'] ?? 'assessment-not-graded';
 
-            $is_cert = ($st === 'certified');
-            $is_drop = ($st === 'dropout');
-            $is_failed = ($st === 'failed');
-            $is_ongoing = ($st === 'ongoing');
-            $needs_feedback = isset($tr['needs_feedback']) && $tr['needs_feedback'];
+            $is_cert       = ($st === 'certified');
+            $is_drop       = ($st === 'dropout');
+            $is_failed     = ($st === 'failed');
+            $is_ongoing    = ($st === 'ongoing');
+            $needs_feedback= isset($tr['needs_feedback']) && $tr['needs_feedback'];
 
             $today_att  = $tr['today_attendance_status']??null;
             $is_marked  = ($today_att==='present' || $today_att==='absent');
-            $att_disp = $today_att ?? 'unmarked';
+            $att_disp   = $today_att ?? 'unmarked';
 
-            // For certified trainees, today's status should show "Certified"
-            if ($is_cert) {
-                $att_disp = 'certified';
-                $today_att = 'certified';
-            }
+            if ($is_cert) { $att_disp = 'certified'; $today_att = 'certified'; }
 
-            // Can attendance be marked for this trainee at all?
+            // Can attendance be marked — also blocked if program not started
             $can_mark = $program_started && $within_schedule && !$program_ended
                         && !$is_cert && !$is_drop && !$is_failed && !$needs_feedback;
+
+            // ── FIX: Individual action button guards ──
+            // Comprehensive Assessment: needs program started, trainee must be ongoing/not terminal
+            $comp_blocked = $actions_blocked || $is_drop || $is_cert;
+            // Dropout: needs program started, trainee must be active
+            $dropout_blocked = $actions_blocked || $is_drop || $is_cert || $is_failed || $needs_feedback;
           ?>
           <tr id="row-<?= $eid ?>"
               data-eid="<?= $eid ?>"
@@ -1336,7 +791,7 @@ tbody tr:hover{background:#f8f9fa;}
               </span>
              </td>
 
-            <!-- TODAY'S STATUS - Now consistent with certified filter -->
+            <!-- TODAY'S STATUS -->
             <td>
               <span class="att-badge <?= $att_disp ?>" id="attbadge-<?= $eid ?>">
                 <?php if ($today_att==='present'): ?>
@@ -1360,45 +815,37 @@ tbody tr:hover{background:#f8f9fa;}
             <td id="attcell-<?= $eid ?>">
               <?php if ($can_mark): ?>
                 <div class="attendance-actions" id="actions-<?= $eid ?>">
-                  <!-- Present button -->
                   <button
-                    class="att-btn present <?= $is_marked ? 'locked' : ''; ?> <?= ($today_att === 'present') ? 'active' : '' ?>"
+                    class="att-btn present <?= $is_marked ? 'locked' : '' ?> <?= ($today_att==='present') ? 'active' : '' ?>"
                     <?= $is_marked ? 'disabled' : '' ?>
-                    onclick="<?= $is_marked ? '' : "markAtt($eid, 'present')" ?>"
+                    onclick="<?= $is_marked ? '' : "markAtt($eid,'present')" ?>"
                     title="<?= $is_marked ? '🔒 Already marked for today' : 'Mark as Present' ?>">
                     <i class="fas fa-check"></i> Present
                   </button>
-
-                  <!-- Absent button -->
                   <button
-                    class="att-btn absent <?= $is_marked ? 'locked' : ''; ?> <?= ($today_att === 'absent') ? 'active' : '' ?>"
+                    class="att-btn absent <?= $is_marked ? 'locked' : '' ?> <?= ($today_att==='absent') ? 'active' : '' ?>"
                     <?= $is_marked ? 'disabled' : '' ?>
-                    onclick="<?= $is_marked ? '' : "markAtt($eid, 'absent')" ?>"
+                    onclick="<?= $is_marked ? '' : "markAtt($eid,'absent')" ?>"
                     title="<?= $is_marked ? '🔒 Already marked for today' : 'Mark as Absent' ?>">
                     <i class="fas fa-times"></i> Absent
                   </button>
                 </div>
-
                 <?php if ($is_marked): ?>
-                  <span class="lock-label">
-                    <i class="fas fa-lock"></i> 
-                    Marked as <?= ucfirst($today_att) ?>
-                  </span>
+                  <span class="lock-label"><i class="fas fa-lock"></i> Marked as <?= ucfirst($today_att) ?></span>
                 <?php endif; ?>
-
               <?php else: ?>
                 <div style="font-size:11px;color:#9ca3af;">
-                  <?php if ($needs_feedback): ?>
+                  <?php if ($actions_blocked): ?>
+                    <i class="fas fa-lock"></i> Program not started
+                  <?php elseif ($needs_feedback): ?>
                     <i class="fas fa-clock"></i> Awaiting Feedback
-                  <?php elseif ($is_cert):   ?>
+                  <?php elseif ($is_cert): ?>
                     <i class="fas fa-certificate"></i> Certified
-                  <?php elseif ($is_drop):     ?>
+                  <?php elseif ($is_drop): ?>
                     <i class="fas fa-user-times"></i> Dropout
                   <?php elseif ($is_failed): ?>
                     <i class="fas fa-times-circle"></i> Failed
-                  <?php elseif (!$program_started): ?>
-                    <i class="fas fa-clock"></i> Not started
-                  <?php elseif ($program_ended):    ?>
+                  <?php elseif ($program_ended): ?>
                     <i class="fas fa-calendar-times"></i> Ended
                   <?php elseif (!$within_schedule): ?>
                     <i class="fas fa-calendar-day"></i> Off-schedule
@@ -1410,13 +857,51 @@ tbody tr:hover{background:#f8f9fa;}
             <!-- ACTIONS -->
             <td>
               <div style="display:flex;gap:4px;flex-wrap:wrap;">
+
+                <!-- Details — always available -->
                 <button class="btn btn-outline" onclick="viewDetails('<?= $tr['user_id'] ?>',<?= $program_id ?>)">
-                  <i class="fas fa-info-circle"></i> Details</button>
-                <button class="btn btn-warning" onclick="location.href='comprehensive_assessment.php?enrollment_id=<?= $eid ?>&program_id=<?= $program_id ?>'">
-                  <i class="fas fa-clipboard-check"></i>Comprehensive Assessment</button>
-                <button class="btn btn-danger" onclick="doDropout(<?= $eid ?>)"
-                  <?= ($is_drop||$is_cert||$is_failed||$needs_feedback)?'disabled':'' ?>>
-                  <i class="fas fa-user-times"></i> Dropout</button>
+                  <i class="fas fa-info-circle"></i> Details
+                </button>
+
+                <!-- ── FIX: Comprehensive Assessment ── -->
+                <?php if ($comp_blocked): ?>
+                  <div class="btn-blocked-wrap">
+                    <button class="btn btn-warning" disabled style="opacity:.45;cursor:not-allowed;">
+                      <i class="fas fa-clipboard-check"></i> Comprehensive Assessment
+                    </button>
+                    <span class="blocked-tip">
+                      <?= $actions_blocked ? 'Program has not started yet' : ($is_cert ? 'Trainee is already certified' : 'Trainee has dropped out') ?>
+                    </span>
+                  </div>
+                <?php else: ?>
+                  <button class="btn btn-warning"
+                    onclick="location.href='comprehensive_assessment.php?enrollment_id=<?= $eid ?>&program_id=<?= $program_id ?>'">
+                    <i class="fas fa-clipboard-check"></i> Comprehensive Assessment
+                  </button>
+                <?php endif; ?>
+
+                <!-- ── FIX: Dropout ── -->
+                <?php if ($dropout_blocked): ?>
+                  <div class="btn-blocked-wrap">
+                    <button class="btn btn-danger" disabled style="opacity:.45;cursor:not-allowed;">
+                      <i class="fas fa-user-times"></i> Dropout
+                    </button>
+                    <span class="blocked-tip">
+                      <?php
+                        if ($actions_blocked)    echo 'Program has not started yet';
+                        elseif ($is_drop)        echo 'Already marked as dropout';
+                        elseif ($is_cert)        echo 'Trainee is certified';
+                        elseif ($is_failed)      echo 'Trainee has failed';
+                        elseif ($needs_feedback) echo 'Awaiting feedback submission';
+                      ?>
+                    </span>
+                  </div>
+                <?php else: ?>
+                  <button class="btn btn-danger" onclick="doDropout(<?= $eid ?>)">
+                    <i class="fas fa-user-times"></i> Dropout
+                  </button>
+                <?php endif; ?>
+
               </div>
              </td>
            </tr>
@@ -1448,194 +933,115 @@ tbody tr:hover{background:#f8f9fa;}
 
 <script>
 // ── constants from PHP ──────────────────────────────────────
-const PROG_STARTED = <?= $program_started?'true':'false' ?>;
-const PROG_ENDED   = <?= $program_ended  ?'true':'false' ?>;
-const IN_SCHEDULE  = <?= $within_schedule?'true':'false' ?>;
-const PROG_ID      = <?= intval($program_id) ?>;
+const PROG_STARTED    = <?= $program_started  ? 'true' : 'false' ?>;
+const PROG_ENDED      = <?= $program_ended    ? 'true' : 'false' ?>;
+const IN_SCHEDULE     = <?= $within_schedule  ? 'true' : 'false' ?>;
+const PROG_ID         = <?= intval($program_id) ?>;
+const ACTIONS_BLOCKED = <?= $actions_blocked  ? 'true' : 'false' ?>; // ── FIX
 
 // ── init ────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  console.log('DOM loaded - Initializing profile dropdown');
-  
   const btn = document.getElementById('profileBtn');
-  const dd = document.getElementById('profileDropdown');
-  
-  console.log('Profile button:', btn);
-  console.log('Profile dropdown:', dd);
-  
+  const dd  = document.getElementById('profileDropdown');
   if (btn && dd) {
-    // Toggle dropdown when clicking the profile button
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      console.log('Profile button clicked');
-      dd.classList.toggle('show');
-      console.log('Dropdown classes:', dd.className);
-    });
-    
-    // Close dropdown when clicking outside
-    document.addEventListener('click', (e) => { 
-      if (!btn.contains(e.target) && !dd.contains(e.target)) {
-        dd.classList.remove('show'); 
-      }
-    });
-    
-    // Prevent dropdown from closing when clicking inside it
-    dd.addEventListener('click', (e) => {
-      e.stopPropagation();
-    });
-  } else {
-    console.error('Profile button or dropdown not found!');
+    btn.addEventListener('click', e => { e.stopPropagation(); dd.classList.toggle('show'); });
+    document.addEventListener('click', e => { if (!btn.contains(e.target) && !dd.contains(e.target)) dd.classList.remove('show'); });
+    dd.addEventListener('click', e => e.stopPropagation());
   }
 
-  // Logout functionality
   const logoutBtn = document.getElementById('logoutBtn');
   if (logoutBtn) {
-    logoutBtn.addEventListener('click', async (e) => {
+    logoutBtn.addEventListener('click', async e => {
       e.preventDefault();
-      const r = await Swal.fire({
-        title: 'Logout',
-        text: 'Are you sure you want to logout?',
-        icon: 'question',
-        showCancelButton: true,
-        confirmButtonColor: '#dc2626',
-        confirmButtonText: 'Logout',
-        cancelButtonText: 'Cancel'
-      });
-      
-      if (r.isConfirmed) { 
-        try {
-          await fetch('/logout.php', { method: 'POST', credentials: 'same-origin' });
-        } catch(_) {}
-        window.location.href = '/login.php'; 
+      const r = await Swal.fire({ title:'Logout', text:'Are you sure you want to logout?', icon:'question',
+        showCancelButton:true, confirmButtonColor:'#dc2626', confirmButtonText:'Logout', cancelButtonText:'Cancel' });
+      if (r.isConfirmed) {
+        try { await fetch('/logout.php', { method:'POST', credentials:'same-origin' }); } catch(_) {}
+        window.location.href = '/login.php';
       }
     });
   }
-
 });
 
-// Function to show disabled alert for bulk comprehensive
+// ── Disabled alert for bulk comprehensive ───────────────────
 function showDisabledAlert() {
-    Swal.fire({
-        icon: 'info',
-        title: 'Program Not Started',
-        text: 'Bulk comprehensive assessment is only available after the program has started.',
-        confirmButtonColor: '#4A90E2'
-    });
+  Swal.fire({ icon:'info', title: ACTIONS_BLOCKED ? 'Program Not Started' : 'Program Ended',
+    text: ACTIONS_BLOCKED
+      ? 'Bulk comprehensive assessment is only available after the program has started.'
+      : 'Bulk comprehensive assessment is not available after the program has ended.',
+    confirmButtonColor:'#4A90E2' });
 }
 
 // ── helpers ─────────────────────────────────────────────────
 function changeFilter(f) { const p=new URLSearchParams(location.search); p.set('filter',f); location.href='?'+p; }
 
 function schedGuard() {
-  if (!PROG_STARTED) { Swal.fire({icon:'warning',title:'Not Started',text:'Program has not started yet.',timer:2500,showConfirmButton:false}); return false; }
-  if (PROG_ENDED)    { Swal.fire({icon:'warning',title:'Ended',      text:'Program has already ended.',  timer:2500,showConfirmButton:false}); return false; }
-  if (!IN_SCHEDULE)  { Swal.fire({icon:'warning',title:'Off-Schedule',text:'Today is outside program schedule.',timer:2500,showConfirmButton:false}); return false; }
+  // ── FIX: Check not-started first with specific message
+  if (!PROG_STARTED) {
+    Swal.fire({ icon:'warning', title:'Program Not Started',
+      text:'All actions are locked until the program begins.', timer:2500, showConfirmButton:false });
+    return false;
+  }
+  if (PROG_ENDED) {
+    Swal.fire({ icon:'warning', title:'Program Ended', text:'Program has already ended.', timer:2500, showConfirmButton:false });
+    return false;
+  }
+  if (!IN_SCHEDULE) {
+    Swal.fire({ icon:'warning', title:'Off-Schedule', text:'Today is outside program schedule.', timer:2500, showConfirmButton:false });
+    return false;
+  }
   return true;
 }
 
 // ── individual attendance ────────────────────────────────────
 async function markAtt(eid, status) {
-  if (!schedGuard()) return;
+  if (!schedGuard()) return; // covers not-started, ended, off-schedule
 
-  const row       = document.getElementById(`row-${eid}`);
-  const isMarked  = row.getAttribute('data-marked') === 'true';
-  const curStatus = row.getAttribute('data-att-status');
-  const isCert    = row.getAttribute('data-certified') === 'true';
-  const isDrop    = row.getAttribute('data-dropout') === 'true';
-  const isFailed  = row.getAttribute('data-failed') === 'true';
-  const pendingFeedback = row.getAttribute('data-pending-feedback') === 'true';
-  const assess    = row.getAttribute('data-assessment');
+  const row         = document.getElementById(`row-${eid}`);
+  const isMarked    = row.getAttribute('data-marked') === 'true';
+  const curStatus   = row.getAttribute('data-att-status');
+  const isCert      = row.getAttribute('data-certified') === 'true';
+  const isDrop      = row.getAttribute('data-dropout') === 'true';
+  const isFailed    = row.getAttribute('data-failed') === 'true';
+  const pendingFeed = row.getAttribute('data-pending-feedback') === 'true';
 
-  if (isCert) { 
-    Swal.fire({icon:'info', title:'Certified', text:'This trainee is already certified.', timer:2000, showConfirmButton:false}); 
-    return; 
-  }
-  if (isFailed) { 
-    Swal.fire({icon:'info', title:'Failed', text:'This trainee has failed.', timer:2000, showConfirmButton:false}); 
-    return; 
-  }
-  if (isDrop) { 
-    Swal.fire({icon:'info', title:'Dropout', text:'This trainee has dropped out.', timer:2000, showConfirmButton:false}); 
-    return; 
-  }
-  if (pendingFeedback) {
-    Swal.fire({icon:'info', title:'Pending Feedback', text:'This trainee is awaiting feedback submission.', timer:2000, showConfirmButton:false}); 
-    return;
-  }
+  if (isCert)      { Swal.fire({icon:'info',title:'Certified',  text:'This trainee is already certified.',    timer:2000,showConfirmButton:false}); return; }
+  if (isFailed)    { Swal.fire({icon:'info',title:'Failed',     text:'This trainee has failed.',              timer:2000,showConfirmButton:false}); return; }
+  if (isDrop)      { Swal.fire({icon:'info',title:'Dropout',    text:'This trainee has dropped out.',         timer:2000,showConfirmButton:false}); return; }
+  if (pendingFeed) { Swal.fire({icon:'info',title:'Pending Feedback',text:'Awaiting feedback submission.',    timer:2000,showConfirmButton:false}); return; }
 
-  // If already marked, show info and return
   if (isMarked) {
-    const lbl = curStatus === 'present' ? '✅ Present' : '❌ Absent';
-    Swal.fire({
-      icon: 'info', 
-      title: '🔒 Already Marked for Today',
-      html: `Attendance recorded as <strong>${lbl}</strong>.<br>
-            <small style="color:#9ca3af;">Cannot change until tomorrow.</small>`,
-      confirmButtonColor: '#4A90E2'
-    });
+    const lbl = curStatus==='present' ? '✅ Present' : '❌ Absent';
+    Swal.fire({ icon:'info', title:'🔒 Already Marked for Today',
+      html:`Attendance recorded as <strong>${lbl}</strong>.<br><small style="color:#9ca3af;">Cannot change until tomorrow.</small>`,
+      confirmButtonColor:'#4A90E2' });
     return;
   }
 
   const cap = status.charAt(0).toUpperCase() + status.slice(1);
-  const res = await Swal.fire({
-    title: 'Mark Attendance', 
-    html: `Mark as <strong>${cap}</strong> for today?`, 
-    icon: 'question',
-    showCancelButton: true,
-    confirmButtonColor: status === 'present' ? '#059669' : '#dc2626',
-    cancelButtonColor: '#6b7280',
-    confirmButtonText: `Mark as ${cap}`, 
-    cancelButtonText: 'Cancel'
-  });
-  
+  const res = await Swal.fire({ title:'Mark Attendance', html:`Mark as <strong>${cap}</strong> for today?`, icon:'question',
+    showCancelButton:true, confirmButtonColor:status==='present'?'#059669':'#dc2626', cancelButtonColor:'#6b7280',
+    confirmButtonText:`Mark as ${cap}`, cancelButtonText:'Cancel' });
   if (!res.isConfirmed) return;
 
   try {
-    const r = await fetch('', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: `ajax=1&action=mark_daily_attendance&enrollment_id=${eid}&status=${status}`
-    });
+    const r = await fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`ajax=1&action=mark_daily_attendance&enrollment_id=${eid}&status=${status}` });
     const d = await r.json();
-
     if (d.success) {
-      await Swal.fire({
-        icon: 'success',
-        title: `Marked as ${cap}`,
-        html: `<small style="color:#9ca3af;">🔒 Reloading...</small>`,
-        timer: 1000,
-        showConfirmButton: false
-      });
-      location.reload(); // Reload to ensure everything is consistent
-
+      await Swal.fire({ icon:'success', title:`Marked as ${cap}`,
+        html:`<small style="color:#9ca3af;">🔒 Reloading...</small>`, timer:1000, showConfirmButton:false });
+      location.reload();
     } else if (d.already_marked) {
-      // Another session marked first
-      const lbl2 = d.current_status === 'present' ? '✅ Present' : '❌ Absent';
-      Swal.fire({
-        icon: 'info', 
-        title: 'Already Marked',
-        html: `Another session recorded <strong>${lbl2}</strong> for today.<br><small style="color:#9ca3af;">Reloading…</small>`,
-        timer: 2500,
-        showConfirmButton: false
-      }).then(() => location.reload());
-
+      const lbl2 = d.current_status==='present' ? '✅ Present' : '❌ Absent';
+      Swal.fire({ icon:'info', title:'Already Marked',
+        html:`Another session recorded <strong>${lbl2}</strong> for today.<br><small style="color:#9ca3af;">Reloading…</small>`,
+        timer:2500, showConfirmButton:false }).then(() => location.reload());
     } else {
-      Swal.fire({
-        icon: 'warning', 
-        title: 'Cannot Mark', 
-        text: d.message || 'Failed to mark attendance.', 
-        confirmButtonColor: '#4A90E2'
-      });
+      Swal.fire({ icon:'warning', title:'Cannot Mark', text:d.message||'Failed to mark attendance.', confirmButtonColor:'#4A90E2' });
     }
   } catch(e) {
-    console.error(e);
-    Swal.fire({
-      icon: 'error', 
-      title: 'Network Error', 
-      text: 'Could not reach server.', 
-      timer: 2000, 
-      showConfirmButton: false
-    });
+    Swal.fire({ icon:'error', title:'Network Error', text:'Could not reach server.', timer:2000, showConfirmButton:false });
   }
 }
 
@@ -1644,11 +1050,11 @@ async function bulkAttendance(status) {
   if (!schedGuard()) return;
 
   let unmarked=0, alrPresent=0, alrAbsent=0, ineligible=0;
-  document.querySelectorAll('tr[data-eid]').forEach(row=>{
+  document.querySelectorAll('tr[data-eid]').forEach(row => {
     const cert   = row.getAttribute('data-certified')==='true';
     const drop   = row.getAttribute('data-dropout')==='true';
     const failed = row.getAttribute('data-failed')==='true';
-    const pending = row.getAttribute('data-pending-feedback')==='true';
+    const pending= row.getAttribute('data-pending-feedback')==='true';
     const marked = row.getAttribute('data-marked')==='true';
     const cur    = row.getAttribute('data-att-status');
     if (cert||drop||failed||pending) ineligible++;
@@ -1656,109 +1062,125 @@ async function bulkAttendance(status) {
     else unmarked++;
   });
 
-  const label = status==='present'?'✅ Present':'❌ Absent';
-
+  const label = status==='present' ? '✅ Present' : '❌ Absent';
   if (unmarked===0) {
-    Swal.fire({icon:'info',title:'🔒 All Eligible Trainees Already Marked',
+    Swal.fire({ icon:'info', title:'🔒 All Eligible Trainees Already Marked',
       html:`<div style="text-align:center;line-height:2.5;">
         <strong style="font-size:22px;color:#059669;">${alrPresent}</strong><span style="color:#6b7280;"> Present &nbsp;|&nbsp; </span>
         <strong style="font-size:22px;color:#dc2626;">${alrAbsent}</strong><span style="color:#6b7280;"> Absent</span><br>
         <small style="color:#9ca3af;">🔒 Resets automatically tomorrow.</small></div>`,
-      confirmButtonColor:'#4A90E2'});
+      confirmButtonColor:'#4A90E2' });
     return;
   }
 
-  const confirm=await Swal.fire({
-    title:'Bulk Mark Attendance',
+  const confirm = await Swal.fire({ title:'Bulk Mark Attendance',
     html:`<div style="text-align:left;">
       Mark <strong>${unmarked}</strong> unmarked trainee${unmarked!==1?'s':''} as <strong>${label}</strong>?<br><br>
       <div style="background:#f8f9fa;padding:12px;border-radius:8px;font-size:13px;line-height:2.2;">
-        <span style="color:#059669;">✅ Already Present: <strong>${alrPresent}</strong></span> — skipped (kept)<br>
-        <span style="color:#dc2626;">❌ Already Absent: <strong>${alrAbsent}</strong></span>  — skipped (kept)<br>
-        <span style="color:#9ca3af;">⛔ Ineligible: <strong>${ineligible}</strong></span>      — skipped<br>
+        <span style="color:#059669;">✅ Already Present: <strong>${alrPresent}</strong></span> — skipped<br>
+        <span style="color:#dc2626;">❌ Already Absent: <strong>${alrAbsent}</strong></span> — skipped<br>
+        <span style="color:#9ca3af;">⛔ Ineligible: <strong>${ineligible}</strong></span> — skipped<br>
         <span style="font-weight:700;">📋 Will be marked: <strong>${unmarked}</strong></span>
       </div><br>
       <small style="color:#9ca3af;">Already-marked trainees are never changed.</small>
     </div>`,
-    icon:'question',showCancelButton:true,
-    confirmButtonColor:status==='present'?'#059669':'#dc2626',cancelButtonColor:'#6b7280',
-    confirmButtonText:`Mark ${unmarked} as ${status.charAt(0).toUpperCase()+status.slice(1)}`,cancelButtonText:'Cancel'
-  });
+    icon:'question', showCancelButton:true,
+    confirmButtonColor:status==='present'?'#059669':'#dc2626', cancelButtonColor:'#6b7280',
+    confirmButtonText:`Mark ${unmarked} as ${status.charAt(0).toUpperCase()+status.slice(1)}`, cancelButtonText:'Cancel' });
   if (!confirm.isConfirmed) return;
 
-  Swal.fire({title:'Processing…',html:`Marking <strong>${unmarked}</strong> trainees as ${label}…`,allowOutsideClick:false,didOpen:()=>Swal.showLoading()});
+  Swal.fire({ title:'Processing…', html:`Marking <strong>${unmarked}</strong> trainees as ${label}…`, allowOutsideClick:false, didOpen:()=>Swal.showLoading() });
 
   try {
-    const act=status==='present'?'mark_all_present_today':'mark_all_absent_today';
-    const r=await fetch('',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:`ajax=1&action=${act}&program_id=${PROG_ID}`});
-    const d=await r.json();
+    const act = status==='present' ? 'mark_all_present_today' : 'mark_all_absent_today';
+    const r = await fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`ajax=1&action=${act}&program_id=${PROG_ID}` });
+    const d = await r.json();
     Swal.close();
     if (d.success) {
-      await Swal.fire({icon:'success',title:'Bulk Attendance Complete',
+      await Swal.fire({ icon:'success', title:'Bulk Attendance Complete',
         html:`<div style="text-align:left;line-height:2.2;">
           ✅ Marked: <strong>${d.success_count}</strong> as ${label}<br>
           ⏭️ Skipped (already marked): <strong>${d.skipped_count??alrPresent+alrAbsent}</strong><br>
           ${d.error_count>0?`❌ Errors: <strong>${d.error_count}</strong><br>`:''}
           <br><small style="color:#9ca3af;">🔒 Reloading...</small></div>`,
-        timer: 1500,
-        showConfirmButton: false
-      });
+        timer:1500, showConfirmButton:false });
       location.reload();
     } else {
-      Swal.fire({icon:'error',title:'Error',text:d.message||'Operation failed.',confirmButtonColor:'#4A90E2'});
+      Swal.fire({ icon:'error', title:'Error', text:d.message||'Operation failed.', confirmButtonColor:'#4A90E2' });
     }
   } catch(e) {
-    Swal.fire({icon:'error',title:'Network Error',text:'Could not reach server.',timer:2000,showConfirmButton:false});
+    Swal.fire({ icon:'error', title:'Network Error', text:'Could not reach server.', timer:2000, showConfirmButton:false });
   }
 }
 
 // ── show notes ──────────────────────────────────────────────
 function showNotes(notes) {
-  Swal.fire({title:'Notes',html:`<div style="text-align:left;white-space:pre-line;background:#f8f9fa;padding:12px;border-radius:6px;">${notes}</div>`,showCloseButton:true,showConfirmButton:false,width:'580px'});
+  Swal.fire({ title:'Notes',
+    html:`<div style="text-align:left;white-space:pre-line;background:#f8f9fa;padding:12px;border-radius:6px;">${notes}</div>`,
+    showCloseButton:true, showConfirmButton:false, width:'580px' });
 }
 
 // ── dropout ─────────────────────────────────────────────────
 async function doDropout(eid) {
-  const {value:reason}=await Swal.fire({title:'Mark as Dropout',input:'textarea',inputLabel:'Reason for dropout:',inputPlaceholder:'Provide detailed reason…',showCancelButton:true,confirmButtonText:'Mark as Dropout',confirmButtonColor:'#dc3545',cancelButtonText:'Cancel',inputValidator:v=>(!v||v.trim().length<10)?'Min 10 characters required':undefined});
+  // ── FIX: JS-level guard for not-started ──
+  if (ACTIONS_BLOCKED) {
+    Swal.fire({ icon:'warning', title:'Program Not Started',
+      text:'You cannot mark a dropout before the program has started.',
+      confirmButtonColor:'#4A90E2' });
+    return;
+  }
+
+  const {value:reason} = await Swal.fire({ title:'Mark as Dropout', input:'textarea',
+    inputLabel:'Reason for dropout:', inputPlaceholder:'Provide detailed reason…',
+    showCancelButton:true, confirmButtonText:'Mark as Dropout', confirmButtonColor:'#dc3545', cancelButtonText:'Cancel',
+    inputValidator: v => (!v||v.trim().length<10) ? 'Min 10 characters required' : undefined });
   if (reason===undefined) return;
-  const c=await Swal.fire({title:'Confirm Dropout',html:`This will move the trainee to Dropout and mark as Failed. Cannot be undone.`,icon:'warning',showCancelButton:true,confirmButtonColor:'#dc3545',cancelButtonColor:'#6b7280',confirmButtonText:'Yes, dropout',cancelButtonText:'Cancel'});
+
+  const c = await Swal.fire({ title:'Confirm Dropout',
+    html:`This will move the trainee to Dropout and mark as Failed. Cannot be undone.`,
+    icon:'warning', showCancelButton:true,
+    confirmButtonColor:'#dc3545', cancelButtonColor:'#6b7280',
+    confirmButtonText:'Yes, dropout', cancelButtonText:'Cancel' });
   if (!c.isConfirmed) return;
-  Swal.fire({title:'Processing…',allowOutsideClick:false,didOpen:()=>Swal.showLoading()});
+
+  Swal.fire({ title:'Processing…', allowOutsideClick:false, didOpen:()=>Swal.showLoading() });
   try {
-    const r=await fetch('',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`ajax=1&action=mark_as_dropout&enrollment_id=${eid}&dropout_reason=${encodeURIComponent(reason)}`});
-    const d=await r.json(); Swal.close();
-    if (d.success) { await Swal.fire({icon:'success',title:'Done!',text:'Trainee marked as dropout.',timer:2000,showConfirmButton:false}); location.reload(); }
-    else Swal.fire({icon:'error',title:'Error',text:d.message||'Failed.',confirmButtonColor:'#4A90E2'});
-  } catch(e) { Swal.fire({icon:'error',title:'Network Error',text:'Could not reach server.',timer:2000,showConfirmButton:false}); }
+    const r = await fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:`ajax=1&action=mark_as_dropout&enrollment_id=${eid}&dropout_reason=${encodeURIComponent(reason)}` });
+    const d = await r.json();
+    Swal.close();
+    if (d.success) {
+      await Swal.fire({ icon:'success', title:'Done!', text:'Trainee marked as dropout.', timer:2000, showConfirmButton:false });
+      location.reload();
+    } else {
+      Swal.fire({ icon:'error', title:'Error', text:d.message||'Failed.', confirmButtonColor:'#4A90E2' });
+    }
+  } catch(e) {
+    Swal.fire({ icon:'error', title:'Network Error', text:'Could not reach server.', timer:2000, showConfirmButton:false });
+  }
 }
 
 // ── view details ─────────────────────────────────────────────
 function viewDetails(uid, pid) {
-  const modal=document.getElementById('detailModal');
-  const body =document.getElementById('detailBody');
-  body.innerHTML='<div style="text-align:center;padding:30px;"><i class="fas fa-spinner fa-spin fa-2x"></i></div>';
-  modal.style.display='flex';
-  fetch('',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`ajax=1&action=get_trainee_details&trainee_user_id=${uid}&program_id=${pid}`})
-  .then(r=>r.json()).then(d=>{
-    if (!d.success){body.innerHTML='<p style="color:red;text-align:center;">Error loading details.</p>';return;}
-    const t=d.trainee; const s=t.attendance_stats||{};
-    
+  const modal = document.getElementById('detailModal');
+  const body  = document.getElementById('detailBody');
+  body.innerHTML = '<div style="text-align:center;padding:30px;"><i class="fas fa-spinner fa-spin fa-2x"></i></div>';
+  modal.style.display = 'flex';
+
+  fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`ajax=1&action=get_trainee_details&trainee_user_id=${uid}&program_id=${pid}` })
+  .then(r => r.json()).then(d => {
+    if (!d.success) { body.innerHTML='<p style="color:red;text-align:center;">Error loading details.</p>'; return; }
+    const t = d.trainee; const s = t.attendance_stats||{};
+
     let sk, sl;
-    if (t.enrollment_status==='rejected') {
-      sk='dropout'; sl='Dropout';
-    } else if (t.assessment==='Passed' || t.enrollment_status==='certified') {
-      if (t.has_feedback) {
-        sk='certified'; sl='Certified';
-      } else {
-        sk='ongoing'; sl='Ongoing (Pending Feedback)';
-      }
-    } else if (t.assessment==='Failed') {
-      sk='failed'; sl='Failed';
-    } else {
-      sk='ongoing'; sl='Ongoing';
-    }
-    
+    if (t.enrollment_status==='rejected')               { sk='dropout';  sl='Dropout'; }
+    else if ((t.assessment==='Passed'||t.enrollment_status==='certified') && t.has_feedback) { sk='certified'; sl='Certified'; }
+    else if ((t.assessment==='Passed'||t.enrollment_status==='certified') && !t.has_feedback){ sk='ongoing';   sl='Ongoing (Pending Feedback)'; }
+    else if (t.assessment==='Failed')                   { sk='failed';   sl='Failed'; }
+    else                                                 { sk='ongoing';  sl='Ongoing'; }
+
     body.innerHTML=`
       <div class="detail-row"><div class="detail-label">Full Name</div><div class="detail-value">${t.fullname}</div></div>
       <div class="detail-row"><div class="detail-label">Email</div><div class="detail-value">${t.email||'N/A'}</div></div>
@@ -1783,15 +1205,12 @@ function viewDetails(uid, pid) {
           <div class="progress-text">${parseFloat(t.attendance||0).toFixed(1)}%</div>
         </div>
       </div>
-      <div class="detail-row">
-        <div class="detail-label">Assessment</div>
-        <div class="detail-value">${t.assessment||'Not yet graded'}</div>
-      </div>
+      <div class="detail-row"><div class="detail-label">Assessment</div><div class="detail-value">${t.assessment||'Not yet graded'}</div></div>
       <div class="detail-row">
         <div class="detail-label">Feedback Status</div>
         <div class="detail-value">
-          ${t.has_feedback 
-            ? '<span style="color:#059669;"><i class="fas fa-check-circle"></i> Feedback Submitted</span>' 
+          ${t.has_feedback
+            ? '<span style="color:#059669;"><i class="fas fa-check-circle"></i> Feedback Submitted</span>'
             : '<span style="color:#dc2626;"><i class="fas fa-exclamation-circle"></i> No Feedback Yet</span>'}
         </div>
       </div>
@@ -1799,10 +1218,11 @@ function viewDetails(uid, pid) {
       ${t.failure_notes_copy?`<div class="detail-row"><div class="detail-label">Notes Archive</div><div class="detail-value" style="background:#fff3cd;padding:12px;border-radius:6px;border-left:4px solid #ffc107;white-space:pre-line;font-size:12px;color:#856404;max-height:180px;overflow-y:auto;">${t.failure_notes_copy}</div></div>`:''}
       <div class="detail-row"><div class="detail-label">Status</div><div class="detail-value"><span class="status-badge status-${sk}">${sl}</span></div></div>
     `;
-  }).catch(()=>{body.innerHTML='<p style="color:red;text-align:center;">Error loading details.</p>';});
+  }).catch(() => { body.innerHTML='<p style="color:red;text-align:center;">Error loading details.</p>'; });
 }
-function closeModal(){document.getElementById('detailModal').style.display='none';}
-window.onclick=e=>{if(e.target===document.getElementById('detailModal'))closeModal();};
+
+function closeModal() { document.getElementById('detailModal').style.display='none'; }
+window.onclick = e => { if (e.target===document.getElementById('detailModal')) closeModal(); };
 </script>
 </body>
 </html>
